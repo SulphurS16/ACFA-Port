@@ -15,6 +15,7 @@
 #include <windows.h>
 #include <xinput.h>
 
+#include "common/file.h"
 #include "ppu/ppu_recomp.h"
 #include "runtime/config.h"
 #include "runtime/hle.h"
@@ -225,6 +226,18 @@ void control_thread(std::string path) {
         game::turn_trace(std::atoi(line.c_str() + 10));
         continue;
       }
+      if (line == "groups") {  // the mission's event groups and their live entities (script_hooks.cpp)
+        ppu::script_groups_dump();
+        continue;
+      }
+      if (line.rfind("kill ", 0) == 0) {  // test shortcut: the game's entity kill for a group (script_hooks.cpp)
+        if (!ppu::script_kill_group(u32(std::atoi(line.c_str() + 5)))) LOG_W("pad", "control: '%s': no such group", line.c_str());
+        continue;
+      }
+      if (line.rfind("autopilot ", 0) == 0) {  // test autopilot (autopilot.cpp)
+        if (!ppu::autopilot_command(line.substr(10))) LOG_W("pad", "control: '%s' is not 'autopilot on [PG EG]|off'", line.c_str());
+        continue;
+      }
       if (line == "axes") {  // the game's input axes (game_input.h)
         game::axes_dump();
         continue;
@@ -252,6 +265,24 @@ void control_thread(std::string path) {
           s += acfa::strprintf(" %08x(%g)", w, double(f));
         }
         LOG_I("pad", "peek 0x%08x:%s", addr, s.c_str());
+        continue;
+      }
+      if (line.rfind("dump ", 0) == 0) {  // "dump ADDR LEN": raw guest memory to <run>/mem_<ADDR>.bin
+        std::istringstream in(line.substr(5));
+        std::string a, l;
+        in >> a >> l;
+        u32 addr = u32(std::strtoul(a.c_str(), nullptr, 0)), len = u32(std::strtoul(l.c_str(), nullptr, 0));
+        if (a.empty() || !len || len > (64u << 20) || !vm::committed(addr, len)) {
+          LOG_W("pad", "control: dump '%s': not mapped guest memory (or length 0 / over 64 MiB)", line.c_str());
+          continue;
+        }
+        std::string path = cfg().run_dir + acfa::strprintf("/mem_%08x.bin", addr);
+        try {
+          acfa::write_file(path, ppu::mem() + addr, len);
+          LOG_I("pad", "dump 0x%08x+0x%x -> %s", addr, len, path.c_str());
+        } catch (const std::exception& e) {
+          LOG_W("pad", "control: dump failed: %s", e.what());
+        }
         continue;
       }
       if (line.rfind("gpu ", 0) == 0) {  // "gpu NAME VALUE": renderer switches for A/B measurements
@@ -378,7 +409,10 @@ PadState read_port(u32 port) {
     if (k.rx >= 0) s.rx = u8(k.rx);
     if (k.ry >= 0) s.ry = u8(k.ry);
   }
-  if (port == 0) apply_script(s);
+  if (port == 0) {
+    apply_script(s);
+    ppu::autopilot_apply(s.d1, s.d2, s.lx, s.ly, s.rx, s.ry);  // test autopilot (off unless enabled)
+  }
   auto pr = [](bool on, u8 cur) { return on ? std::max<u8>(cur, 255) : cur; };
   s.press[0] = pr(s.d1 & RIGHT, s.press[0]);
   s.press[1] = pr(s.d1 & LEFT, s.press[1]);

@@ -9,6 +9,7 @@
 #include <thread>
 #include <vector>
 
+#include "runtime/config.h"
 #include "runtime/hle.h"
 #include "runtime/lv2/lv2.h"
 #include "runtime/memory.h"
@@ -30,6 +31,9 @@ std::atomic<u64> g_fifo_idle_us{0};
 namespace {
 
 std::atomic<u32> g_get_waiters{0}, g_get_wait_lo{0}, g_get_wait_hi{0};  // wait_get_outside()
+// The FIFO's position in the command ring: GET, or while inside called command lists the
+// outermost return address (the place in the ring it will continue from).
+std::atomic<u32> g_ring_get{0};
 std::mutex g_io_mu;
 u32 g_io_ea[512];   // io >> 20 -> ea >> 20 (0xffffffff = unmapped)
 u32 g_ea_io[4096];  // ea >> 20 -> io >> 20
@@ -302,9 +306,37 @@ void do_flip(u32 id) {
 // FIFO
 namespace {
 
+// Recent FIFO control flow (jumps, calls, returns, new PUT values) for the report on the first
+// invalid command: which path led the FIFO into data that is not a command.
+struct FlowEvent {
+  char kind;  // 'J' jump, 'C' call, 'R' return, 'P' new put
+  u32 at, to;
+  u64 t_us;
+};
+FlowEvent g_flow[64];
+u32 g_flow_n = 0;
+void flow(char kind, u32 at, u32 to) { g_flow[g_flow_n++ & 63] = {kind, at, to, lv2::system_time_us()}; }
+
+void flow_report(const char* why, u32 get, u32 put) {
+  static bool once = false;
+  if (once) return;
+  once = true;
+  u32 ctx = kContextAddr;
+  LOG_E("rsx", "FIFO report (%s): get 0x%08x put 0x%08x; libgcm context begin 0x%08x end 0x%08x current 0x%08x", why, get, put,
+        ppu::r32(ctx), ppu::r32(ctx + 4), ppu::r32(ctx + 8));
+  u64 now = lv2::system_time_us();
+  for (u32 i = g_flow_n > 64 ? g_flow_n - 64 : 0; i < g_flow_n; ++i) {
+    const FlowEvent& e = g_flow[i & 63];
+    LOG_E("rsx", "  %c at 0x%08x -> 0x%08x (%.3f ms ago)", e.kind, e.at, e.to, double(now - e.t_us) / 1000.0);
+  }
+}
+
 u32 fifo_read(u32 io) {
   u32 ea;
-  if (!io_to_ea(io, &ea)) fatal(acfa::strprintf("RSX FIFO fetch from unmapped io offset 0x%08x", io));
+  if (!io_to_ea(io, &ea)) {
+    flow_report("fetch from an unmapped io offset", io, ppu::r32(kControlAddr));
+    fatal(acfa::strprintf("RSX FIFO fetch from unmapped io offset 0x%08x", io));
+  }
   return ppu::r32(ea);
 }
 
@@ -316,11 +348,16 @@ void fifo_thread() {
   auto* ctrl_put = reinterpret_cast<volatile u32*>(ppu::mem() + kControlAddr);
   auto* ctrl_get = reinterpret_cast<volatile u32*>(ppu::mem() + kControlAddr + 4);
   u32 get = __builtin_bswap32(*ctrl_get);
+  g_ring_get.store(get);
   std::vector<u32> call_stack;
-  u32 idle = 0;
+  u32 idle = 0, last_put = ~0u;
   u64 idle_since = 0;
   for (;;) {
     u32 put = __builtin_bswap32(*ctrl_put);
+    if (put != last_put) {
+      flow('P', get, put);
+      last_put = put;
+    }
     if (get == g_covered_put) renderer_guest_sync();
     if (get == put) {
       if (idle == 0) idle_since = lv2::system_time_us();
@@ -336,15 +373,19 @@ void fifo_thread() {
     idle = 0;
     u32 cmd = fifo_read(get);
     if ((cmd & 0xe0000003) == 0x20000000) {  // old jump
+      flow('J', get, cmd & 0x1ffffffc);
       get = cmd & 0x1ffffffc;
     } else if ((cmd & 3) == 1) {  // new jump
+      flow('J', get, cmd & 0xfffffffc);
       get = cmd & 0xfffffffc;
     } else if ((cmd & 3) == 2) {  // call
       if (call_stack.size() > 16) fatal("RSX FIFO call stack overflow");
+      flow('C', get, cmd & 0xfffffffc);
       call_stack.push_back(get + 4);
       get = cmd & 0xfffffffc;
     } else if ((cmd & 0xffff0003) == 0x00020000) {  // return
       if (call_stack.empty()) fatal(acfa::strprintf("RSX FIFO return with empty call stack at 0x%08x", get));
+      flow('R', get, call_stack.back());
       get = call_stack.back();
       call_stack.pop_back();
     } else if (cmd == 0) {
@@ -356,6 +397,7 @@ void fifo_thread() {
       bool inc = (cmd & 0xe0030003) == 0;
       if (!inc && !noinc) {
         LOG_E("rsx", "unknown FIFO command 0x%08x at io 0x%08x; skipping", cmd, get);
+        flow_report("invalid command", get, put);
         get += 4;
       } else {
         u32 args_io = get + 4;
@@ -368,32 +410,65 @@ void fifo_thread() {
       }
     }
     *ctrl_get = __builtin_bswap32(get);
-    if (g_get_waiters.load(std::memory_order_acquire) &&
-        (get < g_get_wait_lo.load(std::memory_order_relaxed) || get > g_get_wait_hi.load(std::memory_order_relaxed)))
-      WakeByAddressAll(const_cast<u32*>(ctrl_get));
+    u32 ring = call_stack.empty() ? get : call_stack.front();
+    g_ring_get.store(ring, std::memory_order_release);
+    if (g_get_waiters.load(std::memory_order_acquire)) {
+      u32 lo = g_get_wait_lo.load(std::memory_order_relaxed), hi = g_get_wait_hi.load(std::memory_order_relaxed);
+      if ((ring < lo || ring > hi) && (get < lo || get > hi)) WakeByAddressAll(&g_ring_get);
+    }
   }
 }
 
 }  // namespace
 
-// A PPU thread waiting for the FIFO to leave the command buffer range [lo, hi] (io offsets), e.g.
-// libgcm's fragment callback when the game writes commands faster than they are processed: it
-// sleeps on the GET word and the FIFO thread wakes it once GET is outside the range (instead of a
-// Sleep(0) loop that kept a core busy for the whole wait).
+// A PPU thread waiting for the FIFO to leave the command ring range [lo, hi] (io offsets): libgcm's
+// fragment callback, before the game overwrites the next fragment. The FIFO's position in the ring
+// counts, not GET alone: while the FIFO runs a command list CALLed from that fragment, GET is
+// elsewhere but the FIFO returns into the fragment afterwards (releasing it then let the game
+// overwrite commands the FIFO had yet to finish: it resumed in the middle of new commands and
+// executed their arguments, run 20261012-161028). The thread sleeps until the FIFO thread wakes
+// it (instead of a Sleep(0) loop that kept a core busy for the whole wait).
 void wait_get_outside(u32 lo, u32 hi) {
   auto* ctrl_get = reinterpret_cast<volatile u32*>(ppu::mem() + kControlAddr + 4);
-  auto outside = [&](u32 v) { u32 get = __builtin_bswap32(v); return get < lo || get > hi; };
+  // Released when neither the ring position nor GET itself (a command list inside the range,
+  // called from elsewhere) is in the range.
+  auto released = [&](u32 ring) {
+    u32 get = __builtin_bswap32(*ctrl_get);
+    return (ring < lo || ring > hi) && (get < lo || get > hi);
+  };
+  if (cfg().gcm_wait_spin) {  // --gcm-wait spin: a Sleep(0) loop (A/B comparisons)
+    for (u32 spins = 0; !released(g_ring_get.load(std::memory_order_acquire)); ++spins)
+      if (spins > 64) Sleep(0);
+    return;
+  }
   for (u32 spins = 0; spins < 64; ++spins) {
-    if (outside(*ctrl_get)) return;
+    if (released(g_ring_get.load(std::memory_order_acquire))) return;
     _mm_pause();
   }
   g_get_wait_lo.store(lo, std::memory_order_relaxed);
   g_get_wait_hi.store(hi, std::memory_order_relaxed);
   g_get_waiters.fetch_add(1, std::memory_order_acq_rel);
+  bool hazard = false;
   for (;;) {
-    u32 seen = *ctrl_get;
-    if (outside(seen)) break;
-    WaitOnAddress(const_cast<u32*>(ctrl_get), &seen, sizeof seen, 2);
+    u32 seen = g_ring_get.load(std::memory_order_acquire);
+    if (released(seen)) break;
+    u32 get = __builtin_bswap32(*ctrl_get);
+    if (!hazard && (get < lo || get > hi)) {  // GET alone would have released the fragment
+      hazard = true;
+      static std::atomic<u32> n{0};
+      u32 k = ++n;
+      if (k <= 3 || (k & (k - 1)) == 0)
+        LOG_I("rsx", "fragment wait: GET 0x%08x is outside [0x%08x, 0x%08x] but the FIFO returns into it (ring position 0x%08x): "
+              "kept waiting (%u so far)", get, lo, hi, seen, k);
+      if (k == 1) {  // the FIFO's recent control flow (diagnostics; read while the FIFO thread runs)
+        u32 n = g_flow_n;
+        for (u32 i = n > 12 ? n - 12 : 0; i < n; ++i) {
+          const FlowEvent e = g_flow[i & 63];
+          LOG_I("rsx", "  flow %c at 0x%08x -> 0x%08x", e.kind, e.at, e.to);
+        }
+      }
+    }
+    WaitOnAddress(&g_ring_get, &seen, sizeof seen, 2);
   }
   g_get_waiters.fetch_sub(1, std::memory_order_acq_rel);
 }

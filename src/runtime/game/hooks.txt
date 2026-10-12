@@ -11,3 +11,4 @@
 0x0070b548 input_pitch_set         # look (pitch) command setter thunk (view slot 9 -> 0x70e960)
 0x007a2fb8 look_update             # an AC's look control: turn (0x7a2940), then pitch (0x7a22d0)
 0x0070eb30 input_turn_set          # turn command setter (r3 input, f1 value)
+0x006c2b88 script_call_ii          # mission script invoker for int f(int) members (observation only)

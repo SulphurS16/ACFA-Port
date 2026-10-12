@@ -225,12 +225,14 @@ void hook_look_update(Ctx& ctx, void (*orig)(Ctx&)) {
 // Pad object updates, once per frame and port: cellPadGetData(port) into the object, then the
 // sticks normalized to floats in [-1, 1]. Two classes with the same layout at different offsets.
 void hook_pad_update(Ctx& ctx, void (*orig)(Ctx&)) {
+  run_pending_guest_calls(ctx);  // test shortcuts queued from the control file (script_hooks.cpp)
   u32 pad = u32(ctx.r[3]);
   orig(ctx);
   publish(pad, 696, 1484);
 }
 
 void hook_pad_update_b(Ctx& ctx, void (*orig)(Ctx&)) {
+  run_pending_guest_calls(ctx);
   u32 pad = u32(ctx.r[3]);
   orig(ctx);
   publish(pad, 372, 1160);

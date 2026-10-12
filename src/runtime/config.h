@@ -42,6 +42,7 @@ struct Config {
   std::string priority;             // process priority class: "" (normal), "above-normal", "high"
   int gpu_timing = 0;               // GPU time per pass (gpu/gpu_timing.h), logged every 5 s; 2: per draw
   bool audio_capture = false;       // write the mixed output to <run>/audio.f32 (48 kHz float stereo)
+  bool gcm_wait_spin = false;       // --gcm-wait spin: libgcm fragment waits spin with Sleep(0) (A/B)
   std::string spu_cache;            // where collected SPU code records are written
   std::string shader_cache;         // compiled HLSL (derived from the game's shaders; machine-local)
 };
