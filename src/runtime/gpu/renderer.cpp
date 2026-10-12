@@ -2839,6 +2839,12 @@ void track_flip() {
   double secs = at.back() - at.front();
   LOG_I("perf", "track 0x%08x: %zu flips in %.3f s, %u without movement, path %.2f units (%.2f/s), step min %.4f max %.4f", a,
         pos.size(), secs, still, total, secs > 0 ? total / secs : 0.0, min_step, max_step);
+  std::string csv = "t,x,y,z\n";  // the whole path: <run>/track_<addr>_<start>.csv
+  for (size_t i = 0; i < pos.size(); ++i) csv += acfa::strprintf("%.4f,%g,%g,%g\n", at[i] - at[0], pos[i][0], pos[i][1], pos[i][2]);
+  try {
+    acfa::write_text(std::filesystem::path(cfg().run_dir) / acfa::strprintf("track_%08x_%.0f.csv", a, at[0]), csv);
+  } catch (const std::exception&) {
+  }
   pos.clear();
   at.clear();
 }

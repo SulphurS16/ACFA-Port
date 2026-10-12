@@ -28,16 +28,28 @@ IDXGIOutput* g_output = nullptr;  // output containing the window (held referenc
 std::wstring g_output_name;
 u32 g_refresh = 0;  // Hz of the output's current display mode (integer, as Windows reports it)
 u32 g_divisor = 0;  // display-locked pacing: an emulated vblank every N display vblanks (0: clock)
+double g_div_fps = 0;  // the target g_divisor was chosen for (the target changes during movies)
 bool g_tearing = false;
 std::atomic<bool> g_locked{false};  // the last vblank came from the display (else the clock)
+
+// Video decoders open (movie playback): the system's movie player (libsail, as firmware code)
+// stalls or starts late with the emulated vblank above 60 Hz (GAME_NOTES "Frame pacing": the
+// opening movie at 120 Hz decoded 4 pictures and stopped; 75 Hz started 13 s late), and the
+// movies are 30 fps: while one plays, the vblank runs at 60 Hz.
+std::atomic<int> g_movies{0};
 
 // The game's frame rate target: --fps N (default 60), or the display's refresh (--fps display).
 // The game advances its simulation by measured time (GAME_NOTES "Frame pacing": movement, turning
 // and per-frame motion identical at 60 and 120 Hz), so the emulated vblank rate sets the frame rate.
 double target_fps() {
-  if (cfg().fps > 0) return cfg().fps;
-  std::lock_guard lk(g_mu);
-  return g_refresh >= 30 ? double(g_refresh) : 60.0;
+  double fps;
+  if (cfg().fps > 0) {
+    fps = cfg().fps;
+  } else {
+    std::lock_guard lk(g_mu);
+    fps = g_refresh >= 30 ? double(g_refresh) : 60.0;
+  }
+  return fps > 60.5 && g_movies.load(std::memory_order_relaxed) > 0 ? 60.0 : fps;
 }
 
 // Display-locked pacing needs a refresh that is a whole multiple of the target (within 1.5 Hz).
@@ -45,6 +57,14 @@ u32 divisor_for(u32 hz, double fps) {
   if (hz < 30 || fps <= 0) return 0;
   u32 n = u32(std::lround(double(hz) / fps));
   return n && std::fabs(double(hz) / n - fps) <= 1.5 ? n : 0;
+}
+// The divisor under the configured pacing (auto, display, clock).
+u32 pacing_divisor(u32 hz, double fps) {
+  u32 div = divisor_for(hz, fps);
+  const std::string& want = cfg().pacing;
+  if (want == "clock") div = 0;
+  else if (want == "display" && !div && hz) div = std::max<u32>(1, u32(std::lround(double(hz) / fps)));
+  return div;
 }
 
 // ---- clock pacing (the target rate from the performance counter) ----
@@ -98,13 +118,11 @@ void update_output(IDXGISwapChain1* swap) {
     g_refresh = hz;
   }
   double fps = target_fps();
-  u32 div = divisor_for(hz, fps);
-  const std::string& want = cfg().pacing;
-  if (want == "clock") div = 0;
-  else if (want == "display" && !div && hz) div = std::max<u32>(1, u32(std::lround(double(hz) / fps)));
+  u32 div = pacing_divisor(hz, fps);
   {
     std::lock_guard lk(g_mu);
     g_divisor = div;
+    g_div_fps = fps;
   }
   char name[64];
   WideCharToMultiByte(CP_UTF8, 0, od.DeviceName, -1, name, sizeof name, nullptr, nullptr);
@@ -118,11 +136,24 @@ void update_output(IDXGISwapChain1* swap) {
 
 }  // namespace
 
+void movie_started() {
+  if (g_movies.fetch_add(1) == 0 && cfg().fps != 60)
+    LOG_I("display", "video playback: the emulated vblank runs at up to 60 Hz until it ends");
+}
+void movie_stopped() {
+  if (g_movies.fetch_sub(1) == 1 && cfg().fps != 60) LOG_I("display", "video playback ended: the frame rate target applies again");
+}
+
 void wait_next_vblank() {
   IDXGIOutput* out = nullptr;
   u32 div = 0;
+  double fps = target_fps();  // before the lock (it may take it)
   {
     std::lock_guard lk(g_mu);
+    if (g_output && fps != g_div_fps) {  // the target changed (movie playback): pacing for the new one now
+      g_divisor = pacing_divisor(g_refresh, fps);
+      g_div_fps = fps;
+    }
     if (g_output && g_divisor) {
       out = g_output;
       out->AddRef();

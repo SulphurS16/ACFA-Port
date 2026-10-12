@@ -20,6 +20,10 @@ namespace rt::gpu::display {
 
 // Blocks the vblank thread until the next emulated vblank is due.
 void wait_next_vblank();
+// A video decoder opened / closed (movie playback): the vblank runs at up to 60 Hz while one is
+// open (the system movie player's A/V sync fails above 60 Hz).
+void movie_started();
+void movie_stopped();
 // Present flags for the current pacing (DXGI_PRESENT_ALLOW_TEARING in clock mode when supported).
 u32 present_flags();
 // The swap chain was created (tearing: created with DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING). Called on
