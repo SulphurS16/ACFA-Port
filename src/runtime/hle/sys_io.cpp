@@ -32,7 +32,11 @@
 
 namespace rt::gpu {
 extern std::atomic<int> g_capture_requests;
+extern std::atomic<int> g_framehash_requests, g_framehash_total;
 }  // namespace rt::gpu
+namespace rt::rsx {
+extern std::atomic<u32> g_track_addr, g_track_left;  // renderer.cpp
+}  // namespace rt::rsx
 
 namespace rt {
 namespace {
@@ -228,6 +232,26 @@ void control_thread(std::string path) {
       }
       if (line == "groups") {  // the mission's event groups and their live entities (script_hooks.cpp)
         ppu::script_groups_dump();
+        continue;
+      }
+      if (line.rfind("track ", 0) == 0) {  // "track ADDR N": a guest vector read at each of the next N flips (renderer.cpp)
+        std::istringstream in(line.substr(6));
+        std::string a;
+        u32 n = 0;
+        in >> a >> n;
+        u32 addr = u32(std::strtoul(a.c_str(), nullptr, 0));
+        if (!vm::committed(addr, 12) || n < 2) {
+          LOG_W("pad", "control: '%s' is not 'track ADDR N' over mapped memory", line.c_str());
+          continue;
+        }
+        rsx::g_track_addr = addr;
+        rsx::g_track_left = std::min<u32>(n, 5000);
+        continue;
+      }
+      if (line.rfind("framehash ", 0) == 0) {  // distinct-frame check over the next N frames (renderer.cpp)
+        int n = std::clamp(std::atoi(line.c_str() + 10), 2, 2000);
+        gpu::g_framehash_total = n;
+        gpu::g_framehash_requests = n;
         continue;
       }
       if (line.rfind("kill ", 0) == 0) {  // test shortcut: the game's entity kill for a group (script_hooks.cpp)

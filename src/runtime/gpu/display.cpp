@@ -31,16 +31,26 @@ u32 g_divisor = 0;  // display-locked pacing: an emulated vblank every N display
 bool g_tearing = false;
 std::atomic<bool> g_locked{false};  // the last vblank came from the display (else the clock)
 
-u32 divisor_for(u32 hz) {
-  if (hz < 50) return 0;
-  u32 n = (hz + 30) / 60;
-  return n && std::fabs(double(hz) / n - 60.0) <= 1.5 ? n : 0;
+// The game's frame rate target: --fps N (default 60), or the display's refresh (--fps display).
+// The game advances its simulation by measured time (GAME_NOTES "Frame pacing": movement, turning
+// and per-frame motion identical at 60 and 120 Hz), so the emulated vblank rate sets the frame rate.
+double target_fps() {
+  if (cfg().fps > 0) return cfg().fps;
+  std::lock_guard lk(g_mu);
+  return g_refresh >= 30 ? double(g_refresh) : 60.0;
 }
 
-// ---- clock pacing (60 Hz from the performance counter) ----
+// Display-locked pacing needs a refresh that is a whole multiple of the target (within 1.5 Hz).
+u32 divisor_for(u32 hz, double fps) {
+  if (hz < 30 || fps <= 0) return 0;
+  u32 n = u32(std::lround(double(hz) / fps));
+  return n && std::fabs(double(hz) / n - fps) <= 1.5 ? n : 0;
+}
+
+// ---- clock pacing (the target rate from the performance counter) ----
 double g_next_tick_us = 0;
 void wait_clock() {
-  const double period = 1e6 / 60.0;
+  const double period = 1e6 / target_fps();
   double now = double(lv2::system_time_us());
   if (g_next_tick_us == 0 || now - g_next_tick_us > 4 * period) g_next_tick_us = now;  // start or resynchronise
   g_next_tick_us += period;
@@ -76,27 +86,34 @@ void update_output(IDXGISwapChain1* swap) {
   DEVMODEW dm{};
   dm.dmSize = sizeof dm;
   u32 hz = EnumDisplaySettingsW(od.DeviceName, ENUM_CURRENT_SETTINGS, &dm) ? dm.dmDisplayFrequency : 0;
-  std::lock_guard lk(g_mu);
-  if (g_output && g_output_name == od.DeviceName && g_refresh == hz) {
-    out->Release();
-    return;
+  {
+    std::lock_guard lk(g_mu);
+    if (g_output && g_output_name == od.DeviceName && g_refresh == hz) {
+      out->Release();
+      return;
+    }
+    if (g_output) g_output->Release();
+    g_output = out;
+    g_output_name = od.DeviceName;
+    g_refresh = hz;
   }
-  if (g_output) g_output->Release();
-  g_output = out;
-  g_output_name = od.DeviceName;
-  g_refresh = hz;
-  g_divisor = divisor_for(hz);
+  double fps = target_fps();
+  u32 div = divisor_for(hz, fps);
   const std::string& want = cfg().pacing;
-  if (want == "clock") g_divisor = 0;
-  else if (want == "display" && !g_divisor && hz) g_divisor = std::max<u32>(1, (hz + 30) / 60);
+  if (want == "clock") div = 0;
+  else if (want == "display" && !div && hz) div = std::max<u32>(1, u32(std::lround(double(hz) / fps)));
+  {
+    std::lock_guard lk(g_mu);
+    g_divisor = div;
+  }
   char name[64];
   WideCharToMultiByte(CP_UTF8, 0, od.DeviceName, -1, name, sizeof name, nullptr, nullptr);
-  if (g_divisor)
-    LOG_I("display", "output %s at %u Hz: the game's vblank follows every %u%s display vblank (%.2f Hz)", name, hz, g_divisor,
-          g_divisor == 1 ? "" : g_divisor == 2 ? "nd" : g_divisor == 3 ? "rd" : "th", double(hz) / g_divisor);
+  if (div)
+    LOG_I("display", "output %s at %u Hz, target %.0f fps: the game's vblank follows every %u%s display vblank (%.2f Hz)", name, hz,
+          fps, div, div == 1 ? "" : div == 2 ? "nd" : div == 3 ? "rd" : "th", double(hz) / div);
   else
-    LOG_I("display", "output %s at %u Hz: not a multiple of ~60 Hz; the game's vblank runs from a 60 Hz clock%s", name, hz,
-          g_tearing ? ", frames presented with tearing allowed (even pacing on variable-refresh displays)" : "");
+    LOG_I("display", "output %s at %u Hz, target %.0f fps: not a whole multiple; the game's vblank runs from a %.0f Hz clock%s", name,
+          hz, fps, fps, g_tearing ? ", frames presented with tearing allowed (even pacing on variable-refresh displays)" : "");
 }
 
 }  // namespace
@@ -191,7 +208,7 @@ std::string report() {
     tearing = g_tearing;
   }
   std::string pacing = div && g_locked.load() ? acfa::strprintf("display-locked every %u vblank%s", div, div > 1 ? "s" : "")
-                           : acfa::strprintf("60 Hz clock%s", tearing ? ", tearing allowed" : "");
+                           : acfa::strprintf("%.0f Hz clock%s", target_fps(), tearing ? ", tearing allowed" : "");
   if (!s.presents) return acfa::strprintf("display: %u Hz, %s; no frames presented", hz, pacing.c_str());
   std::string shown;
   u64 known = 0;

@@ -116,6 +116,7 @@ int main(int argc, char** argv) {
     else if (a == "--audio-capture") c.audio_capture = true;
     else if (a == "--gcm-wait") c.gcm_wait_spin = next() == "spin";
     else if (a == "--pacing") c.pacing = next();
+    else if (a == "--fps") { std::string v = next(); c.fps = v == "display" ? 0 : std::max(30.0, std::atof(v.c_str())); }
     else if (a == "--fullscreen") c.fullscreen = true;
     else if (a == "--shot-interval") c.shot_interval = std::atof(next().c_str());
     else {

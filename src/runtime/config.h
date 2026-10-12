@@ -44,6 +44,7 @@ struct Config {
   bool audio_capture = false;       // write the mixed output to <run>/audio.f32 (48 kHz float stereo)
   bool gcm_wait_spin = false;       // --gcm-wait spin: libgcm fragment waits spin with Sleep(0) (A/B)
   std::string pacing = "auto";      // emulated vblank source (gpu/display.h): auto | display | clock
+  double fps = 60;                  // game frame rate target (--fps N | display: 0 = the display's refresh)
   bool fullscreen = false;          // start in borderless fullscreen (F11 / Alt+Enter toggle)
   std::string spu_cache;            // where collected SPU code records are written
   std::string shader_cache;         // compiled HLSL (derived from the game's shaders; machine-local)

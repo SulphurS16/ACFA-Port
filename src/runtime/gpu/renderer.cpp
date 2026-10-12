@@ -13,6 +13,7 @@
 #include <cstring>
 #include <filesystem>
 #include <map>
+#include <mutex>
 #include <thread>
 #include <unordered_map>
 
@@ -35,6 +36,7 @@
 namespace rt::gpu {
 std::atomic<int> g_capture_requests{0};
 std::atomic<u32> g_capture_index{0};
+std::atomic<int> g_framehash_requests{0}, g_framehash_total{0};  // "framehash N" (maybe_capture)
 }  // namespace rt::gpu
 
 namespace rt::rsx {
@@ -2243,9 +2245,46 @@ void set_immediate(u32 attr, u32 comp_mask, const float* v) {
 
 // Captures do not stall the frame: the copy is read back once the GPU has finished it and the PNG
 // is encoded on a worker thread.
+// Distinct-frame check ("framehash N" control command): the next N presented frames are read back
+// and hashed; consecutive frames with equal hashes are repeats (frames the game presented without
+// new content). Readbacks that cannot keep up skip frames; only pairs of consecutive frame numbers
+// are compared.
+std::mutex g_fh_mu;
+std::vector<std::pair<u32, u64>> g_fh;  // (frame number, hash)
+u32 g_fh_expect = 0;
+void framehash_done(u32 frame, u64 h) {
+  std::lock_guard lk(g_fh_mu);
+  g_fh.push_back({frame, h});
+  if (g_fh.size() < g_fh_expect) return;
+  std::sort(g_fh.begin(), g_fh.end());
+  u32 pairs = 0, repeats = 0, longest = 0, run = 0;
+  for (size_t i = 1; i < g_fh.size(); ++i) {
+    if (g_fh[i].first != g_fh[i - 1].first + 1) {
+      run = 0;
+      continue;
+    }
+    ++pairs;
+    if (g_fh[i].second == g_fh[i - 1].second) {
+      ++repeats;
+      longest = std::max(longest, ++run);
+    } else {
+      run = 0;
+    }
+  }
+  LOG_I("perf", "framehash: %zu frames hashed (%u..%u), %u consecutive pairs, %u identical to the previous frame (%.1f%%), "
+        "longest run of repeats %u", g_fh.size(), g_fh.front().first, g_fh.back().first, pairs, repeats,
+        pairs ? 100.0 * repeats / pairs : 0.0, longest);
+  g_fh.clear();
+  g_fh_expect = 0;
+}
+
 void maybe_capture() {
   gpu::rec().call([](ID3D11DeviceContext*) {  // in stream order, after the frame's presentation
     gpu::poll_captures([](u32 n, std::vector<u8>&& rgba, u32 w, u32 h) {
+      if (n & 0x80000000u) {  // a framehash readback: n holds the frame number
+        std::thread([n, px = std::move(rgba)] { framehash_done(n & 0x7fffffffu, hash_bytes(px.data(), px.size())); }).detach();
+        return;
+      }
       std::thread([n, w, h, px = std::move(rgba)] {
         std::string path = cfg().run_dir + acfa::strprintf("\\shot_%04u.png", n);
         bool uniform = !px.empty();  // a frame of one color usually means nothing was drawn: say so
@@ -2256,6 +2295,14 @@ void maybe_capture() {
       }).detach();
     });
   });
+  if (gpu::g_framehash_requests.load() > 0) {
+    if (gpu::g_framehash_requests.fetch_sub(1) == gpu::g_framehash_total.load()) {
+      std::lock_guard lk(g_fh_mu);
+      g_fh.clear();
+      g_fh_expect = gpu::g_framehash_total.load();
+    }
+    gpu::rec().call([f = u32(g_frame)](ID3D11DeviceContext*) { gpu::begin_capture(0x80000000u | (f & 0x7fffffffu)); });
+  }
   if (gpu::g_capture_requests.load() <= 0) return;
   gpu::g_capture_requests.fetch_sub(1);
   u32 n = gpu::g_capture_index.fetch_add(1);
@@ -2492,7 +2539,37 @@ void pacing_frame() {
   compiled_at_start = compiled;
 }
 
+// Per-flip motion check ("track ADDR N" control command): the vector at ADDR (e.g. an entity's
+// position, entity + 0x40) is read at each of the next N flips; flips where it did not change are
+// frames without new motion for that object.
+std::atomic<u32> g_track_addr{0}, g_track_left{0};
+void track_flip() {
+  static std::vector<std::array<float, 3>> pos;
+  static std::vector<double> at;
+  u32 left = g_track_left.load(std::memory_order_relaxed);
+  if (!left) return;
+  u32 a = g_track_addr.load();
+  pos.push_back({::ppu::bitsf(::ppu::r32(a)), ::ppu::bitsf(::ppu::r32(a + 4)), ::ppu::bitsf(::ppu::r32(a + 8))});
+  at.push_back(log_time());
+  if (g_track_left.fetch_sub(1) != 1) return;
+  u32 still = 0;
+  double total = 0, min_step = 1e30, max_step = 0;
+  for (size_t i = 1; i < pos.size(); ++i) {
+    double d = std::sqrt(std::pow(pos[i][0] - pos[i - 1][0], 2) + std::pow(pos[i][1] - pos[i - 1][1], 2) + std::pow(pos[i][2] - pos[i - 1][2], 2));
+    still += d < 1e-4;
+    total += d;
+    min_step = std::min(min_step, d);
+    max_step = std::max(max_step, d);
+  }
+  double secs = at.back() - at.front();
+  LOG_I("perf", "track 0x%08x: %zu flips in %.3f s, %u without movement, path %.2f units (%.2f/s), step min %.4f max %.4f", a,
+        pos.size(), secs, still, total, secs > 0 ? total / secs : 0.0, min_step, max_step);
+  pos.clear();
+  at.clear();
+}
+
 void present_buffer(u32 id, const DisplayBuffer& b) {
+  track_flip();
   if (!g_have_device || !b.width || !b.height) return;
   if (fr_on()) LOG_I("frame", "flip buffer %u at 0x%x (%ux%u)", id, b.offset, b.width, b.height);
   pacing_frame();
