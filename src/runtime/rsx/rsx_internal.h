@@ -72,6 +72,8 @@ struct PhaseScope {
   ~PhaseScope() { phase_switch(prev); }
 };
 void renderer_flush();                          // finish pending GPU work before a sync point
-u32 renderer_report_value(u32 type);            // value for GET_REPORT (e.g. ZPASS_PIXEL_CNT)
+// Value for GET_REPORT of `type` written to guest address `ea` (pixel counts arrive later, see
+// renderer.cpp "Pixel counts").
+u32 renderer_report_value(u32 type, u32 ea);
 
 }  // namespace rt::rsx

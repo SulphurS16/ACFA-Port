@@ -94,7 +94,8 @@ u64 g_frame = 0;
 // Work counters, logged as per-frame averages every 300 frames (perf).
 struct RenderStats {
   u64 draws = 0, vcached = 0, vconverted = 0, tex_hashed = 0, tex_uploaded = 0, surfaces = 0, target_binds = 0, collections = 0,
-      bytes_queried = 0, vertices = 0, max_draw_vertices = 0, vbytes = 0, query_calls = 0, query_ticks = 0, query_written = 0;
+      bytes_queried = 0, vertices = 0, max_draw_vertices = 0, vbytes = 0, query_calls = 0, query_ticks = 0, query_written = 0,
+      cond_draws = 0, cond_skipped = 0, zpass_reports = 0, zcull_reports = 0;
 };
 RenderStats g_rs, g_rs_last;
 
@@ -1639,9 +1640,14 @@ bool dump_texture(ID3D11ShaderResourceView* srv, u32 w, u32 h, const std::string
 
 void fr_frame_boundary() {
   if (cfg().frame_report < 0 || g_fr.state == 2) return;
+  static int frames_left = 2;  // two frames: work done every other frame (e.g. ACFA's sun test) shows up
   if (g_fr.state == 0) {
     if (log_time() < cfg().frame_report) return;
     g_fr.state = 1;
+    LOG_I("frame", "frame report: frame %llu begins", (unsigned long long)g_frame);
+    return;
+  }
+  if (--frames_left > 0) {
     LOG_I("frame", "frame report: frame %llu begins", (unsigned long long)g_frame);
     return;
   }
@@ -2219,7 +2225,11 @@ void flush_draw() {
   bump(g.draws);
   if (reg(m::SET_RENDER_ENABLE) >> 24 == 2) {
     u32 ea = kReportAddr + (reg(m::SET_RENDER_ENABLE) & 0xffffff);
-    if (ppu::r32(ea + 8) == 0) return;  // conditional rendering: report value is zero
+    ++g_rs.cond_draws;
+    if (ppu::r32(ea + 8) == 0) {  // conditional rendering: report value is zero
+      ++g_rs.cond_skipped;
+      return;
+    }
   }
   // With depth and stencil tests disabled a draw neither reads nor writes the depth buffer (GL
   // semantics): it is not bound, so passes with other clip sizes leave the depth surface alone.
@@ -2645,6 +2655,103 @@ int phase_switch(int p) {
 }
 
 // ---------------------------------------------------------------------------------------------
+// Pixel counts (ZPASS_PIXEL_CNT reports, rsx_facts §8): the samples passing the depth/stencil
+// tests while counting is enabled (SET_ZPASS_PIXEL_COUNT_ENABLE) since the last
+// CLEAR_REPORT_VALUE(1). Each counting span is a D3D11 occlusion query. A report gets at once the
+// last count known for its address (ACFA asks about every other frame in missions and reads the
+// value later), and the submission thread writes the real count into guest memory once the GPU
+// has it (polled at frame ends). Was always 0 before (nothing ever counted as visible).
+namespace {
+ID3D11Query* g_zp_open = nullptr;        // FIFO thread: the query of the counting span in progress
+std::vector<ID3D11Query*> g_zp_closed;   // FIFO thread: spans ended since the last clear
+bool g_zp_used = false;                  // FIFO thread: a pixel count was reported (frame-end polls)
+bool g_zp_on = true;                     // "gpu zpass on|off" (A/B: off answers 0 as before)
+std::mutex g_zp_mu;
+std::unordered_map<u32, u32> g_zp_last;  // report address -> last count written (under g_zp_mu)
+struct ZpReport {
+  u32 ea;
+  std::vector<ID3D11Query*> qs;
+};
+std::vector<ZpReport> g_zp_pending;  // submission thread (recorded calls) only
+
+void zpass_begin() {
+  D3D11_QUERY_DESC qd{D3D11_QUERY_OCCLUSION, 0};
+  ID3D11Query* q = nullptr;
+  if (FAILED(device().dev->CreateQuery(&qd, &q))) return;
+  gpu::rec().call([q](ID3D11DeviceContext* c) { c->Begin(q); });
+  g_zp_open = q;
+}
+void zpass_end() {
+  ID3D11Query* q = g_zp_open;
+  if (!q) return;
+  gpu::rec().call([q](ID3D11DeviceContext* c) { c->End(q); });
+  g_zp_closed.push_back(q);
+  g_zp_open = nullptr;
+  if (g_zp_closed.size() == 1024) warn_once("zpass-spans", "pixel counting: 1024 spans without CLEAR_REPORT_VALUE");
+}
+void zpass_enable(bool on) {
+  if (fr_on()) LOG_I("frame", "pixel counting %s", on ? "on" : "off");
+  if (!g_have_device || (on && !g_zp_on)) return;
+  if (on && !g_zp_open) zpass_begin();
+  else if (!on) zpass_end();
+}
+void zpass_clear() {
+  bool counting = g_zp_open != nullptr;
+  zpass_end();
+  for (ID3D11Query* q : g_zp_closed) gpu::rec().release(q);
+  g_zp_closed.clear();
+  if (counting) zpass_begin();  // counting stays enabled across the clear
+}
+// Submission thread: writes the counts of the reports whose queries have finished.
+void zpass_poll(ID3D11DeviceContext* c) {
+  for (auto it = g_zp_pending.begin(); it != g_zp_pending.end();) {
+    u64 total = 0;
+    bool done = true;
+    for (ID3D11Query* q : it->qs) {
+      UINT64 n = 0;
+      if (c->GetData(q, &n, sizeof n, D3D11_ASYNC_GETDATA_DONOTFLUSH) != S_OK) {
+        done = false;
+        break;
+      }
+      total += n;
+    }
+    if (!done) {
+      ++it;
+      continue;
+    }
+    u32 v = u32(std::min<u64>(total, 0xffffffffu));
+    static int logged = 0;
+    if (logged < 6) {
+      ++logged;
+      LOG_I("gpu", "pixel count report at 0x%08x: %u samples (%zu spans)", it->ea, v, it->qs.size());
+    }
+    ppu::w32(it->ea + 8, v);
+    {
+      std::lock_guard lk(g_zp_mu);
+      g_zp_last[it->ea] = v;
+    }
+    for (ID3D11Query* q : it->qs) q->Release();
+    it = g_zp_pending.erase(it);
+  }
+}
+u32 zpass_report(u32 ea) {
+  if (fr_on()) LOG_I("frame", "pixel count report to 0x%08x", ea);
+  if (!g_have_device || !g_zp_on) return 0;
+  g_zp_used = true;
+  if (g_zp_open) {  // the count so far: this span ends, counting goes on in a new one
+    zpass_end();
+    zpass_begin();
+  }
+  std::vector<ID3D11Query*> qs = g_zp_closed;
+  for (ID3D11Query* q : qs) q->AddRef();  // the resolver's references
+  gpu::rec().call([qs, ea](ID3D11DeviceContext*) { g_zp_pending.push_back({ea, qs}); });
+  std::lock_guard lk(g_zp_mu);
+  auto it = g_zp_last.find(ea);
+  return it == g_zp_last.end() ? 0 : it->second;
+}
+}  // namespace
+
+// ---------------------------------------------------------------------------------------------
 // Hooks
 void renderer_thread_init() {
   void* hwnd = nullptr;
@@ -2865,10 +2972,12 @@ void present_buffer(u32 id, const DisplayBuffer& b) {
     u64 surf_bytes = 0;
     for (const Surface* s : g_surfaces) surf_bytes += surface_bytes(s);
     LOG_I("perf",
-          "per frame: %.0f draws (vertex data %.0f cached, %.0f uploaded: %.0f KiB, element span %.0f), textures %.1f hashed "
+          "per frame: %.0f draws (%.1f conditional, %.1f of them skipped; %.1f pixel count and %.1f zcull reports; vertex data %.0f cached, %.0f uploaded: %.0f KiB, element span %.0f), textures %.1f hashed "
           "%.1f uploaded, %.2f surfaces created, %.1f target changes, %.1f collections (%.0f write queries over %.0f MiB, "
           "%.2f ms, %.0f pages written); static vertex data %zu entries %.0f MiB; textures %zu %.0f MiB; surfaces %zu %.0f MiB",
-          pf(&RenderStats::draws), pf(&RenderStats::vcached), pf(&RenderStats::vconverted), pf(&RenderStats::vbytes) / 1024.0,
+          pf(&RenderStats::draws), pf(&RenderStats::cond_draws), pf(&RenderStats::cond_skipped), pf(&RenderStats::zpass_reports),
+          pf(&RenderStats::zcull_reports), pf(&RenderStats::vcached),
+          pf(&RenderStats::vconverted), pf(&RenderStats::vbytes) / 1024.0,
           pf(&RenderStats::vertices), pf(&RenderStats::tex_hashed), pf(&RenderStats::tex_uploaded), pf(&RenderStats::surfaces),
           pf(&RenderStats::target_binds), pf(&RenderStats::collections), pf(&RenderStats::query_calls),
           pf(&RenderStats::bytes_queried) / 1048576.0, pf(&RenderStats::query_ticks) * g_ms_per_tick, pf(&RenderStats::query_written),
@@ -2890,6 +2999,7 @@ void present_buffer(u32 id, const DisplayBuffer& b) {
   maybe_capture();
   gpu::timing::frame_end();
   g_rt_label = "-";
+  if (g_zp_used) gpu::rec().call([](ID3D11DeviceContext* c) { zpass_poll(c); });  // pixel count results
   gpu::rec().frame_end(1);  // at most one presented frame queued behind the FIFO thread
   gpu::apply_submit_mode();
 }
@@ -2903,7 +3013,8 @@ void renderer_mark_special(void (*mark)(u32 method, u32 bytes)) {
   mark(m::SET_VERTEX_DATA4UB_M, 0x40);
   mark(m::SET_VERTEX_DATA3F_M, 0x100);
   for (u32 method : {m::SET_TRANSFORM_PROGRAM_LOAD, m::SET_TRANSFORM_CONSTANT_LOAD, m::SET_BEGIN_END, m::DRAW_ARRAYS,
-                     m::DRAW_INDEX_ARRAY, m::INLINE_ARRAY, m::ARRAY_ELEMENT16, m::ARRAY_ELEMENT32, m::CLEAR_SURFACE})
+                     m::DRAW_INDEX_ARRAY, m::INLINE_ARRAY, m::ARRAY_ELEMENT16, m::ARRAY_ELEMENT32, m::CLEAR_SURFACE,
+                     m::SET_ZPASS_PIXEL_COUNT_ENABLE, m::CLEAR_REPORT_VALUE})
     mark(method, 4);
 }
 
@@ -3039,6 +3150,12 @@ void renderer_method(u32 ri, u32 arg, u32 count, u32 index) {
     case m::CLEAR_SURFACE:
       if (g_have_device) clear_surface(arg);
       return;
+    case m::SET_ZPASS_PIXEL_COUNT_ENABLE:
+      zpass_enable(arg != 0);
+      return;
+    case m::CLEAR_REPORT_VALUE:
+      if (arg == 1) zpass_clear();
+      return;
     default:
       return;
   }
@@ -3074,6 +3191,11 @@ bool gpu_option(const std::string& name, const std::string& value) {
     LOG_I("gpu", "write tracking: runs up to %u granules apart queried together", g_ww_gap);
     return true;
   }
+  if (name == "zpass" && (value == "on" || value == "off")) {
+    g_zp_on = value == "on";
+    LOG_I("gpu", "pixel count reports %s", g_zp_on ? "from occlusion queries" : "answered with 0");
+    return true;
+  }
   if (name == "zcullstats" && (value == "on" || value == "off")) {
     g_zcull_stats = value == "on";
     LOG_I("gpu", "zcull statistics reports %s", value == "on" ? "-1 while enabled (as RPCS3)" : "0");
@@ -3098,12 +3220,18 @@ bool gpu_option(const std::string& name, const std::string& value) {
 }
 
 // Reports (rsx_facts §8): zcull statistics (types 2-4) are not modelled; as RPCS3 they read -1
-// while zcull and its statistics are enabled, else 0 (ACFA requests type 2). Pixel counts
-// (type 1, occlusion) and ZCULL_STATS3 are answered with 0. "gpu zcullstats off" answers 0 for all.
-u32 renderer_report_value(u32 type) {
+// while zcull and its statistics are enabled, else 0 (ACFA requests type 2). Pixel counts (type
+// 1) come from occlusion queries ("Pixel counts" above). ZCULL_STATS3 is answered with 0. "gpu
+// zcullstats off" answers 0 for zcull statistics.
+u32 renderer_report_value(u32 type, u32 ea) {
+  if (type == 1) {
+    ++g_rs.zpass_reports;
+    return zpass_report(ea);
+  }
+  ++g_rs.zcull_reports;
   if (type >= 2 && type <= 4 && g_zcull_stats)
     return reg(m::SET_ZCULL_STATS_ENABLE) && reg(m::SET_ZCULL_EN) ? 0xffffffffu : 0u;
-  warn_once("report" + std::to_string(type), "GET_REPORT type " + std::to_string(type) + " answered with 0 (occlusion counting not implemented)");
+  warn_once("report" + std::to_string(type), "GET_REPORT type " + std::to_string(type) + " answered with 0 (not modelled)");
   return 0;
 }
 

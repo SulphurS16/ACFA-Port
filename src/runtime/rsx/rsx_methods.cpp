@@ -56,7 +56,7 @@ void get_report(u32 arg) {
     LOG_E("rsx", "GET_REPORT to invalid offset 0x%x (location %u)", offset, loc);
     return;
   }
-  u32 value = renderer_report_value(type);
+  u32 value = renderer_report_value(type, ea);
   ppu::w64(ea, lv2::system_time_us() * 1000);  // nanoseconds
   ppu::w32(ea + 8, value);
   ppu::w32(ea + 12, 0);
