@@ -7,6 +7,7 @@
 #include <atomic>
 #include <chrono>
 #include <cstdio>
+#include <cstdlib>
 #include <ctime>
 #include <filesystem>
 #include <fstream>
@@ -181,6 +182,7 @@ int main(int argc, char** argv) {
     else if (a == "--pacing") c.pacing = next();
     else if (a == "--fps") { std::string v = next(); c.fps = v == "display" ? 0 : std::max(30.0, std::atof(v.c_str())); }
     else if (a == "--fullscreen") c.fullscreen = true;
+    else if (a == "--affinity") c.affinity = std::strtoull(next().c_str(), nullptr, 16);
     else if (a == "--shot-interval") c.shot_interval = std::atof(next().c_str());
     else {
       std::fprintf(stderr, "unknown argument %s\n", a.c_str());
@@ -211,6 +213,12 @@ int main(int argc, char** argv) {
   }
   prof::start(c.profile);
   LOG_I("main", "run dir %s", c.run_dir.c_str());
+  if (c.affinity) {  // --affinity MASK (hex): fewer logical CPUs, to estimate smaller machines
+    if (SetProcessAffinityMask(GetCurrentProcess(), DWORD_PTR(c.affinity)))
+      LOG_I("main", "--affinity: limited to logical CPUs 0x%llx (%d of them)", c.affinity, __builtin_popcountll(c.affinity));
+    else
+      LOG_W("main", "--affinity 0x%llx not applied (error %lu)", c.affinity, GetLastError());
+  }
   if (c.warm_shaders) {  // pipeline step: shader cache from the manifest, no game run
     gpu::WarmResult w = gpu::warm_shaders((root / "data" / "shader_manifest.txt").string(), c.disc_root, c.prepared);
     if (!w.error.empty()) {

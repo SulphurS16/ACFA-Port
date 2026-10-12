@@ -1148,6 +1148,7 @@ ID3D11ShaderResourceView* texture_view(const gpu::TexDesc& t, float* scale) {
 // Depth compare (shadow) fetch (rsx_facts §2.9, as RPCS3): a depth format, a compare function
 // other than NEVER/ALWAYS (ADDRESS[31:28]) and alpha kill off. The fetch returns the filtered test
 // result in every channel instead of the depth (2D textures; cube shadows not handled).
+bool g_zcull_stats = true;  // "gpu zcullstats on|off" (renderer_report_value)
 bool g_depth_compare = true;  // "gpu shadow on|off" (A/B: off samples the depth values as before)
 bool depth_compare(const gpu::TexDesc& t) {
   u32 zfunc = t.address >> 28;
@@ -3067,6 +3068,11 @@ bool gpu_option(const std::string& name, const std::string& value) {
     LOG_I("gpu", "write tracking: runs up to %u granules apart queried together", g_ww_gap);
     return true;
   }
+  if (name == "zcullstats" && (value == "on" || value == "off")) {
+    g_zcull_stats = value == "on";
+    LOG_I("gpu", "zcull statistics reports %s", value == "on" ? "-1 while enabled (as RPCS3)" : "0");
+    return true;
+  }
   if (name == "shadow" && (value == "on" || value == "off")) {
     g_depth_compare = value == "on";
     LOG_I("gpu", "depth compare (shadow) fetches %s", value.c_str());
@@ -3085,8 +3091,13 @@ bool gpu_option(const std::string& name, const std::string& value) {
   return false;
 }
 
+// Reports (rsx_facts §8): zcull statistics (types 2-4) are not modelled; as RPCS3 they read -1
+// while zcull and its statistics are enabled, else 0 (ACFA requests type 2). Pixel counts
+// (type 1, occlusion) and ZCULL_STATS3 are answered with 0. "gpu zcullstats off" answers 0 for all.
 u32 renderer_report_value(u32 type) {
-  warn_once("report", "GET_REPORT type " + std::to_string(type) + " answered with 0 (occlusion/zcull counting not implemented)");
+  if (type >= 2 && type <= 4 && g_zcull_stats)
+    return reg(m::SET_ZCULL_STATS_ENABLE) && reg(m::SET_ZCULL_EN) ? 0xffffffffu : 0u;
+  warn_once("report" + std::to_string(type), "GET_REPORT type " + std::to_string(type) + " answered with 0 (occlusion counting not implemented)");
   return 0;
 }
 

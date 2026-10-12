@@ -48,6 +48,7 @@ struct Config {
   std::string pacing = "auto";      // emulated vblank source (gpu/display.h): auto | display | clock
   double fps = 60;                  // game frame rate target (--fps N | display: 0 = the display's refresh)
   bool fullscreen = false;          // start in borderless fullscreen (F11 / Alt+Enter toggle)
+  unsigned long long affinity = 0;  // --affinity MASK: logical CPUs the process may use (hardware range estimates)
   std::string spu_cache;            // where collected SPU code records are written
   std::string shader_cache;         // compiled HLSL (derived from the game's shaders; machine-local)
   std::string shader_records;       // programs recorded with --shader-collect (game-derived; machine-local)
