@@ -37,10 +37,12 @@ std::atomic<bool> g_locked{false};  // the last vblank came from the display (el
 // opening movie at 120 Hz decoded 4 pictures and stopped; 75 Hz started 13 s late), and the
 // movies are 30 fps: while one plays, the vblank runs at 60 Hz.
 std::atomic<int> g_movies{0};
+std::atomic<int> g_gameplay{0};  // missions running (frame_policy.cpp)
 
 // The game's frame rate target: --fps N (default 60), or the display's refresh (--fps display).
 // The game advances its simulation by measured time (GAME_NOTES "Frame pacing": movement, turning
 // and per-frame motion identical at 60 and 120 Hz), so the emulated vblank rate sets the frame rate.
+// Targets above 60 apply in missions only: some menu fades count frames, and movies need 60.
 double target_fps() {
   double fps;
   if (cfg().fps > 0) {
@@ -49,7 +51,8 @@ double target_fps() {
     std::lock_guard lk(g_mu);
     fps = g_refresh >= 30 ? double(g_refresh) : 60.0;
   }
-  return fps > 60.5 && g_movies.load(std::memory_order_relaxed) > 0 ? 60.0 : fps;
+  bool capped = g_movies.load(std::memory_order_relaxed) > 0 || g_gameplay.load(std::memory_order_relaxed) == 0;
+  return fps > 60.5 && capped ? 60.0 : fps;
 }
 
 // Display-locked pacing needs a refresh that is a whole multiple of the target (within 1.5 Hz).
@@ -141,7 +144,13 @@ void movie_started() {
     LOG_I("display", "video playback: the emulated vblank runs at up to 60 Hz until it ends");
 }
 void movie_stopped() {
-  if (g_movies.fetch_sub(1) == 1 && cfg().fps != 60) LOG_I("display", "video playback ended: the frame rate target applies again");
+  if (g_movies.fetch_sub(1) == 1 && cfg().fps != 60) LOG_I("display", "video playback ended");
+}
+void gameplay_started() {
+  if (g_gameplay.fetch_add(1) == 0 && cfg().fps != 60) LOG_I("display", "mission started: frame rate target %.0f", target_fps());
+}
+void gameplay_stopped() {
+  if (g_gameplay.fetch_sub(1) == 1 && cfg().fps != 60) LOG_I("display", "mission ended: up to 60 Hz outside missions");
 }
 
 void wait_next_vblank() {

@@ -24,6 +24,10 @@ void wait_next_vblank();
 // open (the system movie player's A/V sync fails above 60 Hz).
 void movie_started();
 void movie_stopped();
+// A mission started / ended (game/frame_policy.cpp): the configured frame rate applies in
+// missions; outside them the vblank runs at up to 60 Hz.
+void gameplay_started();
+void gameplay_stopped();
 // Present flags for the current pacing (DXGI_PRESENT_ALLOW_TEARING in clock mode when supported).
 u32 present_flags();
 // The swap chain was created (tearing: created with DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING). Called on
