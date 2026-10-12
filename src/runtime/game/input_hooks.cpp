@@ -6,7 +6,9 @@
 #include <atomic>
 #include <cmath>
 #include <cstring>
+#include <mutex>
 #include <sstream>
+#include <vector>
 
 #include "ppu/ppu_recomp.h"
 #include "runtime/bindings.h"
@@ -74,8 +76,12 @@ u32 bits_of_f32(float f) {
 // seen with vtables 0x1228610 and 0x1228550, AI-driven ACs' 0x122e3c8) read their virtual pad
 // state at +12 (vtable slot 2, 0x70b540); the player's is the one the operator writes.
 constexpr u32 kAiInputVtable = 0x0122e3c8;
-// The player operator (0x6eee98) sets the turn command through a temporary view object (vtable
-// 0x1226c30, on the stack) from this call site; the setter sees no AI objects.
+// The player operator sets the turn and pitch commands through a temporary view object on the
+// stack (vtable 0x1226c30); AI-driven units do not use that class. The operator code differs by
+// state: the reference saw the calls from 0x6eee98 (return sites 0x6ef030 turn, 0x6ef110 /
+// 0x6ef77c pitch); with this project's saves (Line Ark, Mimir) they come from 0x6e2198 (turn
+// 0x6e22ec) and 0x6edef4 (pitch). The view class identifies the player in every variant.
+constexpr u32 kPlayerViewVtable = 0x01226c30;
 constexpr u32 kPlayerTurnSetSite = 0x006ef030;
 // Sensitivity 1.0: 1000 counts per second turn the AC at its full rate (value 1.0), i.e. one count
 // turns 1/1000 of the AC's full rate times one second (0.075 deg for an AC turning 75 deg/s).
@@ -113,7 +119,8 @@ constexpr u32 kLookToPosition = 0xD49C;
 
 bool is_player_input(u32 input) {
   u32 state = g_player_state.load(std::memory_order_relaxed);
-  return state && input && rt::vm::committed(input, 16) && r32(input + 12) == state;
+  // input is the game's own call argument (no VirtualQuery here: it costs milliseconds per call in this process)
+  return state && input && r32(input + 12) == state;
 }
 
 void mouse_axis(MouseAxis& a, s64 counts, double sens, double dt) {
@@ -150,7 +157,7 @@ void mouse_look_frame() {
   mouse_axis(g_mouse_pitch, m.invert_y ? -dy : dy, pitch_sens, dt);
   // At a pitch limit the game discards motion beyond it; the carried mouse motion toward that limit
   // is dropped too, so pushing against the limit leaves no dead zone for the way back.
-  if (u32 look = g_look.load(std::memory_order_relaxed); g_mouse_pitch.backlog != 0 && look && rt::vm::committed(look + 48, 40)) {
+  if (u32 look = g_look.load(std::memory_order_relaxed); g_mouse_pitch.backlog != 0 && look) {
     float angle = f32_of_bits(r32(look + 48)), hi = f32_of_bits(r32(look + 48 + 32)), lo = f32_of_bits(r32(look + 48 + 36));
     double toward = g_mouse_pitch.backlog * pitch_sens;  // > 0: up
     if ((toward > 0 && angle >= hi) || (toward < 0 && angle <= lo)) g_mouse_pitch.backlog = 0;
@@ -182,7 +189,17 @@ void hook_input_axis_get(Ctx& ctx, void (*orig)(Ctx&)) {
 // mouse turn of this frame is added to the stick's value.
 void hook_input_turn_set(Ctx& ctx, void (*orig)(Ctx&)) {
   u32 input = u32(ctx.r[3]);
-  if (u32(ctx.lr) == kPlayerTurnSetSite) {
+  {  // diagnostics: the call sites seen (the first 8 distinct ones)
+    static std::mutex mu;
+    static std::vector<u32> sites;
+    std::lock_guard lk(mu);
+    u32 lr = u32(ctx.lr);
+    if (sites.size() < 8 && std::find(sites.begin(), sites.end(), lr) == sites.end()) {
+      sites.push_back(lr);
+      LOG_I("input", "turn command setter called from 0x%08x (input 0x%08x, vtable %08x)", lr, input, input ? r32(input) : 0);
+    }
+  }
+  if (u32(ctx.lr) == kPlayerTurnSetSite || (input && r32(input) == kPlayerViewVtable)) {
     static int logged = 0;
     if (g_turn_input.exchange(input) != input && logged++ < 4)
       LOG_I("input", "mouse look: player turn command set through 0x%08x (vtable %08x), pad state 0x%08x", input,
@@ -201,7 +218,19 @@ void hook_input_turn_set(Ctx& ctx, void (*orig)(Ctx&)) {
 // mouse pitch of this frame is added to the stick's value (after the game's own inversion option).
 void hook_input_pitch_set(Ctx& ctx, void (*orig)(Ctx&)) {
   u32 lr = u32(ctx.lr);
-  if (lr == kPlayerPitchSetSites[0] || lr == kPlayerPitchSetSites[1]) {
+  {  // diagnostics: the call sites seen (the first 8 distinct ones)
+    static std::mutex mu;
+    static std::vector<u32> sites;
+    std::lock_guard lk(mu);
+    u32 view = u32(ctx.r[3]);
+    if (sites.size() < 8 && std::find(sites.begin(), sites.end(), lr) == sites.end()) {
+      sites.push_back(lr);
+      LOG_I("input", "pitch command setter called from 0x%08x (view 0x%08x, vtable %08x)", lr, view, view ? r32(view) : 0);
+    }
+  }
+  u32 view = u32(ctx.r[3]);
+  if (lr == kPlayerPitchSetSites[0] || lr == kPlayerPitchSetSites[1] ||
+      (view && r32(view) == kPlayerViewVtable)) {
     float stick = float(ctx.f[1]);
     if (g_mouse_pitch.value != 0) ctx.f[1] = double(std::clamp(stick + g_mouse_pitch.value, -1.0f, 1.0f));
     if (g_trace_left.load(std::memory_order_relaxed) > 0 && g_trace_left.fetch_sub(1) > 0)
