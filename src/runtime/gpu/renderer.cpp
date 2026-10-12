@@ -93,7 +93,7 @@ u64 g_frame = 0;
 // Work counters, logged as per-frame averages every 300 frames (perf).
 struct RenderStats {
   u64 draws = 0, vcached = 0, vconverted = 0, tex_hashed = 0, tex_uploaded = 0, surfaces = 0, target_binds = 0, collections = 0,
-      bytes_queried = 0, vertices = 0, max_draw_vertices = 0, vbytes = 0;
+      bytes_queried = 0, vertices = 0, max_draw_vertices = 0, vbytes = 0, query_calls = 0, query_ticks = 0, query_written = 0;
 };
 RenderStats g_rs, g_rs_last;
 
@@ -102,6 +102,7 @@ const char* const kPhaseNames[kPhCount] = {"methods",    "surfaces", "shaders", 
                                            "write checks", "draw calls", "flip", "waits", "state",
                                            "constants",  "uploads"};
 u64 g_phase_ticks[kPhCount];
+double g_ms_per_tick = 0;  // TSC rate (pacing_frame)
 int g_phase = kPhMethods;
 u64 g_phase_at = 0;
 
@@ -696,24 +697,44 @@ std::vector<u32> g_page_serial;
 u32 g_mem_serial = 1;
 bool g_track_writes = true;
 // Only the 64 KiB granules holding cached data are queried (a query costs in proportion to the
-// range). A collection queries the granules a cache check used in the last kHotFrames frames, in
-// runs; the others keep their written state in the OS (it accumulates until reset) and are queried
-// when a check next touches them (refresh_granules), so data idle for a while costs nothing.
+// range). A collection queries, in runs, the granules a cache check used since the previous
+// collection (hot mode 1; mode 0: in the last kHotFrames frames: m540 0.66 instead of 0.37 ms per
+// frame); the others keep their written state in the OS (it accumulates until reset) and are
+// queried when a check next touches them (refresh_granules), so data idle for a while costs
+// nothing.
 constexpr u32 kGranuleShift = 16;
 constexpr u32 kGranules = 1u << (32 - kGranuleShift);
 constexpr u64 kHotFrames = 2;
+u32 g_hot_mode = 1;  // "gpu hot 0|1" (A/B)
+// Runs of hot granules this many granules apart or closer are queried in one call: a query costs
+// ~3 us per call and little per byte (m540: 504 calls over 268 MiB per frame took 1.7 ms), and
+// pages found written in the gaps are recorded like any others. "gpu wwgap N" (A/B).
+u32 g_ww_gap = 2;
 std::vector<u8> g_granule_watched(kGranules);
-std::vector<u32> g_granule_queried(kGranules);  // collection epoch of the last query
-std::vector<u64> g_granule_used(kGranules);     // frame of the last cache check touching it
+std::vector<u32> g_watched_list;  // the watched granules (sorted at the next collection)
+bool g_watched_sorted = true;
+std::vector<u32> g_granule_queried(kGranules);     // collection epoch of the last query
+std::vector<u64> g_granule_used(kGranules);        // frame of the last cache check touching it
+std::vector<u32> g_granule_used_epoch(kGranules);  // collection epoch of the last cache check touching it
 u32 g_collect_epoch = 0;
 void watch_range(u32 ea, u32 size) {
   for (u32 r = ea >> kGranuleShift, e = u32((u64(ea) + size + (1u << kGranuleShift) - 1) >> kGranuleShift); r < e && r < kGranules;
        ++r)
-    g_granule_watched[r] = 1;
+    if (!g_granule_watched[r]) {
+      g_granule_watched[r] = 1;
+      g_watched_list.push_back(r);
+      g_watched_sorted = false;
+    }
 }
 bool query_pages(u32 first, u32 end, std::vector<u32>& pages) {
   g_rs.bytes_queried += u64(end - first) << kGranuleShift;
-  if (vm::take_written_pages(first << kGranuleShift, (end - first) << kGranuleShift, pages)) return true;
+  ++g_rs.query_calls;
+  size_t before = pages.size();
+  u64 t0 = __rdtsc();
+  bool ok = vm::take_written_pages(first << kGranuleShift, (end - first) << kGranuleShift, pages);
+  g_rs.query_ticks += __rdtsc() - t0;
+  g_rs.query_written += pages.size() - before;
+  if (ok) return true;
   g_track_writes = false;
   LOG_W("gpu", "guest write tracking query failed: cached textures and vertices are re-checked by hashing");
   return false;
@@ -725,9 +746,13 @@ void refresh_granules(u32 ea, u32 size) {
   u32 r = ea >> kGranuleShift, e = u32(std::min<u64>((u64(ea) + size + (1u << kGranuleShift) - 1) >> kGranuleShift, kGranules));
   for (; r < e; ++r) {
     g_granule_used[r] = g_frame;
+    g_granule_used_epoch[r] = g_collect_epoch;
     if (!g_granule_watched[r] || g_granule_queried[r] == g_collect_epoch) continue;
     u32 run_end = r + 1;
-    while (run_end < e && g_granule_watched[run_end] && g_granule_queried[run_end] != g_collect_epoch) g_granule_used[run_end++] = g_frame;
+    while (run_end < e && g_granule_watched[run_end] && g_granule_queried[run_end] != g_collect_epoch) {
+      g_granule_used[run_end] = g_frame;
+      g_granule_used_epoch[run_end++] = g_collect_epoch;
+    }
     pages.clear();
     if (!query_pages(r, run_end, pages)) return;
     for (u32 k = r; k < run_end; ++k) g_granule_queried[k] = g_collect_epoch;
@@ -750,14 +775,19 @@ void collect_writes() {
   g_covered_put = ppu::r32(kControlAddr);  // read before the query: commands up to it are covered
   if (!g_track_writes) return;
   ++g_rs.collections;
-  ++g_collect_epoch;  // every granule is unqueried in the new epoch
+  u32 ended = g_collect_epoch++;  // every granule is unqueried in the new epoch
   if (g_page_serial.empty()) g_page_serial.assign(1u << 20, 0);
+  if (!g_watched_sorted) {
+    std::sort(g_watched_list.begin(), g_watched_list.end());
+    g_watched_sorted = true;
+  }
   // Hot granules in runs; small gaps are queried too (fewer calls for about the same cost).
   static std::vector<std::pair<u32, u32>> runs;
   runs.clear();
-  for (u32 r = 0; r < kGranules; ++r) {
-    if (!g_granule_watched[r] || g_granule_used[r] + kHotFrames < g_frame) continue;
-    if (!runs.empty() && r - runs.back().second <= 2) runs.back().second = r + 1;
+  for (u32 r : g_watched_list) {
+    bool hot = g_hot_mode ? g_granule_used_epoch[r] == ended : g_granule_used[r] + kHotFrames >= g_frame;
+    if (!hot) continue;
+    if (!runs.empty() && r - runs.back().second <= g_ww_gap) runs.back().second = r + 1;
     else runs.push_back({r, r + 1});
   }
   static std::vector<u32> pages;
@@ -2125,12 +2155,22 @@ void flush_draw() {
   env.fp32_exports = (sc >> 6) & 1;
   env.depth_export = (sc & 0xe) != 0 && t.depth;
   env.mrt_count = u8(std::max<u32>(t.count, 1));
-  gpu::TexDesc tex[16];
+  // Texture units decoded again only when one of their registers changed.
+  static gpu::TexDesc tex[16];
+  static u32 tex_regs[16][9];
+  static bool tex_memo = false;
   for (u32 u = 0; u < 16; ++u) {
-    tex[u] = gpu::decode_texture(g.regs, u);
+    u32 now[9];
+    std::memcpy(now, &g.regs[(0x1A00 + 0x20 * u) >> 2], 32);
+    now[8] = g.regs[(0x1840 + 4 * u) >> 2];
+    if (!tex_memo || std::memcmp(now, tex_regs[u], sizeof now)) {
+      tex[u] = gpu::decode_texture(g.regs, u);
+      std::memcpy(tex_regs[u], now, sizeof now);
+    }
     if (!tex[u].enabled) continue;
     env.tex_dim[u] = u8(tex[u].cubemap ? 4 : tex[u].dim == 3 ? 3 : tex[u].dim == 1 ? 1 : 2);
   }
+  tex_memo = true;
   const PsEntry* ps = pixel_shader(env, ::ppu::mem() + fp_ea, max_bytes, code_hash, sp);
   if (!ps->ps) return fr_drop("fragment program unusable");
 
@@ -2567,7 +2607,8 @@ void pacing_frame() {
   // performance counter since the first frame.
   static u64 tsc0 = 0;
   static LARGE_INTEGER qpc0{}, qpf{};
-  double ms_per_tick = 0;
+  double& ms_per_tick = g_ms_per_tick;
+  ms_per_tick = 0;
   {
     LARGE_INTEGER q;
     QueryPerformanceCounter(&q);
@@ -2727,11 +2768,12 @@ void present_buffer(u32 id, const DisplayBuffer& b) {
     for (const Surface* s : g_surfaces) surf_bytes += surface_bytes(s);
     LOG_I("perf",
           "per frame: %.0f draws (vertex data %.0f cached, %.0f uploaded: %.0f KiB, element span %.0f), textures %.1f hashed "
-          "%.1f uploaded, %.2f surfaces created, %.1f target changes, %.1f write queries (%.0f MiB); static vertex data %zu "
-          "entries %.0f MiB; textures %zu %.0f MiB; surfaces %zu %.0f MiB",
+          "%.1f uploaded, %.2f surfaces created, %.1f target changes, %.1f collections (%.0f write queries over %.0f MiB, "
+          "%.2f ms, %.0f pages written); static vertex data %zu entries %.0f MiB; textures %zu %.0f MiB; surfaces %zu %.0f MiB",
           pf(&RenderStats::draws), pf(&RenderStats::vcached), pf(&RenderStats::vconverted), pf(&RenderStats::vbytes) / 1024.0,
           pf(&RenderStats::vertices), pf(&RenderStats::tex_hashed), pf(&RenderStats::tex_uploaded), pf(&RenderStats::surfaces),
-          pf(&RenderStats::target_binds), pf(&RenderStats::collections), pf(&RenderStats::bytes_queried) / 1048576.0,
+          pf(&RenderStats::target_binds), pf(&RenderStats::collections), pf(&RenderStats::query_calls),
+          pf(&RenderStats::bytes_queried) / 1048576.0, pf(&RenderStats::query_ticks) * g_ms_per_tick, pf(&RenderStats::query_written),
           g_streams.size() + g_index_lists.size(), g_vdata_bytes / 1048576.0, g_tex.size(), g_tex_bytes / 1048576.0,
           g_surfaces.size(), surf_bytes / 1048576.0);
     g_rs_last = g_rs;
@@ -2752,6 +2794,36 @@ void present_buffer(u32 id, const DisplayBuffer& b) {
   g_rt_label = "-";
   gpu::rec().frame_end(1);  // at most one presented frame queued behind the FIFO thread
   gpu::apply_submit_mode();
+}
+
+void renderer_mark_special(void (*mark)(u32 method, u32 bytes)) {
+  mark(m::SET_TRANSFORM_PROGRAM, 0x80);
+  mark(m::SET_TRANSFORM_CONSTANT, 0x80);
+  mark(m::SET_VERTEX_DATA4F_M, 0x100);
+  mark(m::SET_VERTEX_DATA2F_M, 0x80);
+  mark(m::SET_VERTEX_DATA1F_M, 0x40);
+  mark(m::SET_VERTEX_DATA4UB_M, 0x40);
+  mark(m::SET_VERTEX_DATA3F_M, 0x100);
+  for (u32 method : {m::SET_TRANSFORM_PROGRAM_LOAD, m::SET_TRANSFORM_CONSTANT_LOAD, m::SET_BEGIN_END, m::DRAW_ARRAYS,
+                     m::DRAW_INDEX_ARRAY, m::INLINE_ARRAY, m::ARRAY_ELEMENT16, m::ARRAY_ELEMENT32, m::CLEAR_SURFACE})
+    mark(method, 4);
+}
+
+void renderer_transform_constants(const u8* words, u32 first, u32 count) {
+  u32 base = g_vc_load * 4 + first;
+  if (base >= 468 * 4) return;
+  count = std::min(count, 468 * 4 - base);
+  for (u32 i = 0; i < count; ++i) {
+    u32 w, old;
+    std::memcpy(&w, words + 4 * i, 4);
+    w = __builtin_bswap32(w);
+    std::memcpy(&old, &g_vc[base + i], 4);
+    if (old == w) continue;
+    std::memcpy(&g_vc[base + i], &w, 4);
+    g_vc_dirty = true;
+    g_vc_lo = std::min(g_vc_lo, (base + i) >> 2);
+    g_vc_hi = std::max(g_vc_hi, (base + i) >> 2);
+  }
 }
 
 void renderer_method(u32 ri, u32 arg, u32 count, u32 index) {
@@ -2897,6 +2969,16 @@ bool gpu_option(const std::string& name, const std::string& value) {
     g_patch_cb = value == "on" ? 7 : value == "off" ? 0 : u32(std::atoi(value.c_str())) & 7;
     g_cb_reset = true;
     LOG_I("gpu", "constant buffer changes recorded as patches: mask %u", g_patch_cb);
+    return true;
+  }
+  if (name == "wwgap") {
+    g_ww_gap = u32(std::atoi(value.c_str()));
+    LOG_I("gpu", "write tracking: runs up to %u granules apart queried together", g_ww_gap);
+    return true;
+  }
+  if (name == "hot" && (value == "0" || value == "1")) {
+    g_hot_mode = u32(std::atoi(value.c_str()));
+    LOG_I("gpu", "write tracking: collections query the granules used %s", g_hot_mode ? "since the previous collection" : "in the last two frames");
     return true;
   }
   if (name == "kick" && std::atoi(value.c_str()) > 0) {

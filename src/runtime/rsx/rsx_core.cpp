@@ -340,6 +340,8 @@ void fifo_thread() {
   u32 get = __builtin_bswap32(*ctrl_get);
   g_ring_get.store(get);
   std::vector<u32> call_stack;
+  const bool trace_methods = cfg().trace_rsx != 0;  // --trace-rsx logs every method: no bulk paths
+  init_method_kinds();
   u32 idle = 0, last_put = ~0u;
   u64 idle_since = 0;
   for (;;) {
@@ -392,9 +394,26 @@ void fifo_thread() {
       } else {
         u32 args_io = get + 4;
         get += 4 + 4 * count;
-        for (u32 i = 0; i < count; ++i) {
-          u32 m = noinc ? method : method + 4 * i;
-          execute_method(m >> 2, fifo_read(args_io + 4 * i), count, i);
+        // The arguments through one host pointer when they lie in one io page (nearly always).
+        u32 args_ea;
+        const u8* args = count && (args_io >> 20) == ((args_io + 4 * count - 1) >> 20) && io_to_ea(args_io, &args_ea)
+                             ? ppu::mem() + args_ea
+                             : nullptr;
+        if (args && inc && method >= m::SET_TRANSFORM_CONSTANT && method + 4 * count <= m::SET_TRANSFORM_CONSTANT + 0x80 &&
+            !trace_methods) {
+          renderer_transform_constants(args, (method - m::SET_TRANSFORM_CONSTANT) >> 2, count);
+          for (u32 i = 0; i < count; ++i) g.regs[(method >> 2) + i] = __builtin_bswap32(reinterpret_cast<const u32*>(args)[i]);
+        } else {
+          for (u32 i = 0; i < count; ++i) {
+            u32 mi = noinc ? method : method + 4 * i;
+            u32 arg = args ? __builtin_bswap32(reinterpret_cast<const u32*>(args)[i]) : fifo_read(args_io + 4 * i);
+            if (!g_method_special[mi >> 2] && !trace_methods) {  // plain state: the register write only
+              record_method(mi, arg);
+              g.regs[mi >> 2] = arg;
+              continue;
+            }
+            execute_method(mi >> 2, arg, count, i);
+          }
         }
         bump(g.commands);
       }
@@ -472,8 +491,7 @@ void start() {
   LOG_I("rsx", "RSX threads started");
 }
 
-extern std::atomic<u32> g_acquire_ea, g_acquire_value, g_method_pos;
-extern u32 g_method_ring[32][2];
+extern std::atomic<u32> g_acquire_ea, g_acquire_value;
 
 void dump() {
   u32 put = ppu::r32(kControlAddr), get = ppu::r32(kControlAddr + 4), ref = ppu::r32(kControlAddr + 8);
