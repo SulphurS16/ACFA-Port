@@ -64,8 +64,9 @@ class Recorder {
   void frame_end(u32 max_frames = 1);
   // Waits until everything recorded has run.
   void finish();
-  // After a draw: hands the recorded calls over when the submission thread is idle or the batch is
-  // large, so it starts early without a handover per call.
+  // After a draw: hands the recorded calls over when the submission thread is idle and at least
+  // the kick batch of draws is recorded, or the chunk is large, so it starts early without a
+  // handover (a thread wake-up on both sides) per draw.
   void kick();
   bool async() const;
 };
@@ -76,6 +77,8 @@ void submit_init(bool async);
 // "gpu submit on|off" (applied at the next frame boundary by apply_submit_mode).
 void request_submit_mode(bool async);
 void apply_submit_mode();
+// "gpu kick N": draws per handover to an idle submission thread (A/B measurements; default 32).
+void set_kick_batch(u32 draws);
 // Submission thread statistics for the perf lines: milliseconds spent executing calls and CPU
 // cycles used (OS thread cycle count), both totals since start.
 void submit_stats(double* busy_ms, u64* cpu_cycles);

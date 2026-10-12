@@ -97,6 +97,11 @@ constexpr size_t kMaxQueuedChunks = 64;
 constexpr size_t kMaxFreeChunks = 64;
 constexpr size_t kMaxKeptCapacity = size_t(1) << 20;
 std::atomic<HANDLE> g_thread{nullptr};  // the submission thread (cycle counts)
+// Draws recorded since the last handover, and how many make a batch for an idle submission thread
+// (handing over every draw cost a wake-up per draw on both threads: ~1400 per frame in heavy
+// missions, about 1-2 ms of the FIFO thread and 5-6 ms of the submission thread per frame).
+u32 g_kicks = 0;  // FIFO thread
+std::atomic<u32> g_kick_batch{32};
 ID3D11Buffer* g_sync_unmap = nullptr;  // synchronous write_buffer_space: unmapped at the next call
 
 ID3D11DeviceContext* ctx() { return device().ctx; }
@@ -562,14 +567,20 @@ void Recorder::flush() {
     sync_pending();
     return;
   }
+  g_kicks = 0;
   if (!g_cur->size) return;
   auto next = take_chunk();
+  bool room;
   {
-    std::unique_lock lk(g_mu);
+    std::lock_guard lk(g_mu);
     g_queued_bytes += g_cur->size;
     g_queue.push_back(std::move(g_cur));
     ++g_chunks_sent;
-    g_cv_work.notify_one();
+    room = g_queued_bytes <= kMaxQueuedBytes && g_queue.size() <= kMaxQueuedChunks;
+  }
+  g_cv_work.notify_one();  // outside the lock: the woken thread does not block on it at once
+  if (!room) {
+    std::unique_lock lk(g_mu);
     g_cv_done.wait(lk, [] { return g_queued_bytes <= kMaxQueuedBytes && g_queue.size() <= kMaxQueuedChunks; });
   }
   g_cur = std::move(next);
@@ -577,8 +588,13 @@ void Recorder::flush() {
 
 void Recorder::kick() {
   if (!g_async || !g_cur->size) return;
-  if (g_idle.load(std::memory_order_relaxed) || g_cur->size > (size_t(512) << 10)) flush();
+  ++g_kicks;
+  if ((g_kicks >= g_kick_batch.load(std::memory_order_relaxed) && g_idle.load(std::memory_order_relaxed)) ||
+      g_cur->size > (size_t(512) << 10))
+    flush();
 }
+
+void set_kick_batch(u32 draws) { g_kick_batch = std::max<u32>(draws, 1); }
 
 void Recorder::frame_end(u32 max_frames) {
   if (!g_async) {

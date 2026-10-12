@@ -2584,10 +2584,11 @@ void present_buffer(u32 id, const DisplayBuffer& b) {
     u64 surf_bytes = 0;
     for (const Surface* s : g_surfaces) surf_bytes += surface_bytes(s);
     LOG_I("perf",
-          "per frame: %.0f draws (vertices %.0f cached, %.0f converted), textures %.1f hashed %.1f uploaded, %.2f surfaces created, "
-          "%.1f target changes, %.1f write queries (%.0f MiB); vertex cache %zu entries %.0f MiB; textures %zu %.0f MiB; "
-          "surfaces %zu %.0f MiB",
-          pf(&RenderStats::draws), pf(&RenderStats::vcached), pf(&RenderStats::vconverted), pf(&RenderStats::tex_hashed),
+          "per frame: %.0f draws (vertices %.0f cached, %.0f converted: %.0f vertices), textures %.1f hashed %.1f uploaded, "
+          "%.2f surfaces created, %.1f target changes, %.1f write queries (%.0f MiB); vertex cache %zu entries %.0f MiB; "
+          "textures %zu %.0f MiB; surfaces %zu %.0f MiB",
+          pf(&RenderStats::draws), pf(&RenderStats::vcached), pf(&RenderStats::vconverted), pf(&RenderStats::vertices),
+          pf(&RenderStats::tex_hashed),
           pf(&RenderStats::tex_uploaded), pf(&RenderStats::surfaces), pf(&RenderStats::target_binds), pf(&RenderStats::collections),
           pf(&RenderStats::bytes_queried) / 1048576.0, g_vcache.size(), g_vcache_bytes / 1048576.0, g_tex.size(),
           g_tex_bytes / 1048576.0, g_surfaces.size(), surf_bytes / 1048576.0);
@@ -2745,6 +2746,11 @@ bool gpu_option(const std::string& name, const std::string& value) {
   if (name == "submit" && (value == "on" || value == "off")) {
     gpu::request_submit_mode(value == "on");
     LOG_I("gpu", "D3D11 submission thread requested %s (applied at the next frame)", value.c_str());
+    return true;
+  }
+  if (name == "kick" && std::atoi(value.c_str()) > 0) {
+    gpu::set_kick_batch(u32(std::atoi(value.c_str())));
+    LOG_I("gpu", "draws per handover to an idle submission thread: %s", value.c_str());
     return true;
   }
   return false;

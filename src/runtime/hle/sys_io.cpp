@@ -5,6 +5,7 @@
 #define WIN32_LEAN_AND_MEAN
 #include <algorithm>
 #include <atomic>
+#include <cctype>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
@@ -27,6 +28,7 @@
 #include "runtime/input.h"
 #include "runtime/memory.h"
 #include "runtime/memscan.h"
+#include "runtime/profiler.h"
 #include "runtime/rsx/rsx.h"
 #include "runtime/sysdialog.h"
 
@@ -306,6 +308,22 @@ void control_thread(std::string path) {
           LOG_I("pad", "dump 0x%08x+0x%x -> %s", addr, len, path.c_str());
         } catch (const std::exception& e) {
           LOG_W("pad", "control: dump failed: %s", e.what());
+        }
+        continue;
+      }
+      if (line.rfind("profile ", 0) == 0) {  // "profile THREADS|reset|write NAME": sampling profiler (profiler.h)
+        std::string arg = line.substr(8);
+        if (arg == "reset") {
+          prof::reset();
+        } else if (arg.rfind("write ", 0) == 0) {
+          std::string name = arg.substr(6);
+          bool ok = !name.empty() && std::all_of(name.begin(), name.end(), [](char ch) {
+            return std::isalnum(static_cast<unsigned char>(ch)) || ch == '_' || ch == '-';
+          });
+          if (ok) prof::write_snapshot(cfg().run_dir + "/profile_" + name + ".txt");
+          else LOG_W("pad", "control: 'profile write NAME' takes letters, digits, '_' and '-'");
+        } else {
+          prof::start(arg);
         }
         continue;
       }

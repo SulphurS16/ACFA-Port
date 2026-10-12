@@ -14,7 +14,14 @@ void register_thread(const std::string& name, void* handle);
 void unregister_thread(void* handle);
 // Snapshot of the registered threads (handle, name).
 std::vector<std::pair<void*, std::string>> threads();
+// Starts sampling the threads whose names contain one of the comma-separated substrings; when
+// already sampling, replaces the selection (also control command "profile THREADS").
 void start(const std::string& match);
+// Clears the samples taken so far ("profile reset").
+void reset();
+// Writes the samples taken so far and keeps sampling ("profile write NAME").
+void write_snapshot(const std::string& path);
+// Writes the report and stops sampling (at exit).
 void write_report(const std::string& path);
 // Logs the CPU time (user + kernel) used so far by each registered thread, busiest first.
 void cpu_report();
