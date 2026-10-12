@@ -24,6 +24,14 @@ foreach ($it in $items) {
   if ($h -ne $it.sha) { throw "hash mismatch for $file ($h)" }
   if (Test-Path (Join-Path $tools $it.check)) { Write-Host "ok $($it.check)"; continue }
   $target = if ($it.dest) { Join-Path $tools $it.dest } else { $tools }
-  Expand-Archive -Path $file -DestinationPath $target -Force
+  New-Item -ItemType Directory -Force -Path $target | Out-Null
+  # Windows' bsdtar unpacks zips far faster than Expand-Archive; fall back if it is missing.
+  $tar = Join-Path $env:SystemRoot "System32\tar.exe"
+  if (Test-Path $tar) {
+    & $tar -xf $file -C $target
+    if ($LASTEXITCODE -ne 0) { throw "tar failed for $file" }
+  } else {
+    Expand-Archive -Path $file -DestinationPath $target -Force
+  }
   Write-Host "unpacked $($it.check)"
 }

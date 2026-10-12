@@ -5,6 +5,9 @@ param(
   [string]$Target = "",
   [switch]$Clean
 )
+# Windows PowerShell 5.1 turns a native tool's stderr lines into error records; under a caller's
+# "Stop" preference CMake's "GLOB mismatch" notice would abort the build. Exit codes decide here.
+$ErrorActionPreference = "Continue"
 . (Join-Path $PSScriptRoot "env.ps1")
 $root = Split-Path -Parent $PSScriptRoot
 $bdir = Join-Path $root ("local\build\" + $Config.ToLower())

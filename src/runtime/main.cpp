@@ -54,7 +54,9 @@ namespace fs = std::filesystem;
 int main(int argc, char** argv) {
   Config& c = cfg();
   fs::path root = fs::current_path();
-  // This machine's game folder (first line of local\config\disc_root.txt; --disc overrides it).
+  // The user's game folder: by default the disc folder inside the project root; the first line
+  // of local\config\disc_root.txt names another one; --disc overrides both.
+  c.disc_root = (root / "Armored Core - For Answer (USA)").string();
   if (std::ifstream f(root / "local" / "config" / "disc_root.txt"); f) {
     std::string line;
     std::getline(f, line);
