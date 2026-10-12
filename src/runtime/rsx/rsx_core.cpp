@@ -10,6 +10,7 @@
 #include <vector>
 
 #include "runtime/config.h"
+#include "runtime/gpu/display.h"
 #include "runtime/hle.h"
 #include "runtime/lv2/lv2.h"
 #include "runtime/memory.h"
@@ -84,23 +85,12 @@ std::condition_variable g_vb_cv;
 std::mutex g_db_mu;
 DisplayBuffer g_display[8];
 
+// The emulated vertical blank: from the display's own vblank when its refresh is a multiple of
+// about 60 Hz, else from a 60 Hz clock (gpu/display.h).
 void vblank_thread() {
   SetThreadDescription(GetCurrentThread(), L"rsx-vblank");
-  LARGE_INTEGER f, t0, now;
-  QueryPerformanceFrequency(&f);
-  QueryPerformanceCounter(&t0);
-  const double period = 1001.0 / 60000.0;  // 59.94 Hz
-  u64 n = 0;
   for (;;) {
-    ++n;
-    for (;;) {
-      QueryPerformanceCounter(&now);
-      double el = double(now.QuadPart - t0.QuadPart) / double(f.QuadPart);
-      double left = n * period - el;
-      if (left <= 0) break;
-      if (left > 0.002) lv2::sleep_us(u64((left - 0.001) * 1e6));
-      else _mm_pause();
-    }
+    gpu::display::wait_next_vblank();
     {
       std::lock_guard lk(g_vb_mu);
       g_vblank.fetch_add(1);

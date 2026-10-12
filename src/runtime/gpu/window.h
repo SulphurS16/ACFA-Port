@@ -10,6 +10,8 @@ void* window_handle();   // HWND
 bool window_pump();      // processes pending messages; false once the window was destroyed
 bool window_close_requested();
 void window_set_title(const std::string& title);
+// Borderless fullscreen on the window's monitor (also toggled with F11 or Alt+Enter).
+void window_set_fullscreen(bool on);
 // Runs fn on the window's thread during its next window_pump() and waits for it to finish
 // (directly when called on that thread). Returns false if there is no window.
 bool run_on_window_thread(const std::function<void()>& fn);

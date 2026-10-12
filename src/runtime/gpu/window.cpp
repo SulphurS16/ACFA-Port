@@ -44,6 +44,35 @@ void set_mouse_capture(bool on) {
   input_mouse_capture(on);
 }
 
+// Borderless fullscreen: the window without frame covers its monitor (the swap chain follows the
+// client size); toggled with F11 or Alt+Enter, restored to the previous window placement.
+bool g_fullscreen = false;
+WINDOWPLACEMENT g_windowed_placement = [] {
+  WINDOWPLACEMENT p{};
+  p.length = sizeof p;
+  return p;
+}();
+void set_fullscreen(bool on) {
+  if (on == g_fullscreen || !g_hwnd) return;
+  DWORD style = DWORD(GetWindowLongW(g_hwnd, GWL_STYLE));
+  if (on) {
+    MONITORINFO mi{};
+    mi.cbSize = sizeof mi;
+    if (!GetWindowPlacement(g_hwnd, &g_windowed_placement) || !GetMonitorInfoW(MonitorFromWindow(g_hwnd, MONITOR_DEFAULTTONEAREST), &mi))
+      return;
+    SetWindowLongW(g_hwnd, GWL_STYLE, LONG((style & ~WS_OVERLAPPEDWINDOW) | WS_POPUP));
+    SetWindowPos(g_hwnd, HWND_TOP, mi.rcMonitor.left, mi.rcMonitor.top, mi.rcMonitor.right - mi.rcMonitor.left,
+                 mi.rcMonitor.bottom - mi.rcMonitor.top, SWP_NOOWNERZORDER | SWP_FRAMECHANGED);
+  } else {
+    SetWindowLongW(g_hwnd, GWL_STYLE, LONG((style & ~WS_POPUP) | WS_OVERLAPPEDWINDOW));
+    SetWindowPlacement(g_hwnd, &g_windowed_placement);
+    SetWindowPos(g_hwnd, nullptr, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOOWNERZORDER | SWP_FRAMECHANGED);
+  }
+  g_fullscreen = on;
+  if (g_mouse_captured) clip_cursor();
+  LOG_I("gpu", "window: %s", on ? "borderless fullscreen" : "windowed");
+}
+
 struct Call {
   const std::function<void()>* fn;
   bool done = false;
@@ -83,6 +112,10 @@ LRESULT CALLBACK wndproc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
     case WM_KEYDOWN:
     case WM_SYSKEYDOWN:
       if (wp == VK_F1 && !(lp & (1 << 30)) && !input_isolated()) set_mouse_capture(!g_mouse_captured);
+      if (!(lp & (1 << 30)) && (wp == VK_F11 || (wp == VK_RETURN && msg == WM_SYSKEYDOWN && (lp & (1 << 29))))) {
+        set_fullscreen(!g_fullscreen);
+        return 0;  // not passed to the game's key bindings
+      }
       input_key(u32(wp), true);
       if (msg == WM_SYSKEYDOWN) break;
       return 0;
@@ -132,6 +165,10 @@ bool window_create(const std::string& title, int w, int h, bool visible) {
     LOG_W("input", "raw mouse input unavailable (RegisterRawInputDevices failed, error %lu)", GetLastError());
   if (visible) ShowWindow(g_hwnd, SW_SHOWNOACTIVATE);
   return true;
+}
+
+void window_set_fullscreen(bool on) {
+  run_on_window_thread([on] { set_fullscreen(on); });
 }
 
 void* window_handle() { return g_hwnd; }

@@ -17,6 +17,7 @@
 #include "runtime/config.h"
 #include "runtime/datawatch.h"
 #include "runtime/gpu/d3d11_device.h"
+#include "runtime/gpu/display.h"
 #include "runtime/gpu/window.h"
 #include "runtime/rsx/rsx.h"
 #include "runtime/sysutil.h"
@@ -114,6 +115,8 @@ int main(int argc, char** argv) {
     else if (a == "--spu-cache") c.spu_cache = next();
     else if (a == "--audio-capture") c.audio_capture = true;
     else if (a == "--gcm-wait") c.gcm_wait_spin = next() == "spin";
+    else if (a == "--pacing") c.pacing = next();
+    else if (a == "--fullscreen") c.fullscreen = true;
     else if (a == "--shot-interval") c.shot_interval = std::atof(next().c_str());
     else {
       std::fprintf(stderr, "unknown argument %s\n", a.c_str());
@@ -190,6 +193,8 @@ int main(int argc, char** argv) {
   lv2_init();
   if (!c.headless && !gpu::window_create("ARMORED CORE for Answer - native port", 1280, 720, true))
     LOG_E("main", "window creation failed; running without presentation");
+  else if (!c.headless && c.fullscreen)
+    gpu::window_set_fullscreen(true);
   start_main_thread(ex.entry_opd, ex.primary_stack, ex.primary_prio, ex.tls_vaddr, ex.tls_filesz, ex.tls_memsz,
                     ex.malloc_pagesize, "/dev_bdvd/PS3_GAME/USRDIR/EBOOT.BIN");
   auto t0 = std::chrono::steady_clock::now();
@@ -251,6 +256,7 @@ int main(int argc, char** argv) {
                 double(pmc.PageFaultCount - last_faults) / (now - last_fps_at), (unsigned long long)(pmc.WorkingSetSize >> 20),
                 busy.c_str());
         if (last_fps_at > 0) LOG_I("perf", "%s", audio_report().c_str());
+        if (last_fps_at > 0 && !c.headless) LOG_I("perf", "%s", gpu::display::report().c_str());
         last_faults = pmc.PageFaultCount;
         last_idle = idle;
         last_total = total;

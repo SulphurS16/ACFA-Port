@@ -1,9 +1,12 @@
 #include "runtime/gpu/d3d11_device.h"
 
 #include <d3dcompiler.h>
+#include <dxgi1_5.h>
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cmath>
 #include <filesystem>
 #include <mutex>
 #include <set>
@@ -11,12 +14,15 @@
 #include "common/crypto.h"
 #include "common/file.h"
 #include "runtime/config.h"
+#include "runtime/gpu/display.h"
 #include "runtime/log.h"
 
 namespace rt::gpu {
 namespace {
 
 Device g_dev;
+HWND g_hwnd = nullptr;
+bool g_tearing = false;  // the swap chain was created with DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING
 ID3D11VertexShader* g_blit_vs = nullptr;
 ID3D11PixelShader* g_blit_ps = nullptr;
 ID3D11SamplerState* g_linear = nullptr;
@@ -123,8 +129,21 @@ bool device_init(void* hwnd) {
   LOG_I("gpu", "D3D11 device on '%s' (%llu MB VRAM); no-overwrite maps of shader-resource buffers %s", name,
         (unsigned long long)(ad.DedicatedVideoMemory >> 20), g_dev.no_overwrite_srv ? "supported" : "not supported");
   if (hwnd) {
+    g_hwnd = static_cast<HWND>(hwnd);
+    RECT rc{};
+    GetClientRect(g_hwnd, &rc);
+    if (rc.right > 0 && rc.bottom > 0) g_dev.width = u32(rc.right), g_dev.height = u32(rc.bottom);
     IDXGIFactory2* fac = nullptr;
     adapter->GetParent(__uuidof(IDXGIFactory2), reinterpret_cast<void**>(&fac));
+    // Tearing support (DXGI 1.5): needed to present at the game's own rate on variable-refresh
+    // displays (gpu/display.h).
+    IDXGIFactory5* fac5 = nullptr;
+    BOOL tearing = FALSE;
+    if (SUCCEEDED(fac->QueryInterface(__uuidof(IDXGIFactory5), reinterpret_cast<void**>(&fac5)))) {
+      if (FAILED(fac5->CheckFeatureSupport(DXGI_FEATURE_PRESENT_ALLOW_TEARING, &tearing, sizeof tearing))) tearing = FALSE;
+      fac5->Release();
+    }
+    g_tearing = tearing;
     DXGI_SWAP_CHAIN_DESC1 sd{};
     sd.Width = g_dev.width;
     sd.Height = g_dev.height;
@@ -134,8 +153,9 @@ bool device_init(void* hwnd) {
     sd.BufferCount = 2;
     sd.Scaling = DXGI_SCALING_STRETCH;
     sd.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
-    hr = fac->CreateSwapChainForHwnd(g_dev.dev, static_cast<HWND>(hwnd), &sd, nullptr, nullptr, &g_dev.swap);
-    fac->MakeWindowAssociation(static_cast<HWND>(hwnd), DXGI_MWA_NO_ALT_ENTER);
+    sd.Flags = g_tearing ? DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING : 0;
+    hr = fac->CreateSwapChainForHwnd(g_dev.dev, g_hwnd, &sd, nullptr, nullptr, &g_dev.swap);
+    fac->MakeWindowAssociation(g_hwnd, DXGI_MWA_NO_ALT_ENTER);  // the window handles Alt+Enter (borderless fullscreen)
     fac->Release();
     if (FAILED(hr)) {
       LOG_E("gpu", "CreateSwapChainForHwnd failed 0x%08lx", hr);
@@ -145,6 +165,8 @@ bool device_init(void* hwnd) {
     g_dev.swap->GetBuffer(0, __uuidof(ID3D11Texture2D), reinterpret_cast<void**>(&bb));
     g_dev.dev->CreateRenderTargetView(bb, nullptr, &g_dev.backbuffer_rtv);
     bb->Release();
+    LOG_I("gpu", "swap chain %ux%u, flip model, tearing %s", g_dev.width, g_dev.height, g_tearing ? "supported" : "not supported");
+    display::swapchain_created(g_dev.swap, g_tearing);
   }
   adapter->Release();
   dxdev->Release();
@@ -174,6 +196,28 @@ void report_failure(const char* what, HRESULT hr) {
         removed != S_OK ? acfa::strprintf("; the D3D11 device was removed (reason 0x%08lx)", (unsigned long)removed).c_str() : "");
 }
 
+// The swap chain follows the window's client size (resizing, borderless fullscreen), checked
+// before each present on the presenting thread.
+void resize_to_window() {
+  RECT rc{};
+  if (!g_hwnd || !GetClientRect(g_hwnd, &rc) || rc.right <= 0 || rc.bottom <= 0) return;  // minimized: keep the buffers
+  u32 w = u32(rc.right), h = u32(rc.bottom);
+  if (w == g_dev.width && h == g_dev.height) return;
+  g_dev.ctx->OMSetRenderTargets(0, nullptr, nullptr);
+  if (g_dev.backbuffer_rtv) g_dev.backbuffer_rtv->Release();
+  g_dev.backbuffer_rtv = nullptr;
+  HRESULT hr = g_dev.swap->ResizeBuffers(0, w, h, DXGI_FORMAT_UNKNOWN, g_tearing ? DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING : 0);
+  if (FAILED(hr)) report_failure("swap chain resize", hr);
+  else g_dev.width = w, g_dev.height = h;
+  ID3D11Texture2D* bb = nullptr;
+  g_dev.swap->GetBuffer(0, __uuidof(ID3D11Texture2D), reinterpret_cast<void**>(&bb));
+  if (bb) {
+    g_dev.dev->CreateRenderTargetView(bb, nullptr, &g_dev.backbuffer_rtv);
+    bb->Release();
+  }
+  LOG_I("gpu", "swap chain resized to %ux%u", g_dev.width, g_dev.height);
+}
+
 void present_texture(ID3D11ShaderResourceView* srv, u32 src_w, u32 src_h) {
   auto* c = g_dev.ctx;
   // Keep a copy for captures (same size as the source).
@@ -197,8 +241,8 @@ void present_texture(ID3D11ShaderResourceView* srv, u32 src_w, u32 src_h) {
     g_last_w = src_w;
     g_last_h = src_h;
   }
-  auto draw_to = [&](ID3D11RenderTargetView* rtv, u32 w, u32 h) {
-    D3D11_VIEWPORT vp{0, 0, float(w), float(h), 0, 1};
+  auto draw_to = [&](ID3D11RenderTargetView* rtv, u32 w, u32 h, const D3D11_VIEWPORT* fit = nullptr) {
+    D3D11_VIEWPORT vp = fit ? *fit : D3D11_VIEWPORT{0, 0, float(w), float(h), 0, 1};
     c->OMSetRenderTargets(1, &rtv, nullptr);
     c->OMSetBlendState(nullptr, nullptr, 0xffffffff);
     c->OMSetDepthStencilState(nullptr, 0);
@@ -222,8 +266,17 @@ void present_texture(ID3D11ShaderResourceView* srv, u32 src_w, u32 src_h) {
   draw_to(last_rtv, src_w, src_h);
   last_rtv->Release();
   if (g_dev.swap) {
-    draw_to(g_dev.backbuffer_rtv, g_dev.width, g_dev.height);
-    g_dev.swap->Present(0, 0);
+    resize_to_window();
+    // Aspect-correct fit: the frame is scaled to the largest centred rectangle with its own
+    // aspect ratio; the rest of the window stays black.
+    float sx = float(g_dev.width) / float(src_w), sy = float(g_dev.height) / float(src_h), s = std::min(sx, sy);
+    float vw = std::floor(float(src_w) * s + 0.5f), vh = std::floor(float(src_h) * s + 0.5f);
+    D3D11_VIEWPORT fit{std::floor((float(g_dev.width) - vw) / 2), std::floor((float(g_dev.height) - vh) / 2), vw, vh, 0, 1};
+    const float black[4] = {0, 0, 0, 1};
+    c->ClearRenderTargetView(g_dev.backbuffer_rtv, black);
+    draw_to(g_dev.backbuffer_rtv, g_dev.width, g_dev.height, &fit);
+    g_dev.swap->Present(0, display::present_flags());
+    display::after_present(g_dev.swap);
   }
 }
 
