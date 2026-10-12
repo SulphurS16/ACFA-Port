@@ -18,6 +18,7 @@
 #include "runtime/datawatch.h"
 #include "runtime/gpu/d3d11_device.h"
 #include "runtime/gpu/display.h"
+#include "runtime/gpu/shader_warm.h"
 #include "runtime/gpu/window.h"
 #include "runtime/rsx/rsx.h"
 #include "runtime/sysutil.h"
@@ -129,6 +130,7 @@ int main(int argc, char** argv) {
   c.flash = (root / "local" / "game" / "firmware241" / "dev_flash").string();
   c.spu_cache = (root / "local" / "spu_cache").string();
   c.shader_cache = (root / "local" / "shader_cache").string();
+  c.shader_records = (root / "local" / "shader_records").string();
   c.input_config = (root / "local" / "config" / "input.ini").string();
   std::vector<std::string> settings_notes = load_settings(c, root / "local" / "config" / "settings.ini");
   std::string level = "info";
@@ -150,6 +152,8 @@ int main(int argc, char** argv) {
     else if (a == "--trace-spu-cats" && i + 1 < argc) c.trace_spu_cats = unsigned(std::stoul(argv[++i]));
     else if (a == "--profile") c.profile = next();
     else if (a == "--spu-collect") c.spu_collect = true;
+    else if (a == "--shader-collect") c.shader_collect = true;
+    else if (a == "--warm-shaders") c.warm_shaders = true;
     else if (a == "--spu-interp") c.spu_interp = true;
     else if (a == "--trace-rsx") c.trace_rsx = unsigned(std::stoul(next()));
     else if (a == "--trace-rsx-at") c.trace_rsx_at = std::atof(next().c_str());
@@ -171,6 +175,7 @@ int main(int argc, char** argv) {
     else if (a == "--gpu-timing") c.gpu_timing = 1;
     else if (a == "--gpu-timing-draws") c.gpu_timing = 2;
     else if (a == "--spu-cache") c.spu_cache = next();
+    else if (a == "--shader-cache") c.shader_cache = next();
     else if (a == "--audio-capture") c.audio_capture = true;
     else if (a == "--gcm-wait") c.gcm_wait_spin = next() == "spin";
     else if (a == "--pacing") c.pacing = next();
@@ -206,6 +211,19 @@ int main(int argc, char** argv) {
   }
   prof::start(c.profile);
   LOG_I("main", "run dir %s", c.run_dir.c_str());
+  if (c.warm_shaders) {  // pipeline step: shader cache from the manifest, no game run
+    gpu::WarmResult w = gpu::warm_shaders((root / "data" / "shader_manifest.txt").string(), c.disc_root, c.prepared);
+    if (!w.error.empty()) {
+      LOG_E("warm", "%s", w.error.c_str());
+      std::fprintf(stderr, "%s\n", w.error.c_str());
+      return 1;
+    }
+    std::string s = acfa::strprintf("shader warm-up: %u programs, %u compiled, %u already cached, %u skipped, %u failed; %.1f s on %u threads",
+                                    w.programs, w.compiled, w.cached, w.skipped, w.failed, w.seconds, w.threads);
+    LOG_I("warm", "%s", s.c_str());
+    std::printf("%s\n", s.c_str());
+    return w.failed ? 1 : 0;
+  }
   for (const auto& n : settings_notes) LOG_I("main", "%s", n.c_str());
   if (!c.watch_access.empty() && !datawatch::configure(c.watch_access)) return 2;
   set_fatal_hook([] {

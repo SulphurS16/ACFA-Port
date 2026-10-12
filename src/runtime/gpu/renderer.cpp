@@ -19,6 +19,7 @@
 #include <thread>
 #include <unordered_map>
 
+#include "common/crypto.h"
 #include "common/file.h"
 #include "ppu/ppu_recomp.h"
 #include "runtime/config.h"
@@ -622,6 +623,48 @@ void dump_shader(const char* kind, u64 key, const std::string& src) {
                    std::vector<u8>(src.begin(), src.end()));
 }
 
+// Shader records (--shader-collect): each program translated in this run with what its HLSL
+// depends on, for the shader manifest (tools/shader_manifest.py finds the programs in the game's
+// shader archives and keeps positions only; the pipeline compiles them before a new installation's
+// first run). Game-derived: local\shader_records, never in Git. Layout (little-endian):
+// "SHREC1\0\0", kind ('v'/'f'), 3 reserved bytes, env bytes, start slot, code bytes, constant slot
+// count (u32 each), then env, the constant slots' byte offsets (u32 each; their values are patched
+// at run time and not part of the HLSL) and the code (VP: big-endian words as in the command
+// buffer; FP: guest memory bytes). Named by a hash of everything with the constant slots cleared.
+void record_shader(char kind, const void* env, u32 env_size, u32 start, const u8* code, u32 code_size,
+                   const std::vector<u32>& const_slots) {
+  if (!cfg().shader_collect) return;
+  std::vector<u8> masked(code, code + code_size);
+  for (u32 off : const_slots)
+    if (off + 16 <= code_size) std::memset(masked.data() + off, 0, 16);
+  std::vector<u8> key;
+  key.push_back(u8(kind));
+  key.insert(key.end(), static_cast<const u8*>(env), static_cast<const u8*>(env) + env_size);
+  key.insert(key.end(), reinterpret_cast<const u8*>(&start), reinterpret_cast<const u8*>(&start) + 4);
+  key.insert(key.end(), masked.begin(), masked.end());
+  auto h = acfa::crypto::sha256(key.data(), key.size());
+  std::string name;
+  for (int i = 0; i < 8; ++i) name += acfa::strprintf("%02x", h[i]);
+  std::filesystem::path file = std::filesystem::path(cfg().shader_records) / (name + ".shrec");
+  std::error_code ec;
+  if (std::filesystem::exists(file, ec)) return;
+  std::vector<u8> out = {'S', 'H', 'R', 'E', 'C', '1', 0, 0, u8(kind), 0, 0, 0};
+  auto put = [&](u32 v) { out.insert(out.end(), reinterpret_cast<const u8*>(&v), reinterpret_cast<const u8*>(&v) + 4); };
+  put(env_size);
+  put(start);
+  put(code_size);
+  put(u32(const_slots.size()));
+  out.insert(out.end(), static_cast<const u8*>(env), static_cast<const u8*>(env) + env_size);
+  for (u32 off : const_slots) put(off);
+  out.insert(out.end(), code, code + code_size);
+  try {
+    std::filesystem::create_directories(file.parent_path(), ec);
+    acfa::write_file(file.string(), out);
+  } catch (const std::exception& e) {
+    warn_once("shrec", std::string("shader record not written: ") + e.what());
+  }
+}
+
 const VsEntry* vertex_shader() {
   u32 start = reg(m::SET_TRANSFORM_PROGRAM_START) % gpu::kVpSlots;
   static u32 memo_start = ~0u, memo_gen = ~0u;
@@ -647,6 +690,14 @@ const VsEntry* vertex_shader() {
   VsEntry e;
   std::string src = gpu::vp_to_hlsl(g_vp, start, &e.info);
   dump_shader("vp", h, src);
+  if (cfg().shader_collect && !branchy) {  // branchy programs depend on all of program memory: not recorded
+    std::vector<u8> words(size_t(end - start + 1) * 16);
+    for (u32 i = 0; i < (end - start + 1) * 4; ++i) {
+      u32 be = __builtin_bswap32(g_vp[4 * start + i]);
+      std::memcpy(&words[4 * i], &be, 4);
+    }
+    record_shader('v', nullptr, 0, start, words.data(), u32(words.size()), {});
+  }
   if (e.info.error.empty()) {
     if (ID3DBlob* b = gpu::compile_hlsl(src, "main", "vs_5_0")) {
       device().dev->CreateVertexShader(b->GetBufferPointer(), b->GetBufferSize(), nullptr, &e.vs);
@@ -667,6 +718,15 @@ const PsEntry* pixel_shader(const gpu::FpEnv& env, const u8* ucode, u32 max_byte
   PsEntry e;
   std::string src = gpu::fp_to_hlsl(ucode, max_bytes, env, &e.info);
   dump_shader("fp", h, acfa::strprintf("// SET_SHADER_PROGRAM 0x%08x\n", sp) + src);
+  if (cfg().shader_collect) {
+    std::vector<u32> offs;
+    u32 size = gpu::fp_scan(ucode, max_bytes, nullptr, &offs);
+    u32 base = 0;  // constant offsets are relative to the first non-NOP instruction (flush_draw)
+    for (; base + 16 <= max_bytes && ((gpu::fp_word(ucode + base) >> 24) & 0x3f) == 0; base += 16) {
+    }
+    for (u32& o : offs) o += base;
+    if (size) record_shader('f', &env, sizeof env, 0, ucode, size, offs);
+  }
   if (e.info.error.empty()) {
     if (ID3DBlob* b = gpu::compile_hlsl(src, "main", "ps_5_0")) {
       device().dev->CreatePixelShader(b->GetBufferPointer(), b->GetBufferSize(), nullptr, &e.ps);
@@ -1085,6 +1145,16 @@ ID3D11ShaderResourceView* texture_view(const gpu::TexDesc& t, float* scale) {
   return e.srv;
 }
 
+// Depth compare (shadow) fetch (rsx_facts §2.9, as RPCS3): a depth format, a compare function
+// other than NEVER/ALWAYS (ADDRESS[31:28]) and alpha kill off. The fetch returns the filtered test
+// result in every channel instead of the depth (2D textures; cube shadows not handled).
+bool g_depth_compare = true;  // "gpu shadow on|off" (A/B: off samples the depth values as before)
+bool depth_compare(const gpu::TexDesc& t) {
+  u32 zfunc = t.address >> 28;
+  return g_depth_compare && t.format >= 0x90 && t.format <= 0x93 && zfunc != 0 && zfunc != 7 && !((t.control0 >> 2) & 1) && !t.cubemap &&
+         t.dim == 2;
+}
+
 D3D11_SAMPLER_DESC sampler_desc(const gpu::TexDesc& t) {
   D3D11_SAMPLER_DESC sd{};
   u32 minf = (t.filter >> 16) & 7, magf = (t.filter >> 24) & 7;
@@ -1111,6 +1181,16 @@ D3D11_SAMPLER_DESC sampler_desc(const gpu::TexDesc& t) {
   sd.MinLOD = float((t.control0 >> 19) & 0xfff) / 256.0f;
   sd.MaxLOD = mips ? float((t.control0 >> 7) & 0xfff) / 256.0f : sd.MinLOD;
   sd.ComparisonFunc = D3D11_COMPARISON_NEVER;
+  if (depth_compare(t)) {
+    // The RSX compares (texel OP reference), D3D (reference OP texel): the order flips.
+    static const D3D11_COMPARISON_FUNC kFlipped[8] = {D3D11_COMPARISON_NEVER,         D3D11_COMPARISON_GREATER,
+                                                      D3D11_COMPARISON_EQUAL,         D3D11_COMPARISON_GREATER_EQUAL,
+                                                      D3D11_COMPARISON_LESS,          D3D11_COMPARISON_NOT_EQUAL,
+                                                      D3D11_COMPARISON_LESS_EQUAL,    D3D11_COMPARISON_ALWAYS};
+    sd.ComparisonFunc = kFlipped[(t.address >> 28) & 7];
+    sd.Filter = mag_lin ? D3D11_FILTER_COMPARISON_MIN_MAG_LINEAR_MIP_POINT : D3D11_FILTER_COMPARISON_MIN_MAG_MIP_POINT;
+    sd.MaxAnisotropy = 1;
+  }
   u32 b = t.border;
   sd.BorderColor[0] = ((b >> 16) & 0xff) / 255.0f;
   sd.BorderColor[1] = ((b >> 8) & 0xff) / 255.0f;
@@ -1282,9 +1362,8 @@ void cpu_fetch(const AttrSrc& s, u32 k, float* out) {
   convert_attr(s.type, std::min(s.size, 4u), ::ppu::mem() + s.ea + size_t(kk) * s.stride, out);
 }
 
-// Appends the indices; returns the start index for the draw.
-u32 upload_indices(const std::vector<u32>& idx) {
-  u32 n = u32(idx.size());
+// Appends `n` indices; returns the start index for the draw.
+u32 upload_indices(const u32* idx, u32 n) {
   constexpr u32 kMinCap = 1u << 22;  // 4 M indices = 16 MiB
   if (n > g_ibuf_cap || !g_ibuf) {
     release(g_ibuf);
@@ -1299,7 +1378,7 @@ u32 upload_indices(const std::vector<u32>& idx) {
     g_ibuf_pos = 0;
   }
   u32 start = g_ibuf_pos;
-  gpu::rec().write_buffer(g_ibuf, mode, start * 4, idx.data(), u32(idx.size() * 4));
+  gpu::rec().write_buffer(g_ibuf, mode, start * 4, idx, n * 4);
   g_ibuf_pos += n;
   return start;
 }
@@ -1309,7 +1388,8 @@ u32 upload_indices(const std::vector<u32>& idx) {
 D3D11_PRIMITIVE_TOPOLOGY convert_primitive(u32 prim, const std::vector<u32>& seq, std::vector<u32>* out) {
   constexpr u32 R = ~0u;
   // Split at restart markers.
-  std::vector<std::pair<u32, u32>> runs;
+  static std::vector<std::pair<u32, u32>> runs;  // reused: called per draw (FIFO thread only)
+  runs.clear();
   u32 s = 0;
   for (u32 i = 0; i <= seq.size(); ++i)
     if (i == seq.size() || seq[i] == R) {
@@ -1835,6 +1915,17 @@ void draw_sequence(Clause clause, std::vector<u32>& seq) {
 // Converts element index sequence `seq` for primitive `prim` and uploads the index list to the ring.
 bool upload_sequence(u32 prim, const std::vector<u32>& seq, DrawGeom* g) {
   static std::vector<u32> positions, indices;
+  // Triangle lists without restart markers (most draws): the sequence is the index list.
+  if (prim == 5 && seq.size() >= 3 && std::find(seq.begin(), seq.end(), ~0u) == seq.end()) {
+    g->topo = D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST;
+    g->count = u32(seq.size() - seq.size() % 3);
+    int prev = phase_switch(kPhUploads);
+    g->start = upload_indices(seq.data(), g->count);
+    phase_switch(prev);
+    g->ib = g_ibuf;
+    g->cached = false;
+    return true;
+  }
   positions.clear();
   g->topo = convert_primitive(prim, seq, &positions);
   if (g->topo == D3D11_PRIMITIVE_TOPOLOGY_UNDEFINED || positions.empty()) {
@@ -1846,7 +1937,7 @@ bool upload_sequence(u32 prim, const std::vector<u32>& seq, DrawGeom* g) {
   for (u32 p : positions) indices.push_back(seq[p]);
   g->count = u32(indices.size());
   int prev = phase_switch(kPhUploads);
-  g->start = upload_indices(indices);
+  g->start = upload_indices(indices.data(), g->count);
   phase_switch(prev);
   g->ib = g_ibuf;
   g->cached = false;
@@ -2168,7 +2259,7 @@ void flush_draw() {
       std::memcpy(tex_regs[u], now, sizeof now);
     }
     if (!tex[u].enabled) continue;
-    env.tex_dim[u] = u8(tex[u].cubemap ? 4 : tex[u].dim == 3 ? 3 : tex[u].dim == 1 ? 1 : 2);
+    env.tex_dim[u] = u8(depth_compare(tex[u]) ? 5 : tex[u].cubemap ? 4 : tex[u].dim == 3 ? 3 : tex[u].dim == 1 ? 1 : 2);
   }
   tex_memo = true;
   const PsEntry* ps = pixel_shader(env, ::ppu::mem() + fp_ea, max_bytes, code_hash, sp);
@@ -2974,6 +3065,11 @@ bool gpu_option(const std::string& name, const std::string& value) {
   if (name == "wwgap") {
     g_ww_gap = u32(std::atoi(value.c_str()));
     LOG_I("gpu", "write tracking: runs up to %u granules apart queried together", g_ww_gap);
+    return true;
+  }
+  if (name == "shadow" && (value == "on" || value == "off")) {
+    g_depth_compare = value == "on";
+    LOG_I("gpu", "depth compare (shadow) fetches %s", value.c_str());
     return true;
   }
   if (name == "hot" && (value == "0" || value == "1")) {

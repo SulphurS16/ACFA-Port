@@ -24,6 +24,8 @@ struct Config {
   double profile_split = 0;         // samples after this time go to profile_late.txt (0 = off)
   std::string profile;              // sample host threads whose name contains this (profile.txt)
   bool spu_collect = false;         // record SPU code without a recompiled version (training run)
+  bool shader_collect = false;      // record the vertex/fragment programs translated (shader manifest)
+  bool warm_shaders = false;        // compile the shader manifest into the shader cache, then exit
   bool spu_interp = false;          // never use recompiled SPU code (diagnostics)
   unsigned trace_rsx = 0;           // log the first N RSX FIFO methods
   double trace_rsx_at = 0;          // ... executed from this many seconds after start
@@ -48,6 +50,7 @@ struct Config {
   bool fullscreen = false;          // start in borderless fullscreen (F11 / Alt+Enter toggle)
   std::string spu_cache;            // where collected SPU code records are written
   std::string shader_cache;         // compiled HLSL (derived from the game's shaders; machine-local)
+  std::string shader_records;       // programs recorded with --shader-collect (game-derived; machine-local)
 };
 
 Config& cfg();
