@@ -11,6 +11,7 @@
 #include <memory>
 #include <mutex>
 #include <thread>
+#include <unordered_map>
 #include <vector>
 
 #include "runtime/gpu/d3d11_device.h"
@@ -43,6 +44,7 @@ enum class Op : u32 {
   ClearDepthStencilView,
   CopyResource,
   UpdateSubresource,
+  UpdateConstants,
   WriteBuffer,
   Release,
   Call,
@@ -186,6 +188,10 @@ struct UpdateArgs {
   UINT row, depth;
   size_t bytes;
 };  // followed by the data
+struct ConstArgs {
+  ID3D11Buffer* b;
+  u32 offset, bytes, total;
+};  // followed by the data
 struct WriteArgs {
   ID3D11Buffer* b;
   D3D11_MAP mode;
@@ -194,6 +200,16 @@ struct WriteArgs {
 struct CallArgs {
   u32 index;
 };
+
+// The executing thread's copies of constant buffers updated through UpdateConstants (the
+// renderer's buffers live as long as the device).
+void update_constants(ID3D11DeviceContext* x, ID3D11Buffer* b, u32 offset, const void* data, u32 bytes, u32 total) {
+  static std::unordered_map<ID3D11Buffer*, std::vector<u8>> copies;
+  std::vector<u8>& whole = copies[b];
+  if (whole.size() != total) whole.assign(total, 0);
+  if (offset <= total && bytes <= total - offset) std::memcpy(whole.data() + offset, data, bytes);
+  x->UpdateSubresource(b, 0, nullptr, whole.data(), 0, 0);
+}
 
 void execute(Chunk& c, ID3D11DeviceContext* x) {
   for (size_t pos = 0; pos < c.size;) {
@@ -288,6 +304,11 @@ void execute(Chunk& c, ID3D11DeviceContext* x) {
       case Op::UpdateSubresource: {
         auto* r = static_cast<UpdateArgs*>(a);
         x->UpdateSubresource(r->r, r->sub, r->has_box ? &r->box : nullptr, payload(r), r->row, r->depth);
+        break;
+      }
+      case Op::UpdateConstants: {
+        auto* r = static_cast<ConstArgs*>(a);
+        update_constants(x, r->b, r->offset, payload(r), r->bytes, r->total);
         break;
       }
       case Op::WriteBuffer: {
@@ -508,6 +529,19 @@ void Recorder::UpdateSubresource(ID3D11Resource* res, UINT sub, const D3D11_BOX*
   r->row = row_pitch;
   r->depth = depth_pitch;
   r->bytes = bytes;
+  std::memcpy(payload(r), data, bytes);
+}
+void Recorder::UpdateConstants(ID3D11Buffer* b, u32 offset, const void* data, u32 bytes, u32 total) {
+  if (!g_async) {
+    sync_pending();
+    update_constants(ctx(), b, offset, data, bytes, total);
+    return;
+  }
+  auto* r = emit<ConstArgs>(Op::UpdateConstants, bytes);
+  r->b = b;
+  r->offset = offset;
+  r->bytes = bytes;
+  r->total = total;
   std::memcpy(payload(r), data, bytes);
 }
 void Recorder::write_buffer(ID3D11Buffer* b, D3D11_MAP mode, u32 offset, const void* data, u32 bytes) {

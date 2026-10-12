@@ -2,9 +2,11 @@
 //
 // Surfaces live on the GPU, keyed by (location, offset); a flip presents the color surface at the
 // display buffer's offset, or guest memory when nothing was rendered there. Vertex programs and
-// fragment programs are translated to HLSL (vp_hlsl/fp_hlsl) and cached. Vertex data is fetched
-// and converted to float4 on the CPU. Known gaps are logged once and listed in docs/STATUS.md.
+// fragment programs are translated to HLSL (vp_hlsl/fp_hlsl) and cached. Vertex data is uploaded
+// as raw guest bytes and decoded by the vertex shader (see "Raw vertex streams"). Known gaps are
+// logged once and listed in docs/STATUS.md.
 #include <d3dcompiler.h>
+#include <x86intrin.h>
 
 #include <algorithm>
 #include <array>
@@ -91,7 +93,7 @@ u64 g_frame = 0;
 // Work counters, logged as per-frame averages every 300 frames (perf).
 struct RenderStats {
   u64 draws = 0, vcached = 0, vconverted = 0, tex_hashed = 0, tex_uploaded = 0, surfaces = 0, target_binds = 0, collections = 0,
-      bytes_queried = 0, vertices = 0, max_draw_vertices = 0;
+      bytes_queried = 0, vertices = 0, max_draw_vertices = 0, vbytes = 0;
 };
 RenderStats g_rs, g_rs_last;
 
@@ -117,7 +119,7 @@ struct Shadow {
   D3D11_RECT scissor;
   ID3D11VertexShader* vs;
   ID3D11PixelShader* ps;
-  ID3D11ShaderResourceView* vs_srv;
+  ID3D11ShaderResourceView* vs_srv[4];  // vertex streams (gpu::kVtxBuffers)
   ID3D11ShaderResourceView* ps_srv[16];
   ID3D11SamplerState* smp[16];
   ID3D11Buffer* ib;
@@ -129,11 +131,11 @@ void shadow_reset() {
   std::memset(&g_sh, 0xff, sizeof g_sh);  // matches no real state
   g_sh.fixed = 0;
 }
-// Sets the slots of want[16] that differ from have[16] (one call over the differing span).
-template <typename T, typename F>
+// Sets the slots of want[N] that differ from have[N] (one call over the differing span).
+template <u32 N = 16, typename T, typename F>
 void bind_changed(T** want, T** have, F set) {
-  u32 lo = 16, hi = 0;
-  for (u32 i = 0; i < 16; ++i)
+  u32 lo = N, hi = 0;
+  for (u32 i = 0; i < N; ++i)
     if (want[i] != have[i]) {
       lo = std::min(lo, i);
       hi = i + 1;
@@ -167,6 +169,10 @@ struct Surface {
   u64 as_color_serial = ~0ull;
 };
 std::vector<Surface*> g_surfaces;
+// Index of g_surfaces by address (one surface per location and offset): lookups per draw for the
+// targets and every texture (a linear search over a few hundred surfaces was ~5% of the FIFO thread).
+std::unordered_map<u64, Surface*> g_surface_at;
+u64 surface_key(u32 location, u32 offset) { return (u64(location) << 32) | offset; }
 u64 g_write_serial = 0;
 
 DXGI_FORMAT color_dxgi(u32 f) {
@@ -195,9 +201,8 @@ void destroy(Surface* s) {
 }
 
 Surface* find_surface(u32 location, u32 offset) {
-  for (Surface* s : g_surfaces)
-    if (s->location == location && s->offset == offset) return s;
-  return nullptr;
+  auto it = g_surface_at.find(surface_key(location, offset));
+  return it == g_surface_at.end() ? nullptr : it->second;
 }
 
 u64 surface_bytes(const Surface* s) {
@@ -217,6 +222,7 @@ void surface_trim() {
     Surface* s = *it;
     if (s->last_frame + 3600 < g_frame) {
       total -= surface_bytes(s);
+      g_surface_at.erase(surface_key(s->location, s->offset));
       it = g_surfaces.erase(it);
       destroy(s);
       ++dropped;
@@ -244,6 +250,7 @@ Surface* get_surface(u32 location, u32 offset, u32 format, u32 w, u32 h, bool de
             s->depth ? "depth" : "color", s->width, s->height, s->format, depth ? "depth" : "color", w, h, format);
     }
     g_surfaces.erase(std::find(g_surfaces.begin(), g_surfaces.end(), s));
+    g_surface_at.erase(surface_key(location, offset));
     destroy(s);
   }
   s = new Surface{location, offset, format, w, h, depth};
@@ -288,6 +295,7 @@ Surface* get_surface(u32 location, u32 offset, u32 format, u32 w, u32 h, bool de
   if (depth && s->dsv) gpu::rec().ClearDepthStencilView(s->dsv, D3D11_CLEAR_DEPTH | D3D11_CLEAR_STENCIL, 1.0f, 0);
   s->last_frame = g_frame;
   g_surfaces.push_back(s);
+  g_surface_at[surface_key(location, offset)] = s;
   LOG_D("gpu", "surface %s %ux%u fmt %u at %s 0x%08x", depth ? "depth" : "color", w, h, format, location ? "main" : "local",
         offset);
   return s;
@@ -579,7 +587,13 @@ u32 g_vp_load = 0, g_vp_burst = 0;
 u32 g_vp_gen = 0;  // bumped when a program word changes
 float g_vc[512 * 4];
 u32 g_vc_load = 0;
-bool g_vc_dirty = true;
+// Registers changed since the last upload: only [g_vc_lo, g_vc_hi] is recorded (Recorder::
+// UpdateConstants). Games set a few registers per draw (a matrix); recording the whole 7.5 KiB
+// buffer per draw was ~7% of the FIFO thread.
+bool g_vc_dirty = true, g_vc_whole = true;
+u32 g_vc_lo = ~0u, g_vc_hi = 0;
+u32 g_patch_cb = 7;       // "gpu patch MASK": 1 vertex constants, 2 fragment constants, 4 vertex formats (A/B)
+bool g_cb_reset = false;  // next draw records the constant buffers whole
 
 struct VsEntry {
   ID3D11VertexShader* vs = nullptr;
@@ -1176,139 +1190,68 @@ void attr_sources(AttrSrc* a) {
   }
 }
 
-// Element converters specialized by type and component count (same results as convert_attr;
-// the components beyond the count keep the template's 0, 0, 0, 1).
-using ConvFn = void (*)(const u8*, float*);
-template <u32 T, u32 N>
-void conv(const u8* p, float* o) {
-  for (u32 c = 0; c < N; ++c) {
-    if constexpr (T == 2) {  // F32
-      u32 w;
-      std::memcpy(&w, p + 4 * c, 4);
-      o[c] = f32_of(__builtin_bswap32(w));
-    } else if constexpr (T == 1 || T == 3 || T == 5) {  // S16 normalized, F16, S16
-      u16 h;
-      std::memcpy(&h, p + 2 * c, 2);
-      h = __builtin_bswap16(h);
-      if constexpr (T == 1) o[c] = (float(s16(h)) + 0.5f) / 32767.5f;
-      else if constexpr (T == 3) o[c] = half_to_float(h);
-      else o[c] = float(s16(h));
-    } else if constexpr (T == 4) {  // U8 normalized
-      o[c] = p[c] / 255.0f;
-    } else {  // U8 unnormalized (0, 7)
-      o[c] = p[c];
-    }
-  }
-}
-void conv_cmp(const u8* p, float* o) { convert_attr(6, 1, p, o); }
-void conv_none(const u8*, float*) {}
-template <u32 T>
-constexpr ConvFn conv_row[5] = {conv_none, conv<T, 1>, conv<T, 2>, conv<T, 3>, conv<T, 4>};
-ConvFn conv_fn(u32 type, u32 size) {
-  size = std::min(size, 4u);
-  switch (type) {
-    case 1: return conv_row<1>[size];
-    case 2: return conv_row<2>[size];
-    case 3: return conv_row<3>[size];
-    case 4: return conv_row<4>[size];
-    case 5: return conv_row<5>[size];
-    case 6: return conv_cmp;
-    case 0: return conv_row<0>[size];
-    case 7: return conv_row<7>[size];
-    default: return conv_none;
-  }
-}
-
-// Vertices of a draw: 16 float4 attributes each, for the attributes the VP reads (unread ones
-// 0, 0, 0, 1; registers for attributes without an array). The per-draw work (template vertex,
-// active arrays with their converters) is done once; each vertex is the template plus its array
-// elements. Also sets the element index range each array was read over (vertex cache).
-u32 g_fetch_lo[16], g_fetch_hi[16];
-void fetch_vertices(const AttrSrc* a, u32 input_mask, const std::vector<u32>& uniq, u32 lo, u32 hi, float* out) {
-  struct Active {
-    u32 slot;
-    ConvFn fn;
-    const u8* base;
-    u32 stride, freq;
-    bool modulo;
-  };
-  Active act[16];
-  u32 nact = 0;
-  alignas(16) float tmpl[64];
-  for (u32 i = 0; i < 16; ++i) {
-    float* t = tmpl + 4 * i;
-    g_fetch_lo[i] = ~0u;
-    g_fetch_hi[i] = 0;
-    if (((input_mask >> i) & 1) && !a[i].array) {
-      std::memcpy(t, g_imm[i], 16);
-      continue;
-    }
-    t[0] = t[1] = t[2] = 0;
-    t[3] = 1;
-    if (!((input_mask >> i) & 1)) continue;
-    act[nact++] = {i, conv_fn(a[i].type, a[i].size), ::ppu::mem() + a[i].ea, a[i].stride, a[i].freq, a[i].modulo};
-    // Element index range over the draw's vertex indices [lo, hi].
-    if (a[i].stride == 0) {
-      g_fetch_lo[i] = g_fetch_hi[i] = 0;
-    } else if (a[i].freq > 1 && a[i].modulo) {
-      g_fetch_lo[i] = 0;
-      g_fetch_hi[i] = std::min(hi, a[i].freq - 1);
-    } else if (a[i].freq > 1) {
-      g_fetch_lo[i] = lo / a[i].freq;
-      g_fetch_hi[i] = hi / a[i].freq;
-    } else {
-      g_fetch_lo[i] = lo;
-      g_fetch_hi[i] = hi;
-    }
-  }
-  for (size_t v = 0; v < uniq.size(); ++v) {
-    float* o = out + v * 64;
-    std::memcpy(o, tmpl, sizeof tmpl);
-    u32 k = uniq[v];
-    for (u32 j = 0; j < nact; ++j) {
-      const Active& t = act[j];
-      u32 kk = k;
-      if (t.freq > 1) kk = t.modulo ? k % t.freq : k / t.freq;
-      if (t.stride == 0) kk = 0;
-      t.fn(t.base + size_t(kk) * t.stride, o + 4 * t.slot);
-    }
-  }
-}
-
-ID3D11Buffer* g_vbuf = nullptr;
-ID3D11ShaderResourceView* g_vsrv = nullptr;
-u32 g_vbuf_cap = 0;
+// ---------------------------------------------------------------------------------------------
+// Raw vertex streams (vp_hlsl.h VtxFmt). The guest memory ranges a draw's vertex arrays span are
+// copied as they are (big-endian) and the vertex shader decodes each attribute, instead of this
+// thread converting every vertex to 16 float4 (256 bytes per vertex, written twice here and copied
+// again by the submission thread). Ranges a small gap apart share a stream (interleaved arrays).
+// Streams go into a ring buffer, or into a buffer of their own once seen unwritten since an
+// earlier frame (static meshes, kept valid by write tracking).
+ID3D11Buffer* g_raw = nullptr;
+ID3D11ShaderResourceView* g_raw_srv = nullptr;
+u32 g_raw_cap = 0, g_raw_pos = 0;  // bytes
 ID3D11Buffer* g_ibuf = nullptr;
-u32 g_ibuf_cap = 0;
+u32 g_ibuf_cap = 0, g_ibuf_pos = 0;  // indices
+ID3D11Buffer* g_vtx_fmt = nullptr;  // VtxFmt constant buffer (b2)
 
-// Vertex and index data go into ring buffers: each draw appends (NO_OVERWRITE) and only a wrap
-// discards, so the driver does not have to rename a large buffer for every draw.
-u32 g_vbuf_pos = 0, g_ibuf_pos = 0;  // float4 / index units
+ID3D11ShaderResourceView* raw_view(ID3D11Buffer* b, u32 bytes) {
+  D3D11_SHADER_RESOURCE_VIEW_DESC sd{};
+  sd.Format = DXGI_FORMAT_R32_TYPELESS;
+  sd.ViewDimension = D3D11_SRV_DIMENSION_BUFFEREX;
+  sd.BufferEx.FirstElement = 0;
+  sd.BufferEx.NumElements = bytes / 4;
+  sd.BufferEx.Flags = D3D11_BUFFEREX_SRV_FLAG_RAW;
+  ID3D11ShaderResourceView* v = nullptr;
+  return SUCCEEDED(device().dev->CreateShaderResourceView(b, &sd, &v)) ? v : nullptr;
+}
 
-// Appends the vertices (16 float4 each); returns the index of the first one in the buffer.
-u32 upload_vertices(const std::vector<float>& v) {
-  u32 count = u32(v.size() / 4);
-  constexpr u32 kMinCap = 1u << 21;  // 2 M float4 = 32 MiB
-  if (count > g_vbuf_cap || !g_vbuf) {
-    release(g_vsrv);
-    release(g_vbuf);
-    g_vbuf_cap = std::max({count * 2, g_vbuf_cap * 2, kMinCap});
-    D3D11_BUFFER_DESC bd{g_vbuf_cap * 16, D3D11_USAGE_DYNAMIC, D3D11_BIND_SHADER_RESOURCE, D3D11_CPU_ACCESS_WRITE,
-                         D3D11_RESOURCE_MISC_BUFFER_STRUCTURED, 16};
-    device().dev->CreateBuffer(&bd, nullptr, &g_vbuf);
-    device().dev->CreateShaderResourceView(g_vbuf, nullptr, &g_vsrv);
-    g_vbuf_pos = g_vbuf_cap;  // force a discard on first use
+// Room for `n` bytes in the ring, filled by the caller before the next recorded call; *offset
+// receives their position (16-byte aligned). Everything one draw reads from the ring must come
+// from one call: a wrap discards what was written before it. Null if the ring is unavailable.
+u8* raw_space(u32 n, u32* offset) {
+  constexpr u32 kMinCap = 64u << 20;
+  n = (n + 15) & ~15u;
+  if (n > g_raw_cap || !g_raw) {
+    release(g_raw_srv);
+    release(g_raw);
+    g_raw_cap = std::max({n * 2, g_raw_cap * 2, kMinCap});
+    D3D11_BUFFER_DESC bd{g_raw_cap, D3D11_USAGE_DYNAMIC, D3D11_BIND_SHADER_RESOURCE, D3D11_CPU_ACCESS_WRITE,
+                         D3D11_RESOURCE_MISC_BUFFER_ALLOW_RAW_VIEWS, 0};
+    if (FAILED(device().dev->CreateBuffer(&bd, nullptr, &g_raw)) || !(g_raw_srv = raw_view(g_raw, g_raw_cap))) {
+      release(g_raw);
+      g_raw_cap = 0;
+      return nullptr;
+    }
+    g_raw_pos = g_raw_cap;  // discard on first use
   }
   D3D11_MAP mode = D3D11_MAP_WRITE_NO_OVERWRITE;
-  if (g_vbuf_pos + count > g_vbuf_cap) {
+  if (g_raw_pos + n > g_raw_cap) {
     mode = D3D11_MAP_WRITE_DISCARD;
-    g_vbuf_pos = 0;
+    g_raw_pos = 0;
   }
-  u32 base = g_vbuf_pos;
-  gpu::rec().write_buffer(g_vbuf, mode, base * 16, v.data(), u32(v.size() * 4));
-  g_vbuf_pos += count;
-  return base / 16;  // a vertex is 16 float4
+  *offset = g_raw_pos;
+  g_raw_pos += n;
+  return static_cast<u8*>(gpu::rec().write_buffer_space(g_raw, mode, *offset, n));
 }
+
+// One attribute element at element index k, converted on the CPU (frame report only).
+void cpu_fetch(const AttrSrc& s, u32 k, float* out) {
+  u32 kk = k;
+  if (s.freq > 1) kk = s.modulo ? k % s.freq : k / s.freq;
+  if (s.stride == 0) kk = 0;
+  convert_attr(s.type, std::min(s.size, 4u), ::ppu::mem() + s.ea + size_t(kk) * s.stride, out);
+}
+
 // Appends the indices; returns the start index for the draw.
 u32 upload_indices(const std::vector<u32>& idx) {
   u32 n = u32(idx.size());
@@ -1719,72 +1662,430 @@ void set_pipeline_state(const Targets& t) {
 }
 
 // ---------------------------------------------------------------------------------------------
-// Vertex cache: converted vertices and indices of array/indexed draws kept in GPU buffers, valid
-// while write tracking reports no write to the guest memory they were read from (static meshes
-// are converted once instead of every frame).
-struct VtxCacheEntry {
-  ID3D11Buffer* vb = nullptr;
+// Static vertex data: streams and converted index lists kept in buffers of their own while write
+// tracking reports no write to the guest memory they came from. A candidate (no buffer yet) is
+// recorded when first seen and stored when seen again in a later frame without writes in between;
+// data rewritten every frame keeps going through the rings (buffer creation is costly).
+struct StreamEntry {
+  ID3D11Buffer* buf = nullptr;
   ID3D11ShaderResourceView* srv = nullptr;
-  ID3D11Buffer* ib = nullptr;
-  u32 index_count = 0, bytes = 0;
-  D3D11_PRIMITIVE_TOPOLOGY topo = D3D11_PRIMITIVE_TOPOLOGY_UNDEFINED;
-  u32 serial = 0;  // write-tracking serial when built (or when first seen, for a candidate)
-  u64 last_frame = 0, seen_frame = ~0ull;  // seen_frame: frame a candidate (no buffers yet) was recorded
-  std::vector<std::pair<u32, u32>> ranges;  // guest memory read: [ea, ea + size)
+  u32 serial = 0, bytes = 0;
+  u64 last_frame = 0, seen_frame = ~0ull;
 };
-std::unordered_map<u64, VtxCacheEntry> g_vcache;
-u64 g_vcache_bytes = 0;
-constexpr u64 kVcacheBudget = 512ull << 20;
+struct IndexEntry {
+  ID3D11Buffer* ib = nullptr;
+  u32 count = 0, lo = 0, hi = 0, serial = 0, bytes = 0;
+  D3D11_PRIMITIVE_TOPOLOGY topo = D3D11_PRIMITIVE_TOPOLOGY_UNDEFINED;
+  u64 last_frame = 0, seen_frame = ~0ull;
+  std::vector<std::pair<u32, u32>> ranges;  // index memory read: [ea, ea + size)
+};
+std::unordered_map<u64, StreamEntry> g_streams;     // key: ea << 32 | size
+std::unordered_map<u64, IndexEntry> g_index_lists;  // key: hash of the index source and primitive
+u64 g_vdata_bytes = 0;
+constexpr u64 kVdataBudget = 512ull << 20;
+constexpr u32 kStreamCacheMin = 16u << 10;  // bytes; smaller streams always go through the ring
+constexpr u32 kIndexCacheMin = 256;         // indices
 
-void vcache_release(VtxCacheEntry& e) {
+void vdata_release(StreamEntry& e) {
   release(e.srv);
-  release(e.vb);
-  release(e.ib);
-  g_vcache_bytes -= e.bytes;
+  release(e.buf);
+  g_vdata_bytes -= e.bytes;
   e.bytes = 0;
 }
-// Once the byte budget or the entry limit is exceeded: drops entries unused for 120 frames and
-// candidates (no buffers yet) unused for two (called at frame boundaries). While everything is
-// still in use, the scan is retried once a second, not every frame.
-void vcache_trim() {
+void vdata_release(IndexEntry& e) {
+  release(e.ib);
+  g_vdata_bytes -= e.bytes;
+  e.bytes = 0;
+}
+// Once over the byte budget or the entry limit: drops entries unused for 120 frames and
+// candidates unused for two (at frame boundaries; while everything is in use, once a second).
+void vdata_trim() {
   static u64 next_scan = 0;
-  if ((g_vcache_bytes <= kVcacheBudget && g_vcache.size() < 50000) || g_frame < next_scan) return;
+  if ((g_vdata_bytes <= kVdataBudget && g_streams.size() + g_index_lists.size() < 50000) || g_frame < next_scan) return;
   next_scan = g_frame + 60;
-  for (auto it = g_vcache.begin(); it != g_vcache.end();) {
-    if (it->second.last_frame + 120 < g_frame || (!it->second.vb && it->second.last_frame + 2 < g_frame)) {
-      vcache_release(it->second);
-      it = g_vcache.erase(it);
-    } else {
-      ++it;
+  auto trim = [](auto& map) {
+    for (auto it = map.begin(); it != map.end();) {
+      if (it->second.last_frame + 120 < g_frame || (!it->second.bytes && it->second.last_frame + 2 < g_frame)) {
+        vdata_release(it->second);
+        it = map.erase(it);
+      } else {
+        ++it;
+      }
     }
+  };
+  trim(g_streams);
+  trim(g_index_lists);
+}
+
+// The buffer of a stream that stayed unwritten since an earlier frame (created now if needed), or
+// null: the stream goes through the ring this time.
+StreamEntry* stream_cached(u32 ea, u32 size) {
+  StreamEntry& e = g_streams[(u64(ea) << 32) | size];
+  e.last_frame = g_frame;
+  if (e.buf) {
+    if (g_track_writes && !written_since(ea, size, e.serial)) return &e;
+    vdata_release(e);  // rewritten: a candidate again
+    e.seen_frame = g_frame;
+    e.serial = g_mem_serial;
+    watch_range(ea, size);
+    return nullptr;
+  }
+  if (e.seen_frame == g_frame) return nullptr;
+  if (e.seen_frame == ~0ull || !g_track_writes || written_since(ea, size, e.serial)) {
+    e.seen_frame = g_frame;
+    e.serial = g_mem_serial;
+    watch_range(ea, size);
+    return nullptr;
+  }
+  D3D11_BUFFER_DESC bd{size, D3D11_USAGE_IMMUTABLE, D3D11_BIND_SHADER_RESOURCE, 0, D3D11_RESOURCE_MISC_BUFFER_ALLOW_RAW_VIEWS, 0};
+  D3D11_SUBRESOURCE_DATA init{::ppu::mem() + ea, 0, 0};
+  if (FAILED(device().dev->CreateBuffer(&bd, &init, &e.buf)) || !(e.srv = raw_view(e.buf, size))) {
+    release(e.buf);
+    return nullptr;
+  }
+  e.bytes = size;
+  g_vdata_bytes += size;
+  e.serial = g_mem_serial;
+  watch_range(ea, size);
+  return &e;
+}
+
+// The draw's vertex data and indices, ready to bind.
+struct DrawGeom {
+  D3D11_PRIMITIVE_TOPOLOGY topo = D3D11_PRIMITIVE_TOPOLOGY_UNDEFINED;
+  ID3D11Buffer* ib = nullptr;  // null: Draw(count, start) without indices (start = first element)
+  u32 count = 0, start = 0;
+  ID3D11ShaderResourceView* srv[gpu::kVtxBuffers] = {};
+  gpu::VtxFmt fmt{};
+  u32 lo = 0, hi = 0;   // element index range
+  bool cached = true;   // nothing went through the rings
+  bool inline_data = false;
+};
+
+// Element index sequence of an array, indexed or element draw (~0u: primitive restart).
+void draw_sequence(Clause clause, std::vector<u32>& seq) {
+  seq.clear();
+  if (clause == Clause::Arrays) {
+    for (auto [first, count] : g_ranges)
+      for (u32 i = 0; i < count; ++i) seq.push_back(first + i);
+  } else if (clause == Clause::Indexed) {
+    bool restart = reg(m::SET_RESTART_INDEX_ENABLE) != 0;
+    u32 restart_value = reg(m::SET_RESTART_INDEX);
+    u32 dma = reg(m::SET_INDEX_ARRAY_DMA);
+    bool u16i = ((dma >> 4) & 15) == 1;
+    u32 isz = u16i ? 2 : 4;
+    u32 base_index = reg(m::SET_VERTEX_DATA_BASE_INDEX);
+    u32 iaddr = reg(m::SET_INDEX_ARRAY_ADDRESS) & ~(isz - 1);
+    for (auto [first, count] : g_ranges) {
+      u32 ea = offset_to_ea(iaddr + first * isz, dma & 15);
+      if (!ea) continue;
+      const u8* p = ::ppu::mem() + ea;
+      for (u32 i = 0; i < count; ++i) {
+        u32 v;
+        if (u16i) {
+          u16 h;
+          std::memcpy(&h, p + 2 * i, 2);
+          v = __builtin_bswap16(h);
+        } else {
+          std::memcpy(&v, p + 4 * i, 4);
+          v = __builtin_bswap32(v);
+        }
+        if (restart && v == restart_value) {
+          seq.push_back(~0u);
+          continue;
+        }
+        seq.push_back((v + base_index) & 0xfffff);
+      }
+    }
+  } else if (clause == Clause::Elements) {
+    seq.assign(g_elements.begin(), g_elements.end());
   }
 }
-bool vcache_valid(const VtxCacheEntry& e) {
-  if (!e.vb || !g_track_writes) return false;
-  for (auto [ea, size] : e.ranges)
-    if (written_since(ea, size, e.serial)) return false;
-  return true;
-}
-// Stores the converted draw; returns false if buffers could not be created.
-bool vcache_store(VtxCacheEntry& e, const std::vector<float>& verts, const std::vector<u32>& indices, D3D11_PRIMITIVE_TOPOLOGY topo) {
-  vcache_release(e);
-  auto* dev = device().dev;
-  D3D11_BUFFER_DESC vd{u32(verts.size() * 4), D3D11_USAGE_IMMUTABLE, D3D11_BIND_SHADER_RESOURCE, 0, D3D11_RESOURCE_MISC_BUFFER_STRUCTURED, 16};
-  D3D11_SUBRESOURCE_DATA vi{verts.data(), 0, 0};
-  D3D11_BUFFER_DESC id{u32(indices.size() * 4), D3D11_USAGE_IMMUTABLE, D3D11_BIND_INDEX_BUFFER, 0, 0, 0};
-  D3D11_SUBRESOURCE_DATA ii{indices.data(), 0, 0};
-  if (FAILED(dev->CreateBuffer(&vd, &vi, &e.vb)) || FAILED(dev->CreateShaderResourceView(e.vb, nullptr, &e.srv)) ||
-      FAILED(dev->CreateBuffer(&id, &ii, &e.ib))) {
-    vcache_release(e);
+
+// Converts element index sequence `seq` for primitive `prim` and uploads the index list to the ring.
+bool upload_sequence(u32 prim, const std::vector<u32>& seq, DrawGeom* g) {
+  static std::vector<u32> positions, indices;
+  positions.clear();
+  g->topo = convert_primitive(prim, seq, &positions);
+  if (g->topo == D3D11_PRIMITIVE_TOPOLOGY_UNDEFINED || positions.empty()) {
+    fr_drop("primitive not drawable");
     return false;
   }
-  e.index_count = u32(indices.size());
-  e.topo = topo;
-  e.bytes = vd.ByteWidth + id.ByteWidth;
-  g_vcache_bytes += e.bytes;
-  e.serial = g_mem_serial;
-  for (auto [ea, size] : e.ranges) watch_range(ea, size);
+  indices.clear();
+  indices.reserve(positions.size());
+  for (u32 p : positions) indices.push_back(seq[p]);
+  g->count = u32(indices.size());
+  int prev = phase_switch(kPhUploads);
+  g->start = upload_indices(indices);
+  phase_switch(prev);
+  g->ib = g_ibuf;
+  g->cached = false;
   return true;
+}
+
+// Index list of an array, indexed or element draw: none for a list drawn from one array range,
+// else a cached list or one converted now. Sets the element index range.
+bool draw_indices(Clause clause, u32 prim, DrawGeom* g) {
+  if (clause == Clause::Arrays && g_ranges.size() == 1 && (prim == 1 || prim == 2 || prim == 5)) {
+    g->topo = prim == 1 ? D3D11_PRIMITIVE_TOPOLOGY_POINTLIST
+              : prim == 2 ? D3D11_PRIMITIVE_TOPOLOGY_LINELIST
+                          : D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST;
+    g->ib = nullptr;
+    g->start = g_ranges[0].first;
+    g->count = g_ranges[0].second;
+    g->lo = g->start;
+    g->hi = g->start + g->count - 1;
+    return true;
+  }
+  u32 total = 0;
+  for (auto [first, count] : g_ranges) total += count;
+  bool cacheable = (clause == Clause::Arrays || clause == Clause::Indexed) && total >= kIndexCacheMin;
+  IndexEntry* e = nullptr;
+  u64 key = 0;
+  if (cacheable) {
+    u32 fixed[8] = {u32(clause), prim, 0, 0, 0, 0, 0, 0};
+    if (clause == Clause::Indexed) {
+      fixed[2] = reg(m::SET_INDEX_ARRAY_DMA);
+      fixed[3] = reg(m::SET_INDEX_ARRAY_ADDRESS);
+      fixed[4] = reg(m::SET_VERTEX_DATA_BASE_INDEX);
+      fixed[5] = reg(m::SET_RESTART_INDEX_ENABLE);
+      fixed[6] = reg(m::SET_RESTART_INDEX);
+    }
+    key = hash_bytes(reinterpret_cast<const u8*>(g_ranges.data()), g_ranges.size() * sizeof(g_ranges[0])) ^
+          hash_bytes(reinterpret_cast<const u8*>(fixed), sizeof fixed) * 31;
+    e = &g_index_lists[key];
+    e->last_frame = g_frame;
+    bool valid = e->ib && g_track_writes;
+    for (size_t r = 0; valid && r < e->ranges.size(); ++r) valid = !written_since(e->ranges[r].first, e->ranges[r].second, e->serial);
+    if (valid) {
+      g->topo = e->topo;
+      g->ib = e->ib;
+      g->count = e->count;
+      g->start = 0;
+      g->lo = e->lo;
+      g->hi = e->hi;
+      return true;
+    }
+  }
+  static std::vector<u32> seq;
+  draw_sequence(clause, seq);
+  u32 lo = ~0u, hi = 0;
+  for (u32 k : seq)
+    if (k != ~0u) {
+      lo = std::min(lo, k);
+      hi = std::max(hi, k);
+    }
+  if (lo == ~0u) {
+    fr_drop("no vertices");
+    return false;
+  }
+  g->lo = lo;
+  g->hi = hi;
+  if (!cacheable) return upload_sequence(prim, seq, g);
+  e->ranges.clear();
+  if (clause == Clause::Indexed) {
+    u32 dma = reg(m::SET_INDEX_ARRAY_DMA);
+    u32 isz = ((dma >> 4) & 15) == 1 ? 2 : 4;
+    u32 iaddr = reg(m::SET_INDEX_ARRAY_ADDRESS) & ~(isz - 1);
+    for (auto [first, count] : g_ranges)
+      if (u32 ea = offset_to_ea(iaddr + first * isz, dma & 15)) e->ranges.push_back({ea, count * isz});
+  }
+  bool unchanged = e->seen_frame != ~0ull && e->seen_frame != g_frame && !e->ib && g_track_writes;
+  for (size_t r = 0; unchanged && r < e->ranges.size(); ++r)
+    unchanged = !written_since(e->ranges[r].first, e->ranges[r].second, e->serial);
+  if (!unchanged) {  // first sight or rewritten: a candidate (again)
+    if (e->seen_frame != g_frame || e->ib) {
+      vdata_release(*e);
+      e->seen_frame = g_frame;
+      e->serial = g_mem_serial;
+      for (auto [ea, size] : e->ranges) watch_range(ea, size);
+    }
+    return upload_sequence(prim, seq, g);
+  }
+  // Unwritten since an earlier frame: a buffer of its own.
+  static std::vector<u32> positions, indices;
+  positions.clear();
+  D3D11_PRIMITIVE_TOPOLOGY topo = convert_primitive(prim, seq, &positions);
+  if (topo == D3D11_PRIMITIVE_TOPOLOGY_UNDEFINED || positions.empty()) {
+    fr_drop("primitive not drawable");
+    return false;
+  }
+  indices.clear();
+  indices.reserve(positions.size());
+  for (u32 p : positions) indices.push_back(seq[p]);
+  D3D11_BUFFER_DESC id{u32(indices.size() * 4), D3D11_USAGE_IMMUTABLE, D3D11_BIND_INDEX_BUFFER, 0, 0, 0};
+  D3D11_SUBRESOURCE_DATA ii{indices.data(), 0, 0};
+  if (FAILED(device().dev->CreateBuffer(&id, &ii, &e->ib))) {
+    release(e->ib);
+    return upload_sequence(prim, seq, g);
+  }
+  e->count = u32(indices.size());
+  e->topo = topo;
+  e->lo = lo;
+  e->hi = hi;
+  e->bytes = id.ByteWidth;
+  g_vdata_bytes += e->bytes;
+  e->serial = g_mem_serial;
+  for (auto [ea, size] : e->ranges) watch_range(ea, size);
+  g->topo = topo;
+  g->ib = e->ib;
+  g->count = e->count;
+  g->start = 0;
+  return true;
+}
+
+// Vertex streams of an array, indexed or element draw for the inputs the program reads: attribute
+// descriptors and buffer bindings.
+bool draw_streams(const AttrSrc* a, u32 mask, DrawGeom* g) {
+  struct Range {
+    u32 b, e, attrs;  // bytes [b, e) and the attributes reading them
+  };
+  Range rs[16];
+  u32 nr = 0;
+  for (u32 i = 0; i < 16; ++i) {
+    if (!((mask >> i) & 1)) continue;
+    if (!a[i].array) {
+      std::memcpy(g->fmt.konst[i], g_imm[i], 16);
+      continue;
+    }
+    u32 elo = g->lo, ehi = g->hi;
+    if (a[i].stride == 0) {
+      elo = ehi = 0;
+    } else if (a[i].freq > 1 && a[i].modulo) {
+      elo = 0;
+      ehi = std::min(g->hi, a[i].freq - 1);
+    } else if (a[i].freq > 1) {
+      elo = g->lo / a[i].freq;
+      ehi = g->hi / a[i].freq;
+    }
+    u32 nb = a[i].type == 6 ? 4 : std::min(a[i].size, 4u) * type_size(a[i].type);
+    u64 b = u64(a[i].ea) + u64(elo) * a[i].stride, e = u64(a[i].ea) + u64(ehi) * a[i].stride + nb;
+    if (e >= 0x100000000ull || e - b > (32u << 20)) {
+      fr_drop("vertex array range outside guest memory or over 32 MiB");
+      return false;
+    }
+    g->fmt.attr[i] = {0, a[i].stride, a[i].freq, a[i].type | (std::min(a[i].size, 4u) << 4) | (u32(a[i].modulo) << 12) | (1u << 16)};
+    rs[nr++] = {u32(b), u32(e), 1u << i};
+  }
+  // Streams: ranges merged when they overlap or lie up to 256 bytes apart (interleaved arrays).
+  std::sort(rs, rs + nr, [](const Range& x, const Range& y) { return x.b < y.b; });
+  Range st[16];
+  u32 ns = 0;
+  for (u32 r = 0; r < nr; ++r) {
+    if (ns && rs[r].b <= st[ns - 1].e + 256) {
+      st[ns - 1].e = std::max(st[ns - 1].e, rs[r].e);
+      st[ns - 1].attrs |= rs[r].attrs;
+    } else {
+      st[ns++] = rs[r];
+    }
+  }
+  // Large streams from their own buffers (slots 1..3) when cached; the others from the ring (slot
+  // 0), all reserved at once.
+  u32 slot_of[16], pos_of[16], ring_bytes = 0, next_slot = 1;
+  for (u32 s = 0; s < ns; ++s) {
+    st[s].b &= ~3u;
+    st[s].e = (st[s].e + 3) & ~3u;
+    u32 size = st[s].e - st[s].b;
+    slot_of[s] = 0;
+    if (size >= kStreamCacheMin && next_slot < gpu::kVtxBuffers)
+      if (StreamEntry* c = stream_cached(st[s].b, size)) {
+        slot_of[s] = next_slot++;
+        pos_of[s] = 0;
+        g->srv[slot_of[s]] = c->srv;
+        continue;
+      }
+    pos_of[s] = ring_bytes;
+    ring_bytes += (size + 15) & ~15u;
+  }
+  if (ring_bytes) {
+    int prev = phase_switch(kPhUploads);
+    u32 base;
+    u8* dst = raw_space(ring_bytes, &base);
+    if (!dst) {
+      phase_switch(prev);
+      fr_drop("vertex ring unavailable");
+      return false;
+    }
+    for (u32 s = 0; s < ns; ++s)
+      if (slot_of[s] == 0) {
+        std::memcpy(dst + pos_of[s], ::ppu::mem() + st[s].b, st[s].e - st[s].b);
+        pos_of[s] += base;
+      }
+    phase_switch(prev);
+    g->srv[0] = g_raw_srv;
+    g->cached = false;
+    g_rs.vbytes += ring_bytes;
+  }
+  for (u32 s = 0; s < ns; ++s)
+    for (u32 i = 0; i < 16; ++i)
+      if ((st[s].attrs >> i) & 1) {
+        g->fmt.attr[i].base = pos_of[s] + (a[i].ea - st[s].b);  // wraps when element 0 lies before the stream
+        g->fmt.attr[i].fmt |= slot_of[s] << 8;
+      }
+  return true;
+}
+
+// Inline arrays (INLINE_ARRAY: interleaved vertices in the command stream, each array padded to
+// 32-bit words) and immediate-mode vertices (16 float4 each, F32): one ring stream in guest
+// layout (big-endian), elements 0..n-1.
+bool draw_immediate(const AttrSrc* a, u32 mask, u32 prim, Clause clause, DrawGeom* g) {
+  u32 nv, base;
+  if (clause == Clause::Inline) {
+    u32 stride = 0, offs[16] = {};
+    for (u32 i = 0; i < 16; ++i)
+      if (a[i].size) {
+        offs[i] = stride;
+        u32 nb = a[i].type == 6 ? 4 : std::min(a[i].size, 4u) * type_size(a[i].type);
+        stride += (nb + 3) & ~3u;
+      }
+    if (!stride) {
+      fr_drop("inline array without enabled arrays");
+      return false;
+    }
+    nv = u32(g_inline.size() * 4 / stride);
+    if (!nv) {
+      fr_drop("no vertices");
+      return false;
+    }
+    u8* dst = raw_space(u32(g_inline.size() * 4), &base);
+    if (!dst) {
+      fr_drop("vertex ring unavailable");
+      return false;
+    }
+    for (size_t w = 0; w < g_inline.size(); ++w) {
+      u32 be = __builtin_bswap32(g_inline[w]);
+      std::memcpy(dst + 4 * w, &be, 4);
+    }
+    for (u32 i = 0; i < 16; ++i) {
+      if (!((mask >> i) & 1)) continue;
+      if (a[i].size) g->fmt.attr[i] = {base + offs[i], stride, 0, a[i].type | (std::min(a[i].size, 4u) << 4) | (1u << 16)};
+      else std::memcpy(g->fmt.konst[i], g_imm[i], 16);
+    }
+  } else {
+    nv = u32(g_imm_vertices.size());
+    u8* dst = raw_space(nv * 256, &base);
+    if (!dst) {
+      fr_drop("vertex ring unavailable");
+      return false;
+    }
+    for (u32 v = 0; v < nv; ++v)
+      for (u32 f = 0; f < 64; ++f) {
+        u32 w;
+        std::memcpy(&w, &g_imm_vertices[v][f], 4);
+        w = __builtin_bswap32(w);
+        std::memcpy(dst + v * 256 + 4 * f, &w, 4);
+      }
+    for (u32 i = 0; i < 16; ++i)
+      if ((mask >> i) & 1) g->fmt.attr[i] = {base + 16 * i, 256, 0, 2u | (4u << 4) | (1u << 16)};
+  }
+  g->srv[0] = g_raw_srv;
+  g->inline_data = true;
+  g->lo = 0;
+  g->hi = nv - 1;
+  static std::vector<u32> seq;
+  seq.clear();
+  for (u32 v = 0; v < nv; ++v) seq.push_back(v);
+  return upload_sequence(prim, seq, g);
 }
 
 void flush_draw() {
@@ -1833,240 +2134,47 @@ void flush_draw() {
   const PsEntry* ps = pixel_shader(env, ::ppu::mem() + fp_ea, max_bytes, code_hash, sp);
   if (!ps->ps) return fr_drop("fragment program unusable");
 
-  // Vertices. The scratch buffers persist across draws: no allocations per draw.
+  // Vertex data and indices.
   phase_switch(kPhVertices);
   AttrSrc a[16];
   attr_sources(a);
   u32 mask = vs->info.input_mask;
-  // Vertex cache key: everything the converted vertices and indices depend on.
-  VtxCacheEntry* vce = nullptr;
-  bool vhit = false, cacheable = (clause == Clause::Arrays || clause == Clause::Indexed) && g_imm_vertices.empty();
-  u64 vkey = 0;
-  if (cacheable) {
-    collect_writes();
-    u64 h = hash_bytes(reinterpret_cast<const u8*>(g_ranges.data()), g_ranges.size() * sizeof(g_ranges[0]));
-    u32 fixed[8] = {u32(clause), prim, mask, reg(m::SET_INDEX_ARRAY_DMA), reg(m::SET_INDEX_ARRAY_ADDRESS),
-                    reg(m::SET_VERTEX_DATA_BASE_INDEX), reg(m::SET_RESTART_INDEX_ENABLE), reg(m::SET_RESTART_INDEX)};
-    h ^= hash_bytes(reinterpret_cast<const u8*>(fixed), sizeof fixed) * 31;
-    for (u32 i = 0; i < 16; ++i) {
-      if (!((mask >> i) & 1)) continue;
-      if (a[i].array) {
-        u32 d[6] = {a[i].type, a[i].size, a[i].stride, a[i].freq, a[i].ea, a[i].modulo};
-        h = (h ^ hash_bytes(reinterpret_cast<const u8*>(d), sizeof d)) * 0x9e3779b97f4a7c15ull;
-      } else {
-        h = (h ^ hash_bytes(reinterpret_cast<const u8*>(g_imm[i]), 16)) * 0x9e3779b97f4a7c15ull;
-      }
-    }
-    vkey = h;
-    auto it = g_vcache.find(vkey);
-    if (it != g_vcache.end()) {
-      vce = &it->second;
-      vce->last_frame = g_frame;
-    }
-    if (vce && vcache_valid(*vce)) {
-      ++g_rs.vcached;
-      vhit = true;
-    } else {
-      ++g_rs.vconverted;
-      for (u32 i = 0; i < 16; ++i) {  // set by fetch_vertices (other clauses read no arrays by index)
-        g_fetch_lo[i] = ~0u;
-        g_fetch_hi[i] = 0;
-      }
-    }
+  static DrawGeom geo;
+  geo = DrawGeom{};
+  collect_writes();
+  if (clause == Clause::Inline || !g_imm_vertices.empty()) {
+    if (!draw_immediate(a, mask, prim, clause, &geo)) return;
+  } else if (!draw_indices(clause, prim, &geo) || !draw_streams(a, mask, &geo)) {
+    return;
   }
-  D3D11_PRIMITIVE_TOPOLOGY topo = D3D11_PRIMITIVE_TOPOLOGY_UNDEFINED;
-  ID3D11ShaderResourceView* draw_srv = g_vsrv;
-  ID3D11Buffer* draw_ib = g_ibuf;
-  u32 draw_count = 0, start_index = 0;
-  if (vhit) {
-    topo = vce->topo;
-    draw_srv = vce->srv;
-    draw_ib = vce->ib;
-    draw_count = vce->index_count;
-  }
-  static std::vector<u32> seq, dense_seq, uniq, positions, indices, slot_of, slot_gen;
-  static std::vector<float> verts;
-  static std::vector<u8> bytes;
-  static u32 gen = 0;
-  seq.clear();  // vertex fetch indices in RSX order (~0u = restart)
-  verts.clear();
-  positions.clear();
-  indices.clear();
-  if (!vhit) {
-  bool restart = reg(m::SET_RESTART_INDEX_ENABLE) != 0;
-  u32 restart_value = reg(m::SET_RESTART_INDEX);
-  if (clause == Clause::Arrays) {
-    for (auto [first, count] : g_ranges)
-      for (u32 i = 0; i < count; ++i) seq.push_back(first + i);
-  } else if (clause == Clause::Indexed) {
-    u32 dma = reg(m::SET_INDEX_ARRAY_DMA);
-    bool u16i = ((dma >> 4) & 15) == 1;
-    u32 isz = u16i ? 2 : 4;
-    u32 base_index = reg(m::SET_VERTEX_DATA_BASE_INDEX);
-    u32 iaddr = reg(m::SET_INDEX_ARRAY_ADDRESS) & ~(isz - 1);
-    for (auto [first, count] : g_ranges) {
-      u32 ea = offset_to_ea(iaddr + first * isz, dma & 15);
-      if (!ea) continue;
-      for (u32 i = 0; i < count; ++i) {
-        u32 v = u16i ? u32(ppu::r16(ea + 2 * i)) : ppu::r32(ea + 4 * i);
-        if (restart && v == restart_value) {
-          seq.push_back(~0u);
-          continue;
-        }
-        seq.push_back((v + base_index) & 0xfffff);
-      }
-    }
-  } else if (clause == Clause::Elements) {
-    seq.assign(g_elements.begin(), g_elements.end());
-  }
-  if (clause == Clause::Inline) {
-    // Interleaved vertices: every enabled array in attribute order, each padded to 32-bit words.
-    u32 stride = 0, offs[16] = {};
-    for (u32 i = 0; i < 16; ++i)
-      if (a[i].size) {
-        offs[i] = stride;
-        u32 nb = a[i].type == 6 ? 4 : a[i].size * type_size(a[i].type);
-        stride += (nb + 3) & ~3u;
-      }
-    if (!stride) return;
-    bytes.resize(g_inline.size() * 4);
-    for (size_t i = 0; i < g_inline.size(); ++i) {
-      u32 wv = g_inline[i];
-      bytes[4 * i] = u8(wv >> 24);
-      bytes[4 * i + 1] = u8(wv >> 16);
-      bytes[4 * i + 2] = u8(wv >> 8);
-      bytes[4 * i + 3] = u8(wv);
-    }
-    u32 nv = u32(bytes.size() / stride);
-    verts.resize(size_t(nv) * 64);
-    for (u32 v = 0; v < nv; ++v) {
-      for (u32 i = 0; i < 16; ++i) {
-        float* o = &verts[size_t(v) * 64 + 4 * i];
-        if (a[i].size) convert_attr(a[i].type, a[i].size, bytes.data() + size_t(v) * stride + offs[i], o);
-        else std::memcpy(o, g_imm[i], 16);
-      }
-      seq.push_back(v);
-    }
-  } else if (!g_imm_vertices.empty()) {
-    verts.resize(g_imm_vertices.size() * 64);
-    for (size_t v = 0; v < g_imm_vertices.size(); ++v) {
-      std::memcpy(&verts[v * 64], g_imm_vertices[v].data(), 256);
-      seq.push_back(u32(v));
-    }
-  } else {
-    // Unique fetch indices -> dense vertex array, via a generation-stamped table over the
-    // draw's index range (indices are at most 20 bits).
-    u32 lo = ~0u, hi = 0;
-    for (u32 k : seq)
-      if (k != ~0u) {
-        lo = std::min(lo, k);
-        hi = std::max(hi, k);
-      }
-    if (lo == ~0u) return fr_drop("no vertices");
-    u32 span = hi - lo + 1;
-    if (slot_gen.size() < span) {
-      slot_gen.resize(span, 0);
-      slot_of.resize(span);
-    }
-    if (++gen == 0) {
-      std::fill(slot_gen.begin(), slot_gen.end(), 0u);
-      gen = 1;
-    }
-    uniq.clear();
-    dense_seq.clear();
-    dense_seq.reserve(seq.size());
-    for (u32 k : seq) {
-      if (k == ~0u) {
-        dense_seq.push_back(~0u);
-        continue;
-      }
-      u32 i = k - lo;
-      if (slot_gen[i] != gen) {
-        slot_gen[i] = gen;
-        slot_of[i] = u32(uniq.size());
-        uniq.push_back(k);
-      }
-      dense_seq.push_back(slot_of[i]);
-    }
-    verts.resize(uniq.size() * 64);
-    fetch_vertices(a, mask, uniq, lo, hi, verts.data());
-    g_rs.vertices += uniq.size();
-    g_rs.max_draw_vertices = std::max<u64>(g_rs.max_draw_vertices, uniq.size());
-    seq.swap(dense_seq);
-  }
-  if (verts.empty()) return fr_drop("no vertices");
-  topo = convert_primitive(prim, seq, &positions);
-  if (topo == D3D11_PRIMITIVE_TOPOLOGY_UNDEFINED || positions.empty()) return fr_drop("primitive not drawable");
-  indices.reserve(positions.size());
-  for (u32 p : positions) indices.push_back(seq[p]);
-  draw_count = u32(indices.size());
-  bool stored = false;
-  // Only larger draws whose source stayed unwritten since an earlier frame get buffers of their
-  // own; one-off and per-frame data goes through the ring (buffer creation is costly).
-  if (cacheable && verts.size() / 64 < 128) {
-    if (vce) g_vcache.erase(vkey);
-    vce = nullptr;
-  } else if (cacheable) {  // keep the converted draw: the guest memory it came from is watched
-    if (!vce) {
-      vce = &g_vcache[vkey];
-      vce->last_frame = g_frame;
-    }
-    vce->ranges.clear();
-    for (u32 i = 0; i < 16; ++i)
-      if (((mask >> i) & 1) && a[i].array && g_fetch_lo[i] <= g_fetch_hi[i]) {
-        u32 nb = a[i].type == 6 ? 4 : a[i].size * type_size(a[i].type);
-        u64 b = u64(a[i].ea) + u64(g_fetch_lo[i]) * a[i].stride, e = u64(a[i].ea) + u64(g_fetch_hi[i]) * a[i].stride + nb;
-        if (e > b && e <= 0x100000000ull) vce->ranges.push_back({u32(b), u32(e - b)});
-      }
-    if (clause == Clause::Indexed) {
-      u32 dma = reg(m::SET_INDEX_ARRAY_DMA);
-      u32 isz = ((dma >> 4) & 15) == 1 ? 2 : 4;
-      u32 iaddr = reg(m::SET_INDEX_ARRAY_ADDRESS) & ~(isz - 1);
-      for (auto [first, count] : g_ranges)
-        if (u32 ea = offset_to_ea(iaddr + first * isz, dma & 15)) vce->ranges.push_back({ea, count * isz});
-    }
-    if (vce->seen_frame == ~0ull || vce->seen_frame == g_frame || vce->vb) {
-      vcache_release(*vce);
-      vce->seen_frame = g_frame;
-      vce->serial = g_mem_serial;
-      for (auto [ea, size] : vce->ranges) watch_range(ea, size);
-    } else {
-      bool unchanged = true;
-      for (auto [ea, size] : vce->ranges) unchanged = unchanged && !written_since(ea, size, vce->serial);
-      if (unchanged) {
-        stored = vcache_store(*vce, verts, indices, topo);
-      } else {
-        vce->serial = g_mem_serial;
-        for (auto [ea, size] : vce->ranges) watch_range(ea, size);
-      }
-    }
-    if (stored) {
-      draw_srv = vce->srv;
-      draw_ib = vce->ib;
-    }
-  }
-  if (!stored) {
-    // The ring keeps vertices 16-float4 aligned: pad the position up to a vertex boundary.
-    if (g_vbuf_pos % 16) g_vbuf_pos += 16 - g_vbuf_pos % 16;
-    // The vertex shader fetches by SV_VertexID: the ring position goes into the indices.
-    phase_switch(kPhUploads);
-    u32 first_vertex = upload_vertices(verts);
-    if (first_vertex)
-      for (u32& i : indices) i += first_vertex;
-    start_index = upload_indices(indices);
-    draw_srv = g_vsrv;
-    draw_ib = g_ibuf;
-  }
-  }  // !vhit
+  if (geo.cached) ++g_rs.vcached;
+  else ++g_rs.vconverted;
+  u32 nverts = geo.hi - geo.lo + 1;
+  g_rs.vertices += nverts;
+  g_rs.max_draw_vertices = std::max<u64>(g_rs.max_draw_vertices, nverts);
 
   phase_switch(kPhState);
   auto* c = &gpu::rec();
   set_pipeline_state(t);
   phase_switch(kPhConstants);
   // Constant buffers.
+  static bool fmt_valid = false, fc_valid = false;
+  const u32 patch = g_patch_cb;
+  if (g_cb_reset) {
+    g_vc_whole = g_vc_dirty = true;
+    fmt_valid = fc_valid = false;
+    g_cb_reset = false;
+  }
   if (g_vc_dirty) {
-    c->UpdateSubresource(g_vc_buf, 0, nullptr, g_vc, 0, 0, sizeof g_vc);
+    if ((patch & 1) && !g_vc_whole && g_vc_lo <= g_vc_hi) {
+      c->UpdateConstants(g_vc_buf, g_vc_lo * 16, &g_vc[g_vc_lo * 4], (g_vc_hi + 1 - g_vc_lo) * 16, sizeof g_vc);
+    } else {
+      c->UpdateConstants(g_vc_buf, 0, g_vc, sizeof g_vc, sizeof g_vc);
+      g_vc_whole = false;
+    }
     g_vc_dirty = false;
+    g_vc_lo = ~0u;
+    g_vc_hi = 0;
   }
   VsState vst{};
   for (int i = 0; i < 4; ++i) {
@@ -2084,6 +2192,25 @@ void flush_draw() {
     c->UpdateSubresource(g_vs_state, 0, nullptr, &vst, 0, 0, sizeof vst);
     vst_last = vst;
     vst_valid = true;
+  }
+  static gpu::VtxFmt fmt_last{};
+  if (!fmt_valid || std::memcmp(&geo.fmt, &fmt_last, sizeof fmt_last)) {
+    if (fmt_valid && (patch & 4)) {  // the span of changed 16-byte rows
+      const u8* cur = reinterpret_cast<const u8*>(&geo.fmt);
+      u8* old = reinterpret_cast<u8*>(&fmt_last);
+      u32 lo = sizeof fmt_last / 16, hi = 0;
+      for (u32 r = 0; r < sizeof fmt_last / 16; ++r)
+        if (std::memcmp(cur + 16 * r, old + 16 * r, 16)) {
+          lo = std::min(lo, r);
+          hi = r + 1;
+        }
+      c->UpdateConstants(g_vtx_fmt, lo * 16, cur + 16 * lo, (hi - lo) * 16, sizeof geo.fmt);
+      std::memcpy(old + 16 * lo, cur + 16 * lo, size_t(hi - lo) * 16);
+    } else {
+      c->UpdateConstants(g_vtx_fmt, 0, &geo.fmt, sizeof geo.fmt, sizeof geo.fmt);
+      fmt_last = geo.fmt;
+    }
+    fmt_valid = true;
   }
   FpState fst{};
   u32 win = reg(m::SET_SHADER_WINDOW);
@@ -2137,26 +2264,27 @@ void flush_draw() {
         fc[4 * i + k] = f32_of(wv);
       }
     static float fc_last[256 * 4];
-    static bool fc_valid = false;
     if (!fc_valid || std::memcmp(fc, fc_last, size_t(n) * 16)) {
-      c->UpdateSubresource(g_fp_const, 0, nullptr, fc, 0, 0, sizeof fc);  // constant buffers update as a whole
-      std::memcpy(fc_last, fc, sizeof fc);
+      if (fc_valid && (patch & 2)) {  // the program reads c[0..n-1]; fc_last mirrors the buffer
+        c->UpdateConstants(g_fp_const, 0, fc, n * 16, sizeof fc);
+        std::memcpy(fc_last, fc, size_t(n) * 16);
+      } else {
+        c->UpdateConstants(g_fp_const, 0, fc, sizeof fc, sizeof fc);
+        std::memcpy(fc_last, fc, sizeof fc);
+      }
       fc_valid = true;
     }
   }
   phase_switch(kPhDraws);
   if (!g_sh.fixed) {
-    ID3D11Buffer* vcb[2] = {g_vc_buf, g_vs_state};
-    c->VSSetConstantBuffers(0, 2, vcb);
+    ID3D11Buffer* vcb[3] = {g_vc_buf, g_vs_state, g_vtx_fmt};
+    c->VSSetConstantBuffers(0, 3, vcb);
     ID3D11Buffer* pcb[2] = {g_fp_state, g_fp_const};
     c->PSSetConstantBuffers(2, 2, pcb);
     c->IASetInputLayout(nullptr);
     g_sh.fixed = 1;
   }
-  if (g_sh.vs_srv != draw_srv) {
-    c->VSSetShaderResources(0, 1, &draw_srv);
-    g_sh.vs_srv = draw_srv;
-  }
+  bind_changed<gpu::kVtxBuffers>(geo.srv, g_sh.vs_srv, [&](u32 first, u32 n) { c->VSSetShaderResources(first, n, geo.srv + first); });
   bind_changed(srvs, g_sh.ps_srv, [&](u32 first, u32 n) { c->PSSetShaderResources(first, n, srvs + first); });
   bind_changed(smps, g_sh.smp, [&](u32 first, u32 n) { c->PSSetSamplers(first, n, smps + first); });
   if (g_sh.vs != vs->vs) {
@@ -2167,17 +2295,18 @@ void flush_draw() {
     c->PSSetShader(ps->ps, nullptr, 0);
     g_sh.ps = ps->ps;
   }
-  if (g_sh.topo != u32(topo)) {
-    c->IASetPrimitiveTopology(topo);
-    g_sh.topo = u32(topo);
+  if (g_sh.topo != u32(geo.topo)) {
+    c->IASetPrimitiveTopology(geo.topo);
+    g_sh.topo = u32(geo.topo);
   }
-  if (g_sh.ib != draw_ib) {
-    c->IASetIndexBuffer(draw_ib, DXGI_FORMAT_R32_UINT, 0);
-    g_sh.ib = draw_ib;
+  if (geo.ib && g_sh.ib != geo.ib) {
+    c->IASetIndexBuffer(geo.ib, DXGI_FORMAT_R32_UINT, 0);
+    g_sh.ib = geo.ib;
   }
   if (gpu::timing::per_draw())
     gpu::timing::mark(acfa::strprintf("%s fp %08x vp %08x", g_rt_label.c_str(), u32(code_hash), u32(reinterpret_cast<uintptr_t>(vs->vs) >> 4)));
-  c->DrawIndexed(draw_count, start_index, 0);
+  if (geo.ib) c->DrawIndexed(geo.count, geo.start, 0);
+  else c->Draw(geo.count, geo.start);
   if (gpu::timing::per_draw()) gpu::timing::mark(g_rt_label + " between draws");
   gpu::rec().kick();
   ++g_rs.draws;
@@ -2197,18 +2326,21 @@ void flush_draw() {
       tx += acfa::strprintf(" t%u=%s%x/f%02x/%ux%u/%s%s", u, tex[u].location ? "M:" : "", tex[u].offset, tex[u].format, tex[u].width,
                             tex[u].height, ts ? "surf" : "mem", srvs[u] ? "" : "(unbound)");
     }
-    LOG_I("frame", "draw %u prim %u verts %zu idx %zu %s vp %u fp %08x zt %d/%x/%d blend %d cull %x%s", g_fr.draws, prim, verts.size() / 64,
-          indices.size(), targets_desc(t).c_str(), reg(m::SET_TRANSFORM_PROGRAM_START), sp, reg(m::SET_DEPTH_TEST_ENABLE) ? 1 : 0,
+    LOG_I("frame", "draw %u prim %u verts %u idx %u %s vp %u fp %08x zt %d/%x/%d blend %d cull %x%s", g_fr.draws, prim, nverts,
+          geo.ib ? geo.count : 0, targets_desc(t).c_str(), reg(m::SET_TRANSFORM_PROGRAM_START), sp, reg(m::SET_DEPTH_TEST_ENABLE) ? 1 : 0,
           reg(m::SET_DEPTH_FUNC), reg(m::SET_DEPTH_MASK) ? 1 : 0, reg(m::SET_BLEND_ENABLE) ? 1 : 0,
           reg(m::SET_CULL_FACE_ENABLE) ? reg(m::SET_CULL_FACE) : 0, tx.c_str());
-    if (verts.size() / 64 <= 64) {  // small draws (particles, HUD): vertex inputs as fetched
+    if (nverts <= 64 && !geo.inline_data) {  // small draws (particles, HUD): vertex inputs of the first elements
       std::string in;
       for (u32 i = 0; i < 16; ++i) {
         if (!((mask >> i) & 1)) continue;
         in += a[i].array ? acfa::strprintf(" i%u:t%u s%u st%u", i, a[i].type, a[i].size, a[i].stride) : acfa::strprintf(" i%u:imm", i);
-        for (size_t v = 0; v < std::min<size_t>(verts.size() / 64, 2); ++v)
-          in += acfa::strprintf(" (%g %g %g %g)", verts[v * 64 + 4 * i], verts[v * 64 + 4 * i + 1], verts[v * 64 + 4 * i + 2],
-                                verts[v * 64 + 4 * i + 3]);
+        for (u32 v = 0; v < std::min(nverts, 2u); ++v) {
+          float f[4];
+          if (a[i].array) cpu_fetch(a[i], geo.lo + v, f);
+          else std::memcpy(f, g_imm[i], 16);
+          in += acfa::strprintf(" (%g %g %g %g)", f[0], f[1], f[2], f[3]);
+        }
       }
       LOG_I("frame", "  inputs:%s", in.c_str());
     }
@@ -2372,9 +2504,7 @@ void present_memory(const DisplayBuffer& b) {
 }  // namespace
 
 int phase_switch(int p) {
-  LARGE_INTEGER t;
-  QueryPerformanceCounter(&t);
-  u64 now = u64(t.QuadPart);
+  u64 now = __rdtsc();  // a QueryPerformanceCounter call per phase change was ~3% of the FIFO thread
   if (g_phase_at) g_phase_ticks[g_phase] += now - g_phase_at;
   g_phase_at = now;
   int prev = g_phase;
@@ -2409,6 +2539,7 @@ void renderer_thread_init() {
   cb(32, &g_clear_cb);
   cb(sizeof g_vc, &g_vc_buf);
   cb(sizeof(VsState), &g_vs_state);
+  cb(sizeof(gpu::VtxFmt), &g_vtx_fmt);
   cb(sizeof(FpState), &g_fp_state);
   cb(256 * 16, &g_fp_const);
   shadow_reset();
@@ -2432,11 +2563,22 @@ void pacing_frame() {
   static u64 prev_idle = 0;
   static u64 prev_ticks[kPhCount] = {}, window_ticks[kPhCount] = {};
   static u64 window_idle = 0;
-  static double ms_per_tick = 0;
-  if (!ms_per_tick) {
-    LARGE_INTEGER f;
-    QueryPerformanceFrequency(&f);
-    ms_per_tick = 1000.0 / double(f.QuadPart);
+  // Phase ticks are time stamp counter ticks (phase_switch); their rate is measured against the
+  // performance counter since the first frame.
+  static u64 tsc0 = 0;
+  static LARGE_INTEGER qpc0{}, qpf{};
+  double ms_per_tick = 0;
+  {
+    LARGE_INTEGER q;
+    QueryPerformanceCounter(&q);
+    u64 tsc = __rdtsc();
+    if (!tsc0) {
+      tsc0 = tsc;
+      qpc0 = q;
+      QueryPerformanceFrequency(&qpf);
+    } else if (tsc > tsc0) {
+      ms_per_tick = double(q.QuadPart - qpc0.QuadPart) * 1000.0 / double(qpf.QuadPart) / double(tsc - tsc0);
+    }
   }
   phase_switch(g_phase);  // account the current phase up to now
   double now = log_time();
@@ -2575,7 +2717,7 @@ void present_buffer(u32 id, const DisplayBuffer& b) {
   pacing_frame();
   PhaseScope phase_scope(kPhFlip);  // counted in the next frame, which it delays
   fr_frame_boundary();
-  vcache_trim();
+  vdata_trim();
   tex_trim();
   surface_trim();
   g_writes_stale = true;
@@ -2584,14 +2726,14 @@ void present_buffer(u32 id, const DisplayBuffer& b) {
     u64 surf_bytes = 0;
     for (const Surface* s : g_surfaces) surf_bytes += surface_bytes(s);
     LOG_I("perf",
-          "per frame: %.0f draws (vertices %.0f cached, %.0f converted: %.0f vertices), textures %.1f hashed %.1f uploaded, "
-          "%.2f surfaces created, %.1f target changes, %.1f write queries (%.0f MiB); vertex cache %zu entries %.0f MiB; "
-          "textures %zu %.0f MiB; surfaces %zu %.0f MiB",
-          pf(&RenderStats::draws), pf(&RenderStats::vcached), pf(&RenderStats::vconverted), pf(&RenderStats::vertices),
-          pf(&RenderStats::tex_hashed),
-          pf(&RenderStats::tex_uploaded), pf(&RenderStats::surfaces), pf(&RenderStats::target_binds), pf(&RenderStats::collections),
-          pf(&RenderStats::bytes_queried) / 1048576.0, g_vcache.size(), g_vcache_bytes / 1048576.0, g_tex.size(),
-          g_tex_bytes / 1048576.0, g_surfaces.size(), surf_bytes / 1048576.0);
+          "per frame: %.0f draws (vertex data %.0f cached, %.0f uploaded: %.0f KiB, element span %.0f), textures %.1f hashed "
+          "%.1f uploaded, %.2f surfaces created, %.1f target changes, %.1f write queries (%.0f MiB); static vertex data %zu "
+          "entries %.0f MiB; textures %zu %.0f MiB; surfaces %zu %.0f MiB",
+          pf(&RenderStats::draws), pf(&RenderStats::vcached), pf(&RenderStats::vconverted), pf(&RenderStats::vbytes) / 1024.0,
+          pf(&RenderStats::vertices), pf(&RenderStats::tex_hashed), pf(&RenderStats::tex_uploaded), pf(&RenderStats::surfaces),
+          pf(&RenderStats::target_binds), pf(&RenderStats::collections), pf(&RenderStats::bytes_queried) / 1048576.0,
+          g_streams.size() + g_index_lists.size(), g_vdata_bytes / 1048576.0, g_tex.size(), g_tex_bytes / 1048576.0,
+          g_surfaces.size(), surf_bytes / 1048576.0);
     g_rs_last = g_rs;
   }
   ++g_frame;
@@ -2626,9 +2768,12 @@ void renderer_method(u32 ri, u32 arg, u32 count, u32 index) {
   }
   if (method >= m::SET_TRANSFORM_CONSTANT && method < m::SET_TRANSFORM_CONSTANT + 0x80) {
     u32 word = g_vc_load * 4 + ((method - m::SET_TRANSFORM_CONSTANT) >> 2);
-    if (word < 468 * 4) {
+    u32 old;
+    if (word < 468 * 4 && (std::memcpy(&old, &g_vc[word], 4), old != arg)) {
       std::memcpy(&g_vc[word], &arg, 4);
       g_vc_dirty = true;
+      g_vc_lo = std::min(g_vc_lo, word >> 2);
+      g_vc_hi = std::max(g_vc_hi, word >> 2);
     }
     return;
   }
@@ -2746,6 +2891,12 @@ bool gpu_option(const std::string& name, const std::string& value) {
   if (name == "submit" && (value == "on" || value == "off")) {
     gpu::request_submit_mode(value == "on");
     LOG_I("gpu", "D3D11 submission thread requested %s (applied at the next frame)", value.c_str());
+    return true;
+  }
+  if (name == "patch") {
+    g_patch_cb = value == "on" ? 7 : value == "off" ? 0 : u32(std::atoi(value.c_str())) & 7;
+    g_cb_reset = true;
+    LOG_I("gpu", "constant buffer changes recorded as patches: mask %u", g_patch_cb);
     return true;
   }
   if (name == "kick" && std::atoi(value.c_str()) > 0) {
