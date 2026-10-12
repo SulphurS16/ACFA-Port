@@ -101,7 +101,8 @@ add_executable(acfa-prep
   src/prep/self.cpp
   src/prep/firmware.cpp
   src/prep/prx.cpp
-  src/prep/sfo.cpp)
+  src/prep/sfo.cpp
+  src/prep/spu_records.cpp)
 target_link_libraries(acfa-prep PRIVATE acfa_common)
 target_compile_options(acfa-prep PRIVATE -Wall -Wextra)
 

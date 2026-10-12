@@ -37,6 +37,7 @@ Config& cfg() {
   return c;
 }
 void vdec_dump();
+std::string audio_report();  // cellAudio.cpp: output statistics since the last call
 void lv2_init();  // lv2 subsystems that need setup after memory/loader
 namespace lv2 {
 void spu_dump();
@@ -111,6 +112,7 @@ int main(int argc, char** argv) {
     else if (a == "--gpu-timing") c.gpu_timing = 1;
     else if (a == "--gpu-timing-draws") c.gpu_timing = 2;
     else if (a == "--spu-cache") c.spu_cache = next();
+    else if (a == "--audio-capture") c.audio_capture = true;
     else if (a == "--shot-interval") c.shot_interval = std::atof(next().c_str());
     else {
       std::fprintf(stderr, "unknown argument %s\n", a.c_str());
@@ -247,6 +249,7 @@ int main(int argc, char** argv) {
                 double(f - last_flips) / (now - last_fps_at), sys_busy, our_share,
                 double(pmc.PageFaultCount - last_faults) / (now - last_fps_at), (unsigned long long)(pmc.WorkingSetSize >> 20),
                 busy.c_str());
+        if (last_fps_at > 0) LOG_I("perf", "%s", audio_report().c_str());
         last_faults = pmc.PageFaultCount;
         last_idle = idle;
         last_total = total;

@@ -29,6 +29,7 @@ std::atomic<u64> g_fifo_idle_us{0};
 
 namespace {
 
+std::atomic<u32> g_get_waiters{0}, g_get_wait_lo{0}, g_get_wait_hi{0};  // wait_get_outside()
 std::mutex g_io_mu;
 u32 g_io_ea[512];   // io >> 20 -> ea >> 20 (0xffffffff = unmapped)
 u32 g_ea_io[4096];  // ea >> 20 -> io >> 20
@@ -367,10 +368,35 @@ void fifo_thread() {
       }
     }
     *ctrl_get = __builtin_bswap32(get);
+    if (g_get_waiters.load(std::memory_order_acquire) &&
+        (get < g_get_wait_lo.load(std::memory_order_relaxed) || get > g_get_wait_hi.load(std::memory_order_relaxed)))
+      WakeByAddressAll(const_cast<u32*>(ctrl_get));
   }
 }
 
 }  // namespace
+
+// A PPU thread waiting for the FIFO to leave the command buffer range [lo, hi] (io offsets), e.g.
+// libgcm's fragment callback when the game writes commands faster than they are processed: it
+// sleeps on the GET word and the FIFO thread wakes it once GET is outside the range (instead of a
+// Sleep(0) loop that kept a core busy for the whole wait).
+void wait_get_outside(u32 lo, u32 hi) {
+  auto* ctrl_get = reinterpret_cast<volatile u32*>(ppu::mem() + kControlAddr + 4);
+  auto outside = [&](u32 v) { u32 get = __builtin_bswap32(v); return get < lo || get > hi; };
+  for (u32 spins = 0; spins < 64; ++spins) {
+    if (outside(*ctrl_get)) return;
+    _mm_pause();
+  }
+  g_get_wait_lo.store(lo, std::memory_order_relaxed);
+  g_get_wait_hi.store(hi, std::memory_order_relaxed);
+  g_get_waiters.fetch_add(1, std::memory_order_acq_rel);
+  for (;;) {
+    u32 seen = *ctrl_get;
+    if (outside(seen)) break;
+    WaitOnAddress(const_cast<u32*>(ctrl_get), &seen, sizeof seen, 2);
+  }
+  g_get_waiters.fetch_sub(1, std::memory_order_acq_rel);
+}
 
 void start() {
   auto* ctrl = reinterpret_cast<u32*>(ppu::mem() + kControlAddr);
