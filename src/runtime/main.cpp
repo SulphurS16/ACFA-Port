@@ -53,6 +53,63 @@ extern std::atomic<int> g_capture_requests;
 using namespace rt;
 namespace fs = std::filesystem;
 
+namespace {
+
+const char* kDefaultSettings =
+    "# ARMORED CORE for Answer native port: settings. Options given on the command line override\n"
+    "# these. Keyboard/mouse bindings and mouse sensitivity are in input.ini.\n"
+    "\n"
+    "# The game's frame rate: 60 (as on the console), a higher number (the game's simulation follows\n"
+    "# real time, so it keeps its speed), or \"display\" for the display's refresh rate.\n"
+    "fps = 60\n"
+    "\n"
+    "# Source of the game's vertical blank: auto (the display's own when its refresh is a whole\n"
+    "# multiple of fps, else a clock, with tearing allowed so variable-refresh displays pace evenly),\n"
+    "# display or clock.\n"
+    "pacing = auto\n"
+    "\n"
+    "# Start in borderless fullscreen (1) or in a window (0). F11 or Alt+Enter switches while playing.\n"
+    "fullscreen = 0\n";
+
+// User settings (local\config\settings.ini): written with the defaults on first run. Problems are
+// returned as messages for the log (which is not open yet).
+std::vector<std::string> load_settings(Config& c, const fs::path& path) {
+  std::vector<std::string> notes;
+  std::error_code ec;
+  if (!fs::exists(path, ec)) {
+    try {
+      acfa::write_text(path, kDefaultSettings);
+      notes.push_back("wrote the default settings to " + path.string());
+    } catch (const std::exception& e) {
+      notes.push_back(std::string("cannot write default settings: ") + e.what());
+    }
+    return notes;
+  }
+  std::ifstream f(path);
+  std::string line;
+  while (std::getline(f, line)) {
+    if (!line.empty() && line.back() == '\r') line.pop_back();
+    size_t h = line.find('#');
+    if (h != std::string::npos) line.resize(h);
+    size_t eq = line.find('=');
+    if (eq == std::string::npos) continue;
+    auto trim = [](std::string s) {
+      size_t b = s.find_first_not_of(" \t"), e = s.find_last_not_of(" \t");
+      return b == std::string::npos ? std::string() : s.substr(b, e - b + 1);
+    };
+    std::string key = trim(line.substr(0, eq)), value = trim(line.substr(eq + 1));
+    if (key == "fps") c.fps = value == "display" ? 0 : std::max(30.0, std::atof(value.c_str()));
+    else if (key == "pacing" && (value == "auto" || value == "display" || value == "clock")) c.pacing = value;
+    else if (key == "fullscreen") c.fullscreen = value == "1" || value == "true" || value == "yes";
+    else if (!key.empty()) notes.push_back("settings: unknown or invalid '" + key + " = " + value + "' ignored");
+  }
+  notes.push_back(acfa::strprintf("settings from %s: fps %s, pacing %s, fullscreen %d", path.string().c_str(),
+                                  c.fps > 0 ? acfa::strprintf("%.0f", c.fps).c_str() : "display", c.pacing.c_str(), int(c.fullscreen)));
+  return notes;
+}
+
+}  // namespace
+
 int main(int argc, char** argv) {
   Config& c = cfg();
   fs::path root = fs::current_path();
@@ -73,6 +130,7 @@ int main(int argc, char** argv) {
   c.spu_cache = (root / "local" / "spu_cache").string();
   c.shader_cache = (root / "local" / "shader_cache").string();
   c.input_config = (root / "local" / "config" / "input.ini").string();
+  std::vector<std::string> settings_notes = load_settings(c, root / "local" / "config" / "settings.ini");
   std::string level = "info";
   for (int i = 1; i < argc; ++i) {
     std::string a = argv[i];
@@ -148,6 +206,7 @@ int main(int argc, char** argv) {
   }
   prof::start(c.profile);
   LOG_I("main", "run dir %s", c.run_dir.c_str());
+  for (const auto& n : settings_notes) LOG_I("main", "%s", n.c_str());
   if (!c.watch_access.empty() && !datawatch::configure(c.watch_access)) return 2;
   set_fatal_hook([] {
     prof::write_report(cfg().run_dir + "/profile.txt");
