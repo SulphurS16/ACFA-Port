@@ -172,7 +172,9 @@ void sys_process_exit(s32 status) { process_exit(status); }
 void _sys_process_atexitspawn() { LOG_D("process", "_sys_process_atexitspawn (ignored: no exitspawn support)"); }
 void _sys_process_at_Exitspawn() { LOG_D("process", "_sys_process_at_Exitspawn (ignored: no exitspawn support)"); }
 void sys_prx_exitspawn_with_level() {
-  LOG_E("process", "sys_prx_exitspawn_with_level: the game asked to spawn another executable; exiting");
+  // The game's own quit (after the exit request when the window closes): on the console it hands
+  // over to the system menu; here the process ends.
+  LOG_I("process", "sys_prx_exitspawn_with_level: the game quits (to the system menu on the console)");
   process_exit(0);
 }
 
