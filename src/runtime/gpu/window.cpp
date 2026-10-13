@@ -264,7 +264,12 @@ bool window_create(const std::string& title, int w, int h, bool visible) {
   rid.hwndTarget = g_hwnd;
   if (!RegisterRawInputDevices(&rid, 1, sizeof rid))
     LOG_W("input", "raw mouse input unavailable (RegisterRawInputDevices failed, error %lu)", GetLastError());
-  if (visible) ShowWindow(g_hwnd, SW_SHOWNOACTIVATE);
+  if (visible && input_isolated()) {
+    ShowWindow(g_hwnd, SW_SHOWNOACTIVATE);  // isolated test runs never take the focus
+  } else if (visible) {
+    ShowWindow(g_hwnd, SW_SHOW);
+    SetForegroundWindow(g_hwnd);  // granted when the launcher (in front) started the game
+  }
   return true;
 }
 

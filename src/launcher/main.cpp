@@ -408,6 +408,7 @@ void play() {
     return;
   }
   CloseHandle(pi.hThread);
+  AllowSetForegroundWindow(pi.dwProcessId);  // the game window takes the focus from the launcher
   g_game = pi.hProcess;
   update_buttons();
   ShowWindow(g_wnd, SW_MINIMIZE);
