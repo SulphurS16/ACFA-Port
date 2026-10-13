@@ -11,6 +11,7 @@
 // refreshes each frame stayed up and the intervals between displayed frames.
 #pragma once
 #include <string>
+#include <vector>
 
 #include "common/bytes.h"
 
@@ -28,8 +29,19 @@ void movie_stopped();
 // missions; outside them the vblank runs at up to 60 Hz.
 void gameplay_started();
 void gameplay_stopped();
-// Present flags for the current pacing (DXGI_PRESENT_ALLOW_TEARING in clock mode when supported).
+// Present flags for the current pacing (DXGI_PRESENT_ALLOW_TEARING in clock mode when supported,
+// never in exclusive fullscreen).
 u32 present_flags();
+// Exclusive fullscreen entered / left (d3d11_device.cpp).
+void set_exclusive(bool on);
+// Refresh rate of the output the window is on (Hz, as Windows reports it; 0 before the first frame).
+u32 refresh_hz();
+// Display modes of the output the window is on (resolution and refresh rate, rounded to whole Hz),
+// largest first; empty before the first frame.
+struct Mode {
+  u32 w, h, hz;
+};
+std::vector<Mode> modes();
 // The swap chain was created (tearing: created with DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING). Called on
 // the presenting thread.
 void swapchain_created(IDXGISwapChain1* swap, bool tearing);

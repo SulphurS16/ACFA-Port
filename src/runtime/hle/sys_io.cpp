@@ -25,12 +25,14 @@
 #include "runtime/datawatch.h"
 #include "runtime/game/game_input.h"
 #include "runtime/gpu/input_hooks.h"
+#include "runtime/gpu/window.h"
 #include "runtime/input.h"
 #include "runtime/memory.h"
 #include "runtime/memscan.h"
 #include "runtime/profiler.h"
 #include "runtime/rsx/rsx.h"
 #include "runtime/sysdialog.h"
+#include "runtime/ui/overlay.h"
 
 namespace rt::gpu {
 extern std::atomic<int> g_capture_requests;
@@ -334,6 +336,30 @@ void control_thread(std::string path) {
         if (!rsx::gpu_option(name, value)) LOG_W("pad", "control: unknown renderer option '%s'", line.c_str());
         continue;
       }
+      if (line.rfind("ui ", 0) == 0) {  // PC SETTINGS tests: "ui key NAME|click X Y|move X Y|wheel N"
+        std::istringstream in(line.substr(3));
+        std::string op, a;
+        int x = 0, y = 0;
+        in >> op;
+        bool ok = true;
+        if (op == "key" && (in >> a) && bindings::key_code(a) && bindings::key_code(a) < 0x100) {
+          u32 vk = bindings::key_code(a);
+          gpu::run_on_window_thread([vk] {
+            ui::on_key(vk, true, false);
+            ui::on_key(vk, false, false);
+          });
+        } else if (op == "click" && (in >> x >> y)) {
+          gpu::run_on_window_thread([x, y] {
+            ui::on_mouse_move(x, y);
+            ui::on_mouse_button(0, true, x, y);
+            ui::on_mouse_button(0, false, x, y);
+          });
+        } else if (op == "move" && (in >> x >> y)) gpu::run_on_window_thread([x, y] { ui::on_mouse_move(x, y); });
+        else if (op == "wheel" && (in >> x)) gpu::run_on_window_thread([x] { ui::on_wheel(x * 120); });
+        else ok = false;
+        if (!ok) LOG_W("pad", "control: '%s' is not 'ui key NAME|click X Y|move X Y|wheel N'", line.c_str());
+        continue;
+      }
       if (line.rfind("key ", 0) == 0) {  // "key NAME down|up": a host key or mouse button, for testing bindings
         std::string rest = line.substr(4);
         size_t sp = rest.rfind(' ');
@@ -416,7 +442,7 @@ PadState read_port(u32 port) {
   if (xin) {
     s.connected = true;
     const auto& g = xs.Gamepad;
-    WORD b = g.wButtons;
+    WORD b = ui::pad_suppressed(port, g.wButtons);  // buttons still held from closing PC SETTINGS stay there
     if (b & XINPUT_GAMEPAD_BACK) s.d1 |= SELECT;
     if (b & XINPUT_GAMEPAD_LEFT_THUMB) s.d1 |= L3;
     if (b & XINPUT_GAMEPAD_RIGHT_THUMB) s.d1 |= R3;
@@ -506,9 +532,14 @@ s32 cellPadGetData(u32 port, Ptr<PadData> data) {
   if (port >= g_max || !data) return PAD_ERR_INVALID_PARAMETER;
   PadState s = read_port(port);
   if (!s.connected) return PAD_ERR_NO_DEVICE;
-  if (sysdlg::active()) {  // a system dialog holds the controller: the game sees it at rest
+  ui::PadMode ui_mode = ui::pad_mode();
+  if (sysdlg::active() || ui_mode != ui::PadMode::Normal) {  // a system dialog or PC SETTINGS holds the controller: the game sees it at rest
     PadState idle;
     idle.connected = true;
+    if (ui_mode == ui::PadMode::Cancel && !sysdlg::active() && port == 0) {  // PC SETTINGS closed: the install question gets CANCEL
+      idle.d2 = CIRCLE;
+      idle.press[5] = 255;
+    }
     s = idle;
   }
   u16 b[24] = {};

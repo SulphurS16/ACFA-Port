@@ -5,12 +5,14 @@
 // control thread "FcsManager" exists (started at the sortie, exited when the mission ends).
 #include "runtime/game/frame_policy.h"
 
+#include "runtime/game/pc_settings_entry.h"
 #include "runtime/gpu/display.h"
 
 namespace rt::game {
 
 void thread_started(const std::string& name) {
   if (name == "FcsManager") gpu::display::gameplay_started();
+  pc_settings_thread_started(name);
 }
 
 void thread_exited(const std::string& name) {

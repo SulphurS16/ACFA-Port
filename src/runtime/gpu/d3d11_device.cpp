@@ -16,6 +16,7 @@
 #include "runtime/config.h"
 #include "runtime/gpu/display.h"
 #include "runtime/log.h"
+#include "runtime/ui/overlay.h"
 
 namespace rt::gpu {
 namespace {
@@ -28,6 +29,14 @@ ID3D11PixelShader* g_blit_ps = nullptr;
 ID3D11SamplerState* g_linear = nullptr;
 ID3D11Texture2D* g_last = nullptr;  // copy of the last presented frame (for captures)
 u32 g_last_w = 0, g_last_h = 0;
+ID3D11Texture2D* g_ui_copy = nullptr;  // the composed back buffer while PC SETTINGS is open (captures)
+u32 g_ui_w = 0, g_ui_h = 0;
+// Exclusive fullscreen: requested by any thread, carried out on the presenting thread.
+std::atomic<int> g_excl_request{-1};  // -1 none, 0 leave, 1 enter
+std::atomic<u32> g_excl_w{0}, g_excl_h{0}, g_excl_hz{0};
+std::atomic<bool> g_exclusive{false};
+bool g_excl_wanted = false;  // presenting thread: the mode is fullscreen (re-entered after Alt+Tab)
+std::chrono::steady_clock::time_point g_excl_retry;
 
 const char* kBlitHlsl = R"(
 Texture2D t0 : register(t0);
@@ -218,6 +227,81 @@ void resize_to_window() {
   LOG_I("gpu", "swap chain resized to %ux%u", g_dev.width, g_dev.height);
 }
 
+namespace {
+// Presenting thread. DXGI sends the window messages while switching; the window thread keeps
+// pumping them (it never waits for this thread).
+void enter_exclusive() {
+  IDXGIOutput* out = nullptr;
+  if (FAILED(g_dev.swap->GetContainingOutput(&out)) || !out) return;
+  DXGI_OUTPUT_DESC od{};
+  out->GetDesc(&od);
+  DXGI_MODE_DESC want{};
+  want.Width = g_excl_w ? g_excl_w.load() : u32(od.DesktopCoordinates.right - od.DesktopCoordinates.left);
+  want.Height = g_excl_h ? g_excl_h.load() : u32(od.DesktopCoordinates.bottom - od.DesktopCoordinates.top);
+  u32 hz = g_excl_hz.load();
+  if (!hz) {
+    DEVMODEW dm{};
+    dm.dmSize = sizeof dm;
+    if (EnumDisplaySettingsW(od.DeviceName, ENUM_CURRENT_SETTINGS, &dm)) hz = dm.dmDisplayFrequency;
+  }
+  want.RefreshRate = DXGI_RATIONAL{hz, hz ? 1u : 0u};
+  want.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+  DXGI_MODE_DESC mode{};
+  if (FAILED(out->FindClosestMatchingMode(&want, &mode, g_dev.dev))) mode = want;
+  g_dev.swap->ResizeTarget(&mode);
+  HRESULT hr = g_dev.swap->SetFullscreenState(TRUE, out);
+  out->Release();
+  if (FAILED(hr)) {  // DXGI_ERROR_NOT_CURRENTLY_AVAILABLE while another window is in front: tried again
+    g_excl_retry = std::chrono::steady_clock::now() + std::chrono::milliseconds(500);
+    LOG_I("gpu", "exclusive fullscreen not available now (0x%08lx); trying again when the window is in front", (unsigned long)hr);
+    return;
+  }
+  mode.RefreshRate = DXGI_RATIONAL{0, 0};  // as DXGI recommends after the switch
+  g_dev.swap->ResizeTarget(&mode);
+  g_exclusive = true;
+  display::set_exclusive(true);
+  LOG_I("gpu", "exclusive fullscreen %ux%u at %.2f Hz", mode.Width, mode.Height,
+        want.RefreshRate.Denominator ? double(want.RefreshRate.Numerator) / want.RefreshRate.Denominator : 0.0);
+}
+
+void leave_exclusive() {
+  g_dev.swap->SetFullscreenState(FALSE, nullptr);
+  g_exclusive = false;
+  display::set_exclusive(false);
+  LOG_I("gpu", "exclusive fullscreen left");
+}
+
+void update_exclusive() {
+  int req = g_excl_request.exchange(-1);
+  if (req == 0) {
+    g_excl_wanted = false;
+    if (g_exclusive) leave_exclusive();
+    PostMessageW(g_hwnd, WM_APP + 1, 0, 0);  // the window applies its own mode (window.cpp)
+  } else if (req == 1) {
+    g_excl_wanted = true;
+    if (g_exclusive) leave_exclusive();  // another display mode
+    enter_exclusive();
+  } else if (g_excl_wanted) {
+    BOOL fs = FALSE;
+    if (g_exclusive && SUCCEEDED(g_dev.swap->GetFullscreenState(&fs, nullptr)) && !fs) {  // DXGI left it (Alt+Tab)
+      g_exclusive = false;
+      display::set_exclusive(false);
+      LOG_I("gpu", "exclusive fullscreen lost; entered again when the window is in front");
+    }
+    if (!g_exclusive && GetForegroundWindow() == g_hwnd && std::chrono::steady_clock::now() >= g_excl_retry) enter_exclusive();
+  }
+}
+
+}  // namespace
+
+void request_exclusive(bool on, u32 w, u32 h, u32 hz) {
+  g_excl_w = w;
+  g_excl_h = h;
+  g_excl_hz = hz;
+  g_excl_request = on ? 1 : 0;
+}
+bool exclusive_active() { return g_exclusive.load(); }
+
 void present_texture(ID3D11ShaderResourceView* srv, u32 src_w, u32 src_h) {
   auto* c = g_dev.ctx;
   // Keep a copy for captures (same size as the source).
@@ -266,6 +350,7 @@ void present_texture(ID3D11ShaderResourceView* srv, u32 src_w, u32 src_h) {
   draw_to(last_rtv, src_w, src_h);
   last_rtv->Release();
   if (g_dev.swap) {
+    update_exclusive();
     resize_to_window();
     // Aspect-correct fit: the frame is scaled to the largest centred rectangle with its own
     // aspect ratio; the rest of the window stays black.
@@ -275,6 +360,26 @@ void present_texture(ID3D11ShaderResourceView* srv, u32 src_w, u32 src_h) {
     const float black[4] = {0, 0, 0, 1};
     c->ClearRenderTargetView(g_dev.backbuffer_rtv, black);
     draw_to(g_dev.backbuffer_rtv, g_dev.width, g_dev.height, &fit);
+    if (ui::is_open()) {  // PC SETTINGS over the game's frame, at the window's resolution
+      ID3D11Texture2D* bb = nullptr;
+      g_dev.swap->GetBuffer(0, __uuidof(ID3D11Texture2D), reinterpret_cast<void**>(&bb));
+      if (bb) {
+        c->OMSetRenderTargets(0, nullptr, nullptr);
+        ui::render(g_dev.dev, c, bb, g_dev.width, g_dev.height);
+        if (!g_ui_copy || g_ui_w != g_dev.width || g_ui_h != g_dev.height) {
+          if (g_ui_copy) g_ui_copy->Release();
+          g_ui_copy = nullptr;
+          D3D11_TEXTURE2D_DESC td{};
+          bb->GetDesc(&td);
+          td.BindFlags = 0;
+          td.MiscFlags = 0;
+          td.Usage = D3D11_USAGE_DEFAULT;
+          if (SUCCEEDED(g_dev.dev->CreateTexture2D(&td, nullptr, &g_ui_copy))) g_ui_w = g_dev.width, g_ui_h = g_dev.height;
+        }
+        if (g_ui_copy) c->CopyResource(g_ui_copy, bb);
+        bb->Release();
+      }
+    }
     g_dev.swap->Present(0, display::present_flags());
     display::after_present(g_dev.swap);
   }
@@ -285,13 +390,16 @@ bool read_back_last_frame(std::vector<u8>& rgba, u32& w, u32& h) { return read_b
 struct PendingCapture {
   ID3D11Texture2D* staging = nullptr;
   u32 index = 0, w = 0, h = 0;
+  bool bgra = false;
 };
 std::vector<PendingCapture> g_captures;
 
 void begin_capture(u32 index) {
-  if (!g_last || g_captures.size() >= 8) return;
+  // While PC SETTINGS is open the capture shows the window as composed (the screen included).
+  ID3D11Texture2D* src = ui::is_open() && g_ui_copy ? g_ui_copy : g_last;
+  if (!src || g_captures.size() >= 8) return;
   D3D11_TEXTURE2D_DESC td{};
-  g_last->GetDesc(&td);
+  src->GetDesc(&td);
   td.Usage = D3D11_USAGE_STAGING;
   td.BindFlags = 0;
   td.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
@@ -301,10 +409,11 @@ void begin_capture(u32 index) {
     report_failure("capture staging texture", hr);
     return;
   }
-  g_dev.ctx->CopyResource(c.staging, g_last);
+  g_dev.ctx->CopyResource(c.staging, src);
   c.index = index;
   c.w = td.Width;
   c.h = td.Height;
+  c.bgra = td.Format == DXGI_FORMAT_B8G8R8A8_UNORM;
   g_captures.push_back(c);
 }
 
@@ -321,6 +430,11 @@ void poll_captures(const std::function<void(u32 index, std::vector<u8>&& rgba, u
       for (u32 y = 0; y < it->h; ++y)
         std::memcpy(&rgba[size_t(y) * it->w * 4], static_cast<u8*>(ms.pData) + size_t(y) * ms.RowPitch, size_t(it->w) * 4);
       g_dev.ctx->Unmap(it->staging, 0);
+      if (it->bgra)
+        for (size_t i = 0; i < rgba.size(); i += 4) {
+          std::swap(rgba[i], rgba[i + 2]);
+          rgba[i + 3] = 0xff;
+        }
       done(it->index, std::move(rgba), it->w, it->h);
     } else {
       report_failure("capture readback", hr);

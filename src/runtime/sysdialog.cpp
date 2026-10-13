@@ -274,7 +274,9 @@ void run_dialog(Dlg* d) {
     RegisterClassExW(&wc);
     registered = true;
   }
-  const int W = 560, H = d->kind == Dlg::List ? 460 : d->kind == Dlg::Text ? 420 : 220;
+  const int dpi = int(GetDpiForWindow(owner) ? GetDpiForWindow(owner) : 96);
+  auto S = [dpi](int v) { return MulDiv(v, dpi, 96); };  // sizes below are at 96 DPI
+  const int W = S(560), H = S(d->kind == Dlg::List ? 460 : d->kind == Dlg::Text ? 420 : 220);
   RECT orc{};
   GetWindowRect(owner, &orc);
   RECT r{0, 0, W, H};
@@ -288,7 +290,7 @@ void run_dialog(Dlg* d) {
     return;
   }
   SetWindowLongPtrW(d->wnd, GWLP_USERDATA, LONG_PTR(d));
-  d->font = CreateFontW(-17, 0, 0, 0, FW_NORMAL, 0, 0, 0, DEFAULT_CHARSET, 0, 0, CLEARTYPE_QUALITY, 0, L"Segoe UI");
+  d->font = CreateFontW(-S(17), 0, 0, 0, FW_NORMAL, 0, 0, 0, DEFAULT_CHARSET, 0, 0, CLEARTYPE_QUALITY, 0, L"Segoe UI");
   auto child = [&](const wchar_t* cls, const wchar_t* text, DWORD st, int cx, int cy, int cw, int ch, int id) {
     HWND c = CreateWindowExW(0, cls, text, WS_CHILD | WS_VISIBLE | st, cx, cy, cw, ch, d->wnd, HMENU(INT_PTR(id)), inst, nullptr);
     SendMessageW(c, WM_SETFONT, WPARAM(d->font), TRUE);
@@ -296,36 +298,36 @@ void run_dialog(Dlg* d) {
   };
   const wchar_t* accept_label = d->kind == Dlg::Question ? L"Yes" : L"OK";
   if (d->kind == Dlg::List) {
-    d->list = child(L"LISTBOX", L"", WS_BORDER | WS_VSCROLL | WS_TABSTOP | LBS_NOTIFY | LBS_NOINTEGRALHEIGHT, 12, 12, W - 24, 300, ID_LIST);
+    d->list = child(L"LISTBOX", L"", WS_BORDER | WS_VSCROLL | WS_TABSTOP | LBS_NOTIFY | LBS_NOINTEGRALHEIGHT, S(12), S(12), W - S(24), S(300), ID_LIST);
     for (const auto& row : d->rows) SendMessageW(d->list, LB_ADDSTRING, 0, LPARAM(row.c_str()));
     SendMessageW(d->list, LB_SETCURSEL, WPARAM(d->focus), 0);
-    d->detail = child(L"STATIC", L"", SS_LEFT, 12, 320, W - 24, 80, ID_DETAIL);
+    d->detail = child(L"STATIC", L"", SS_LEFT, S(12), S(320), W - S(24), S(80), ID_DETAIL);
     update_detail(d);
-    d->accept = child(L"BUTTON", accept_label, WS_TABSTOP | BS_DEFPUSHBUTTON, W - 236, H - 46, 108, 32, ID_ACCEPT);
-    d->back = child(L"BUTTON", L"Back", WS_TABSTOP | BS_PUSHBUTTON, W - 120, H - 46, 108, 32, ID_BACK);
+    d->accept = child(L"BUTTON", accept_label, WS_TABSTOP | BS_DEFPUSHBUTTON, W - S(236), H - S(46), S(108), S(32), ID_ACCEPT);
+    d->back = child(L"BUTTON", L"Back", WS_TABSTOP | BS_PUSHBUTTON, W - S(120), H - S(46), S(108), S(32), ID_BACK);
     SetFocus(d->list);
   } else if (d->kind == Dlg::Text) {
-    child(L"STATIC", d->text.c_str(), SS_LEFT, 16, 16, W - 32, 90, ID_TEXT);
-    d->edit = child(L"EDIT", d->edit_text.c_str(), WS_BORDER | WS_TABSTOP | ES_AUTOHSCROLL, 16, 116, W - 32, 30, ID_EDIT);
+    child(L"STATIC", d->text.c_str(), SS_LEFT, S(16), S(16), W - S(32), S(90), ID_TEXT);
+    d->edit = child(L"EDIT", d->edit_text.c_str(), WS_BORDER | WS_TABSTOP | ES_AUTOHSCROLL, S(16), S(116), W - S(32), S(30), ID_EDIT);
     SendMessageW(d->edit, EM_SETLIMITTEXT, WPARAM(d->max_chars), 0);
     SendMessageW(d->edit, EM_SETSEL, 0, -1);
-    const int n = int(std::size(kKeys)) - 1, kw = (W - 32) / kKeyCols;
+    const int n = int(std::size(kKeys)) - 1, kw = (W - S(32)) / kKeyCols;
     for (int i = 0; i < n; ++i) {
       wchar_t label[8] = {kKeys[i], 0};
       if (kKeys[i] == L' ') wcscpy(label, L"Space");
-      d->keys.push_back(child(L"BUTTON", label, WS_TABSTOP | BS_PUSHBUTTON, 16 + (i % kKeyCols) * kw, 160 + (i / kKeyCols) * 36, kw - 4, 32,
+      d->keys.push_back(child(L"BUTTON", label, WS_TABSTOP | BS_PUSHBUTTON, S(16) + (i % kKeyCols) * kw, S(160) + (i / kKeyCols) * S(36), kw - S(4), S(32),
                               ID_KEY0 + i));
     }
-    child(L"STATIC", L"Controller: D-pad select, A type, X delete, Y space, Start OK, B back", SS_LEFT, 16, H - 84, W - 32, 22,
+    child(L"STATIC", L"Controller: D-pad select, A type, X delete, Y space, Start OK, B back", SS_LEFT, S(16), H - S(84), W - S(32), S(22),
           ID_TEXT);
-    d->accept = child(L"BUTTON", L"OK", WS_TABSTOP | BS_DEFPUSHBUTTON, W - 236, H - 46, 108, 32, ID_ACCEPT);
-    d->back = child(L"BUTTON", L"Back", WS_TABSTOP | BS_PUSHBUTTON, W - 120, H - 46, 108, 32, ID_BACK);
+    d->accept = child(L"BUTTON", L"OK", WS_TABSTOP | BS_DEFPUSHBUTTON, W - S(236), H - S(46), S(108), S(32), ID_ACCEPT);
+    d->back = child(L"BUTTON", L"Back", WS_TABSTOP | BS_PUSHBUTTON, W - S(120), H - S(46), S(108), S(32), ID_BACK);
     SetFocus(d->edit);
   } else {
-    child(L"STATIC", d->text.c_str(), SS_LEFT, 16, 16, W - 32, H - 80, ID_TEXT);
-    d->accept = child(L"BUTTON", accept_label, WS_TABSTOP | BS_DEFPUSHBUTTON, W - (d->kind == Dlg::Question ? 236 : 120), H - 46, 108, 32,
+    child(L"STATIC", d->text.c_str(), SS_LEFT, S(16), S(16), W - S(32), H - S(80), ID_TEXT);
+    d->accept = child(L"BUTTON", accept_label, WS_TABSTOP | BS_DEFPUSHBUTTON, W - (d->kind == Dlg::Question ? S(236) : S(120)), H - S(46), S(108), S(32),
                       ID_ACCEPT);
-    if (d->kind == Dlg::Question) d->back = child(L"BUTTON", L"No", WS_TABSTOP | BS_PUSHBUTTON, W - 120, H - 46, 108, 32, ID_BACK);
+    if (d->kind == Dlg::Question) d->back = child(L"BUTTON", L"No", WS_TABSTOP | BS_PUSHBUTTON, W - S(120), H - S(46), S(108), S(32), ID_BACK);
     SetFocus(d->accept);
   }
   d->pad_last = pad_now();

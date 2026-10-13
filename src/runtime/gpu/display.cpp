@@ -30,6 +30,7 @@ u32 g_refresh = 0;  // Hz of the output's current display mode (integer, as Wind
 u32 g_divisor = 0;  // display-locked pacing: an emulated vblank every N display vblanks (0: clock)
 double g_div_fps = 0;  // the target g_divisor was chosen for (the target changes during movies)
 bool g_tearing = false;
+std::atomic<bool> g_exclusive{false};
 std::atomic<bool> g_locked{false};  // the last vblank came from the display (else the clock)
 
 // Video decoders open (movie playback): the system's movie player (libsail, as firmware code)
@@ -185,7 +186,35 @@ void wait_next_vblank() {
 
 u32 present_flags() {
   std::lock_guard lk(g_mu);
-  return g_tearing && !g_divisor ? DXGI_PRESENT_ALLOW_TEARING : 0;
+  return g_tearing && !g_divisor && !g_exclusive.load() ? DXGI_PRESENT_ALLOW_TEARING : 0;
+}
+
+void set_exclusive(bool on) { g_exclusive = on; }
+
+u32 refresh_hz() {
+  std::lock_guard lk(g_mu);
+  return g_refresh;
+}
+
+std::vector<Mode> modes() {
+  std::vector<Mode> out;
+  std::lock_guard lk(g_mu);
+  if (!g_output) return out;
+  UINT n = 0;
+  if (FAILED(g_output->GetDisplayModeList(DXGI_FORMAT_B8G8R8A8_UNORM, 0, &n, nullptr)) || !n) return out;
+  std::vector<DXGI_MODE_DESC> list(n);
+  if (FAILED(g_output->GetDisplayModeList(DXGI_FORMAT_B8G8R8A8_UNORM, 0, &n, list.data()))) return out;
+  for (UINT i = 0; i < n; ++i) {
+    const DXGI_MODE_DESC& d = list[i];
+    if (d.Width < 640 || d.Height < 360 || !d.RefreshRate.Denominator) continue;
+    u32 hz = u32(std::lround(double(d.RefreshRate.Numerator) / d.RefreshRate.Denominator));
+    bool seen = std::any_of(out.begin(), out.end(), [&](const Mode& m) { return m.w == d.Width && m.h == d.Height && m.hz == hz; });
+    if (!seen && hz >= 30) out.push_back({d.Width, d.Height, hz});
+  }
+  std::sort(out.begin(), out.end(), [](const Mode& a, const Mode& b) {
+    return a.w != b.w ? a.w > b.w : a.h != b.h ? a.h > b.h : a.hz > b.hz;
+  });
+  return out;
 }
 
 void swapchain_created(IDXGISwapChain1* swap, bool tearing) {

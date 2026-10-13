@@ -1,10 +1,14 @@
-// Runtime configuration (command line). Paths are host paths.
+// Runtime configuration (command line and the shared settings file). Paths are host paths.
 #pragma once
+#include <atomic>
 #include <string>
 
 namespace rt {
 
 struct Config {
+  std::string data_dir;     // the installation's data folder (prepared data, saves, caches, settings, runs)
+  std::string settings_file;  // shared settings (common/settings_file.h): <data>\config\settings.ini
+  unsigned keep_runs = 0;   // run directories kept under <data>\runs (0: all)
   std::string disc_root;    // read-only PS3 disc folder (contains PS3_GAME)
   std::string prepared;     // acfa-prep output (eboot.elf, update/)
   std::string hdd0;         // writable /dev_hdd0 (game data, saves)
@@ -38,7 +42,6 @@ struct Config {
   std::string watch_access;         // hardware data watchpoints (datawatch.h), "[base+]off[:len][:w],..."
   std::string input_script;         // timed pad presses on port 0: "t:btn[+btn][:hold],..." (seconds)
   std::string control_file;         // live control: lines of --input items appended while running
-  std::string input_config;         // keyboard/mouse bindings file (bindings.h)
   bool isolate_input = false;       // tests: ignore the real keyboard, mouse and pads (scripted only)
   bool gpu_submit_thread = true;    // D3D11 calls on their own thread (gpu/submit.h); off: FIFO thread
   std::string priority;             // process priority class: "" (normal), "above-normal", "high"
@@ -46,8 +49,10 @@ struct Config {
   bool audio_capture = false;       // write the mixed output to <run>/audio.f32 (48 kHz float stereo)
   bool gcm_wait_spin = false;       // --gcm-wait spin: libgcm fragment waits spin with Sleep(0) (A/B)
   std::string pacing = "auto";      // emulated vblank source (gpu/display.h): auto | display | clock
-  double fps = 60;                  // game frame rate target (--fps N | display: 0 = the display's refresh)
+  std::atomic<double> fps{60};      // game frame rate target (--fps N | display: 0 = the display's refresh); PC SETTINGS changes it
   bool fullscreen = false;          // start in borderless fullscreen (F11 / Alt+Enter toggle)
+  bool windowed = false;            // --windowed: a window whatever the settings say
+  int window_w = 1280, window_h = 720;  // window client size (windowed)
   unsigned long long affinity = 0;  // --affinity MASK: logical CPUs the process may use (hardware range estimates)
   std::string spu_cache;            // where collected SPU code records are written
   std::string shader_cache;         // compiled HLSL (derived from the game's shaders; machine-local)

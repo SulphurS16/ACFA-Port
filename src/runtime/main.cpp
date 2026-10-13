@@ -4,6 +4,7 @@
 #include <windows.h>
 #include <psapi.h>
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cstdio>
@@ -22,6 +23,7 @@
 #include "runtime/gpu/shader_warm.h"
 #include "runtime/gpu/window.h"
 #include "runtime/rsx/rsx.h"
+#include "runtime/settings.h"
 #include "runtime/sysutil.h"
 #include "runtime/hle.h"
 #include "runtime/input.h"
@@ -57,57 +59,23 @@ namespace fs = std::filesystem;
 
 namespace {
 
-const char* kDefaultSettings =
-    "# ARMORED CORE for Answer native port: settings. Options given on the command line override\n"
-    "# these. Keyboard/mouse bindings and mouse sensitivity are in input.ini.\n"
-    "\n"
-    "# The game's frame rate: 60 (as on the console), a higher number (the game's simulation follows\n"
-    "# real time, so it keeps its speed), or \"display\" for the display's refresh rate.\n"
-    "fps = 60\n"
-    "\n"
-    "# Source of the game's vertical blank: auto (the display's own when its refresh is a whole\n"
-    "# multiple of fps, else a clock, with tearing allowed so variable-refresh displays pace evenly),\n"
-    "# display or clock.\n"
-    "pacing = auto\n"
-    "\n"
-    "# Start in borderless fullscreen (1) or in a window (0). F11 or Alt+Enter switches while playing.\n"
-    "fullscreen = 0\n";
-
-// User settings (local\config\settings.ini): written with the defaults on first run. Problems are
-// returned as messages for the log (which is not open yet).
-std::vector<std::string> load_settings(Config& c, const fs::path& path) {
-  std::vector<std::string> notes;
+// Run directories are named after their UTC start time (YYYYMMDD-HHMMSS); with --keep-runs N only
+// the newest N stay (the launcher's runs keep their logs without filling the disk).
+void prune_runs(const fs::path& runs, unsigned keep) {
   std::error_code ec;
-  if (!fs::exists(path, ec)) {
-    try {
-      acfa::write_text(path, kDefaultSettings);
-      notes.push_back("wrote the default settings to " + path.string());
-    } catch (const std::exception& e) {
-      notes.push_back(std::string("cannot write default settings: ") + e.what());
-    }
-    return notes;
+  std::vector<fs::path> dirs;
+  for (const auto& e : fs::directory_iterator(runs, ec)) {
+    std::string n = e.path().filename().string();
+    if (e.is_directory(ec) && n.size() == 15 && n[8] == '-' &&
+        std::all_of(n.begin(), n.end(), [](char ch) { return ch == '-' || (ch >= '0' && ch <= '9'); }))
+      dirs.push_back(e.path());
   }
-  std::ifstream f(path);
-  std::string line;
-  while (std::getline(f, line)) {
-    if (!line.empty() && line.back() == '\r') line.pop_back();
-    size_t h = line.find('#');
-    if (h != std::string::npos) line.resize(h);
-    size_t eq = line.find('=');
-    if (eq == std::string::npos) continue;
-    auto trim = [](std::string s) {
-      size_t b = s.find_first_not_of(" \t"), e = s.find_last_not_of(" \t");
-      return b == std::string::npos ? std::string() : s.substr(b, e - b + 1);
-    };
-    std::string key = trim(line.substr(0, eq)), value = trim(line.substr(eq + 1));
-    if (key == "fps") c.fps = value == "display" ? 0 : std::max(30.0, std::atof(value.c_str()));
-    else if (key == "pacing" && (value == "auto" || value == "display" || value == "clock")) c.pacing = value;
-    else if (key == "fullscreen") c.fullscreen = value == "1" || value == "true" || value == "yes";
-    else if (!key.empty()) notes.push_back("settings: unknown or invalid '" + key + " = " + value + "' ignored");
+  if (dirs.size() <= keep) return;
+  std::sort(dirs.begin(), dirs.end());
+  for (size_t i = 0; i + keep < dirs.size(); ++i) {
+    acfa::guard_write(dirs[i]);
+    fs::remove_all(dirs[i], ec);
   }
-  notes.push_back(acfa::strprintf("settings from %s: fps %s, pacing %s, fullscreen %d", path.string().c_str(),
-                                  c.fps > 0 ? acfa::strprintf("%.0f", c.fps).c_str() : "display", c.pacing.c_str(), int(c.fullscreen)));
-  return notes;
 }
 
 }  // namespace
@@ -115,30 +83,71 @@ std::vector<std::string> load_settings(Config& c, const fs::path& path) {
 int main(int argc, char** argv) {
   Config& c = cfg();
   fs::path root = fs::current_path();
-  // The user's game folder: by default the disc folder inside the project root; the first line
-  // of local\config\disc_root.txt names another one; --disc overrides both.
+  // Where everything machine-local lives: --data DIR (the launcher's data folder), by default
+  // local\ in the current directory (the development layout). --settings FILE replaces the
+  // shared settings file for a run (tests).
+  fs::path data = root / "local";
+  std::string settings_override;
+  for (int i = 1; i + 1 < argc; ++i) {
+    std::string a = argv[i];
+    if (a == "--data") data = fs::absolute(argv[i + 1]);
+    else if (a == "--settings") settings_override = argv[i + 1];
+    else if (a == "--keep-runs") c.keep_runs = unsigned(std::strtoul(argv[i + 1], nullptr, 10));
+  }
+  c.data_dir = data.string();
+  // The user's game folder: by default the disc folder inside the current directory; the first
+  // line of <data>\config\disc_root.txt names another one; --disc overrides both.
   c.disc_root = (root / "Armored Core - For Answer (USA)").string();
-  if (std::ifstream f(root / "local" / "config" / "disc_root.txt"); f) {
+  if (std::ifstream f(data / "config" / "disc_root.txt"); f) {
     std::string line;
     std::getline(f, line);
     while (!line.empty() && (line.back() == '\r' || line.back() == ' ' || line.back() == '"')) line.pop_back();
     size_t b = line.find_first_not_of(" \"");
     if (b != std::string::npos && !line.empty()) c.disc_root = line.substr(b);
   }
-  c.prepared = (root / "local" / "game" / "BLUS30187").string();
-  c.hdd0 = (root / "local" / "hdd0").string();
-  c.hdd1 = (root / "local" / "hdd1").string();
-  c.flash = (root / "local" / "game" / "firmware241" / "dev_flash").string();
-  c.spu_cache = (root / "local" / "spu_cache").string();
-  c.shader_cache = (root / "local" / "shader_cache").string();
-  c.shader_records = (root / "local" / "shader_records").string();
-  c.input_config = (root / "local" / "config" / "input.ini").string();
-  std::vector<std::string> settings_notes = load_settings(c, root / "local" / "config" / "settings.ini");
+  c.prepared = (data / "game" / "BLUS30187").string();
+  c.hdd0 = (data / "hdd0").string();
+  c.hdd1 = (data / "hdd1").string();
+  c.flash = (data / "game" / "firmware241" / "dev_flash").string();
+  c.spu_cache = (data / "spu_cache").string();
+  c.shader_cache = (data / "shader_cache").string();
+  c.shader_records = (data / "shader_records").string();
+  c.settings_file = settings_override.empty() ? acfa::settings::file_in(data).string() : settings_override;
+  std::string shader_manifest = (root / "data" / "shader_manifest.txt").string();
+  // Run directory: <data>\runs\<UTC timestamp>
+  std::time_t now = std::time(nullptr);
+  std::tm tm{};
+  gmtime_s(&tm, &now);
+  char stamp[32];
+  std::strftime(stamp, sizeof stamp, "%Y%m%d-%H%M%S", &tm);
+  fs::path run = data / "runs" / stamp;
+  try {
+    acfa::guard_write(run);
+    fs::create_directories(run);
+    if (c.keep_runs) prune_runs(data / "runs", c.keep_runs);
+    c.run_dir = run.string();
+    log_open((run / "acfa.log").string());
+  } catch (const std::exception& e) {
+    std::fprintf(stderr, "cannot create the run directory %s: %s\n", run.string().c_str(), e.what());
+    return 1;
+  }
+  // Shared settings (launcher and PC SETTINGS), before the command line overrides them.
+  std::vector<std::string> settings_notes;
+  settings::init(c.settings_file, &settings_notes);
+  {
+    acfa::settings::Display d = settings::display();
+    c.fps = d.fps;
+    c.pacing = d.pacing;
+    c.fullscreen = d.mode == acfa::settings::Mode::Borderless;
+    c.window_w = d.width;
+    c.window_h = d.height;
+  }
   std::string level = "info";
   for (int i = 1; i < argc; ++i) {
     std::string a = argv[i];
     auto next = [&]() -> std::string { return i + 1 < argc ? argv[++i] : std::string(); };
-    if (a == "--disc") c.disc_root = next();
+    if (a == "--data" || a == "--settings" || a == "--keep-runs") next();  // read above
+    else if (a == "--disc") c.disc_root = next();
     else if (a == "--prepared") c.prepared = next();
     else if (a == "--hdd0") c.hdd0 = next();
     else if (a == "--flash") c.flash = next();
@@ -169,7 +178,6 @@ int main(int argc, char** argv) {
     else if (a == "--skip-fp") c.skip_fp = unsigned(std::stoul(next(), nullptr, 0));
     else if (a == "--input") c.input_script = next();
     else if (a == "--control") c.control_file = next();
-    else if (a == "--input-config") c.input_config = next();
     else if (a == "--isolate-input") c.isolate_input = true;
     else if (a == "--gpu-submit") c.gpu_submit_thread = next() != "off";
     else if (a == "--priority") c.priority = next();
@@ -181,6 +189,8 @@ int main(int argc, char** argv) {
     else if (a == "--gcm-wait") c.gcm_wait_spin = next() == "spin";
     else if (a == "--pacing") c.pacing = next();
     else if (a == "--fps") { std::string v = next(); c.fps = v == "display" ? 0 : std::max(30.0, std::atof(v.c_str())); }
+    else if (a == "--windowed") c.fullscreen = false, c.windowed = true;
+    else if (a == "--shader-manifest") shader_manifest = next();
     else if (a == "--fullscreen") c.fullscreen = true;
     else if (a == "--affinity") c.affinity = std::strtoull(next().c_str(), nullptr, 16);
     else if (a == "--shot-interval") c.shot_interval = std::atof(next().c_str());
@@ -190,16 +200,6 @@ int main(int argc, char** argv) {
     }
   }
   acfa::add_protected_root(c.disc_root);
-  // Run directory: local/runs/<UTC timestamp>
-  std::time_t now = std::time(nullptr);
-  std::tm tm{};
-  gmtime_s(&tm, &now);
-  char stamp[32];
-  std::strftime(stamp, sizeof stamp, "%Y%m%d-%H%M%S", &tm);
-  fs::path run = root / "local" / "runs" / stamp;
-  fs::create_directories(run);
-  c.run_dir = run.string();
-  log_open((run / "acfa.log").string());
   log_set_level(level == "trace" ? Level::Trace : level == "debug" ? Level::Debug : Level::Info);
   hle::g_trace = c.trace_hle;
   for (size_t p = 0; p < c.watch_lines.size();) {  // --watch-lines ea:size,...
@@ -220,7 +220,7 @@ int main(int argc, char** argv) {
       LOG_W("main", "--affinity 0x%llx not applied (error %lu)", c.affinity, GetLastError());
   }
   if (c.warm_shaders) {  // pipeline step: shader cache from the manifest, no game run
-    gpu::WarmResult w = gpu::warm_shaders((root / "data" / "shader_manifest.txt").string(), c.disc_root, c.prepared);
+    gpu::WarmResult w = gpu::warm_shaders(shader_manifest, c.disc_root, c.prepared);
     if (!w.error.empty()) {
       LOG_E("warm", "%s", w.error.c_str());
       std::fprintf(stderr, "%s\n", w.error.c_str());
@@ -238,7 +238,6 @@ int main(int argc, char** argv) {
     prof::write_report(cfg().run_dir + "/profile.txt");
     datawatch::write_report(cfg().run_dir + "/access.txt");
   });
-  bindings::load(c.input_config);
   // Optional process priority: with other programs keeping every core busy, each handoff between
   // the game's threads otherwise waits for a time slice (the frame rate collapses); above normal,
   // the game's threads run when they become ready. Off by default: it takes CPU time from other
@@ -277,10 +276,15 @@ int main(int argc, char** argv) {
     return 1;
   }
   lv2_init();
-  if (!c.headless && !gpu::window_create("ARMORED CORE for Answer - native port", 1280, 720, true))
+  if (!c.headless) gpu::window_dpi_aware();
+  if (!c.headless && !gpu::window_create("ARMORED CORE for Answer - native port", c.window_w, c.window_h, true))
     LOG_E("main", "window creation failed; running without presentation");
   else if (!c.headless && c.fullscreen)
     gpu::window_set_fullscreen(true);
+  else if (!c.headless && !c.windowed && settings::display().mode == acfa::settings::Mode::Fullscreen) {
+    acfa::settings::Display d = settings::display();  // exclusive fullscreen from the first frame
+    gpu::request_exclusive(true, u32(d.fs_width), u32(d.fs_height), u32(d.fs_hz));
+  }
   start_main_thread(ex.entry_opd, ex.primary_stack, ex.primary_prio, ex.tls_vaddr, ex.tls_filesz, ex.tls_memsz,
                     ex.malloc_pagesize, "/dev_bdvd/PS3_GAME/USRDIR/EBOOT.BIN");
   auto t0 = std::chrono::steady_clock::now();

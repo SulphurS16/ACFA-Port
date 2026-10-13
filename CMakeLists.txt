@@ -28,6 +28,8 @@ add_library(acfa_common STATIC
   src/common/bytes.cpp
   src/common/crypto.cpp
   src/common/file.cpp
+  src/common/ini.cpp
+  src/common/settings_file.cpp
   src/common/sfo.cpp)
 target_include_directories(acfa_common PUBLIC ${CMAKE_SOURCE_DIR}/src)
 target_link_libraries(acfa_common PUBLIC acfa_zlib bcrypt)
@@ -75,7 +77,8 @@ if(ACFA_GEN_SRC)
     ${CMAKE_SOURCE_DIR}/src/runtime/audio/*.cpp
     ${CMAKE_SOURCE_DIR}/src/runtime/media/*.cpp
     ${CMAKE_SOURCE_DIR}/src/runtime/game/*.cpp
-    ${CMAKE_SOURCE_DIR}/src/runtime/spu/*.cpp)
+    ${CMAKE_SOURCE_DIR}/src/runtime/spu/*.cpp
+    ${CMAKE_SOURCE_DIR}/src/runtime/ui/*.cpp)
   # Recompiled SPU code (game-derived, from local/gen/spu; never distributed).
   set(ACFA_SPU_GEN_DIR "${CMAKE_SOURCE_DIR}/local/gen/spu" CACHE PATH "Directory with acfa-spurecomp output")
   file(GLOB ACFA_SPU_GEN_SRC CONFIGURE_DEPENDS "${ACFA_SPU_GEN_DIR}/*.cpp")
@@ -90,7 +93,7 @@ if(ACFA_GEN_SRC)
   target_include_directories(acfa PRIVATE ${CMAKE_SOURCE_DIR}/src)
   target_compile_options(acfa PRIVATE ${ACFA_CPU_FLAGS} -fno-strict-aliasing -Wall -Wextra -Wno-unused-parameter -g)
   # Whole-archive: the function table references everything anyway; keeps HLE registrars alive.
-  target_link_libraries(acfa PRIVATE acfa_ppu_gen acfa_spu_gen acfa_spu acfa_ppu acfa_common d3d11 dxgi d3dcompiler ole32 psapi
+  target_link_libraries(acfa PRIVATE acfa_ppu_gen acfa_spu_gen acfa_spu acfa_ppu acfa_common d3d11 dxgi d3dcompiler d2d1 dwrite ole32 psapi
                         synchronization)
 endif()
 

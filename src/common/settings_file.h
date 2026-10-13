@@ -1,0 +1,55 @@
+// The shared settings file of the launcher and the game (<data>\config\settings.ini): display
+// settings, mouse settings and keyboard bindings. Both sides change single values in place
+// (acfa::Ini), so neither overwrites what the other set. Older layouts are migrated on load:
+// top-level fps/pacing/fullscreen keys (settings.ini before the launcher) and input.ini beside
+// it (bindings and mouse settings), which is renamed to input.ini.migrated afterwards.
+#pragma once
+#include <filesystem>
+#include <string>
+#include <vector>
+
+#include "common/ini.h"
+
+namespace acfa::settings {
+
+std::filesystem::path file_in(const std::filesystem::path& data_dir);  // <data>\config\settings.ini
+
+// Loads `file`, migrating older layouts and adding missing sections with their defaults; when
+// anything was added or migrated the result is saved. Notes describe what happened (for logs).
+Ini load_or_create(const std::filesystem::path& file, std::vector<std::string>* notes);
+
+// The default [keyboard] lines (the game's SIMPLE layout), shared with the runtime's bindings.
+const char* default_keyboard_text();
+
+enum class Mode { Windowed, Fullscreen, Borderless };
+const char* mode_name(Mode m);  // as in the file: windowed, fullscreen, borderless
+
+struct Display {
+  double fps = 60;              // frame rate target in missions; 0 = the display's refresh rate
+  std::string pacing = "auto";  // auto | display | clock
+  Mode mode = Mode::Windowed;   // fullscreen: exclusive, in the display mode below; borderless: the monitor as it is
+  int width = 1280, height = 720;  // window client size (windowed)
+  int fs_width = 0, fs_height = 0, fs_hz = 0;  // fullscreen display mode (0: the desktop's resolution / refresh rate)
+};
+Display read_display(const Ini& ini);
+void write_display(Ini& ini, const Display& d);
+std::string fullscreen_text(const Display& d);  // "desktop", "1920x1080@60"
+
+// Frame rate choices offered by the launcher and the PC SETTINGS screen, in display order.
+// Validated: checked by game execution (movement, turn rates, fire rate and boost physics match
+// 60 fps in missions); the others are offered as untested.
+struct FpsChoice {
+  double fps;  // 0 = display refresh
+  const char* label;
+  bool validated;
+};
+const std::vector<FpsChoice>& fps_choices();
+std::string fps_text(double fps);  // "60", "display"
+
+// Window sizes offered for windowed mode.
+struct Size {
+  int w, h;
+};
+const std::vector<Size>& window_sizes();
+
+}  // namespace acfa::settings
