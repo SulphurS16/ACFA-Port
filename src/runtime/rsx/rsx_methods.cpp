@@ -251,9 +251,11 @@ void execute_method(u32 ri, u32 arg, u32 count, u32 index) {
       sem_offset_406e = arg;
       return;
     case m::SEMAPHORE_ACQUIRE:
+      if (sem_offset_406e >= 0x1000) fifo_desync("semaphore offset outside the label area", sem_offset_406e);
       semaphore_acquire(kLabelAddr + sem_offset_406e, arg);
       return;
     case m::SEMAPHORE_RELEASE:
+      if (sem_offset_406e >= 0x1000) fifo_desync("semaphore offset outside the label area", sem_offset_406e);
       ppu::w32(kLabelAddr + sem_offset_406e, arg);
       return;
     case m::BACK_END_WRITE_SEMAPHORE_RELEASE: {

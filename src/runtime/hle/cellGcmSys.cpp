@@ -165,8 +165,31 @@ void cellGcmSetZcull(ppu::Ctx& ctx) {
         (unsigned long long)ctx.r[10], u32(ppu::r64(sp + 0x70)), u32(ppu::r64(sp + 0x78)), u32(ppu::r64(sp + 0x80)),
         u32(ppu::r64(sp + 0x88)));
 }
-// Old-API flip: writes GCM_FLIP_COMMAND(id) at the context's current pointer.
-void _cellGcmSetFlipCommand(Ptr<ContextData> c, u32 id) {
+// Old-API flip: writes GCM_FLIP_COMMAND(id) at the context's current pointer, after reserving its
+// two words as libgcm does: when they do not fit before the context's end (its last word is the
+// jump slot), the buffer callback first moves on to the next fragment. Writing past the end put
+// the flip into the jump slot and the next fragment's first word, and the callback then wrote its
+// jump inside that fragment without waiting for the FIFO to leave it: when the FIFO lagged a ring
+// lap behind (loading), it executed those words as commands (FIFO desync at the title -> hub
+// transition: player test run 20261013-134934).
+void _cellGcmSetFlipCommand(ppu::Ctx& ctx, Ptr<ContextData> c, u32 id) {
+  if (u32(c->current) + 8 > u32(c->end)) {
+    static std::atomic<u32> n{0};
+    u32 k = ++n;
+    if (k <= 3 || (k & (k - 1)) == 0)
+      LOG_I("gcm", "flip command at the end of a fragment (current 0x%08x, end 0x%08x): buffer callback first (%u so far)",
+            u32(c->current), u32(c->end), k);
+    if (u32(c->callback) == g_context_opd) {
+      u64 r3 = ctx.r[3], r4 = ctx.r[4];
+      ctx.r[3] = c.addr;
+      ctx.r[4] = 2;
+      gcm_callback(ctx);
+      ctx.r[3] = r3;
+      ctx.r[4] = r4;
+    } else {
+      hle::call_guest(ctx, c->callback, {c.addr, 2});
+    }
+  }
   u32 cur = c->current;
   ppu::w32(cur, (1u << 18) | rsx::m::GCM_FLIP_COMMAND);
   ppu::w32(cur + 4, id);

@@ -321,6 +321,19 @@ void flow_report(const char* why, u32 get, u32 put) {
   }
 }
 
+}  // namespace
+
+void fifo_desync(const char* why, u32 value) {
+  u32 n = g_method_pos.load(std::memory_order_relaxed);
+  for (u32 i = n > 32 ? n - 32 : 0; i < n; ++i)
+    LOG_E("rsx", "  method 0x%04x = 0x%08x", g_method_ring[i & 31][0], g_method_ring[i & 31][1]);
+  std::string what = acfa::strprintf("%s (0x%08x)", why, value);
+  flow_report(what.c_str(), __builtin_bswap32(*reinterpret_cast<volatile u32*>(ppu::mem() + kControlAddr + 4)), ppu::r32(kControlAddr));
+  fatal("RSX FIFO desynchronized: " + what);
+}
+
+namespace {
+
 u32 fifo_read(u32 io) {
   u32 ea;
   if (!io_to_ea(io, &ea)) {

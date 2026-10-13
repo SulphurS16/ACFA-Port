@@ -38,6 +38,9 @@ inline void record_method(u32 method, u32 arg) {
   g_method_pos.store(n + 1, std::memory_order_relaxed);
 }
 void do_flip(u32 id);
+// The FIFO executes words that are not commands (a method argument no command buffer can hold):
+// reports the recent FIFO control flow and methods, then stops with `why`.
+[[noreturn]] void fifo_desync(const char* why, u32 value);
 
 // DMA handle -> location (0 local, 1 main).
 inline u32 dma_location(u32 handle) { return handle == 0xfeed0001 || handle == 0xbad68000 ? 1 : 0; }
