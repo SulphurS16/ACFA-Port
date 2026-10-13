@@ -752,10 +752,9 @@ s32 cellVdecDecodeAu(u32 handle, s32 mode, Ptr<CellVdecAuInfo> au) {
   return CELL_OK;
 }
 
-s32 cellVdecGetPicture(u32 handle, Ptr<CellVdecPicFormat> format, u32 out_buff) {
+s32 get_picture(u32 handle, u32 fmt, u32 matrix, u8 alpha, u32 out_buff) {
   auto v = get(handle);
-  if (!v || !format) return CELL_VDEC_ERROR_ARG;
-  u32 fmt = format->formatType, matrix = format->colorMatrixType;
+  if (!v) return CELL_VDEC_ERROR_ARG;
   if (fmt > kFmtYuv420 || (fmt <= kFmtRgba && matrix > 1)) return CELL_VDEC_ERROR_ARG;
   Picture p;
   u64 seq = 0;
@@ -771,10 +770,27 @@ s32 cellVdecGetPicture(u32 handle, Ptr<CellVdecPicFormat> format, u32 out_buff) 
   if (p.seq != seq) return CELL_VDEC_ERROR_EMPTY;
   static std::atomic<u32> logged{0};
   if (logged.fetch_add(1) < 8)
-    LOG_I("vdec", "handle 0x%x: GetPicture format %u matrix %u alpha %u -> 0x%x (%ux%u)", handle, fmt, matrix, format->alpha,
+    LOG_I("vdec", "handle 0x%x: GetPicture format %u matrix %u alpha %u -> 0x%x (%ux%u)", handle, fmt, matrix, alpha,
           out_buff, p.width, p.height);
-  if (out_buff && !p.yuv.empty()) convert(p, fmt, matrix, format->alpha, ppu::mem() + out_buff);
+  if (out_buff && !p.yuv.empty()) convert(p, fmt, matrix, alpha, ppu::mem() + out_buff);
   return CELL_OK;
+}
+s32 cellVdecGetPicture(u32 handle, Ptr<CellVdecPicFormat> format, u32 out_buff) {
+  if (!format) return CELL_VDEC_ERROR_ARG;
+  return get_picture(handle, format->formatType, format->colorMatrixType, format->alpha, out_buff);
+}
+// The newer libvdec entry (system software 4.x modules): a longer format block and one more
+// argument, zero in the calls seen.
+struct CellVdecPicFormat2 {
+  be32 formatType, colorMatrixType, unk0;
+  u8 alpha;
+  be32 unk1;
+};
+s32 cellVdecGetPictureExt(u32 handle, Ptr<CellVdecPicFormat2> format, u32 out_buff, u32 arg4) {
+  if (!format) return CELL_VDEC_ERROR_ARG;
+  if (arg4 || format->unk0 || format->unk1)
+    LOG_W("vdec", "GetPictureExt with unknown arguments (0x%x, 0x%x, 0x%x)", arg4, u32(format->unk0), u32(format->unk1));
+  return get_picture(handle, format->formatType, format->colorMatrixType, format->alpha, out_buff);
 }
 
 s32 cellVdecGetPicItem(u32 handle, Ptr<be32> item_out) {
@@ -843,6 +859,7 @@ static hle::Module s_module("libvdec", {
     HLE_FN(cellVdecEndSeq),
     HLE_FN(cellVdecGetPicItem),
     HLE_FN(cellVdecGetPicture),
+    HLE_FN(cellVdecGetPictureExt),
     HLE_FN(cellVdecOpen),
     HLE_FN(cellVdecOpenEx),
     HLE_FN(cellVdecQueryAttr),
