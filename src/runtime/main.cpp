@@ -17,7 +17,6 @@
 #include "common/file.h"
 #include "runtime/bindings.h"
 #include "runtime/config.h"
-#include "runtime/datawatch.h"
 #include "runtime/gpu/d3d11_device.h"
 #include "runtime/gpu/display.h"
 #include "runtime/gpu/shader_warm.h"
@@ -111,7 +110,6 @@ int main(int argc, char** argv) {
   c.flash = (data / "game" / "firmware241" / "dev_flash").string();
   c.spu_cache = (data / "spu_cache").string();
   c.shader_cache = (data / "shader_cache").string();
-  c.shader_records = (data / "shader_records").string();
   c.settings_file = settings_override.empty() ? acfa::settings::file_in(data).string() : settings_override;
   std::string shader_manifest = (root / "data" / "shader_manifest.txt").string();
   // Run directory: <data>\runs\<UTC timestamp>
@@ -148,52 +146,14 @@ int main(int argc, char** argv) {
     auto next = [&]() -> std::string { return i + 1 < argc ? argv[++i] : std::string(); };
     if (a == "--data" || a == "--settings" || a == "--keep-runs") next();  // read above
     else if (a == "--disc") c.disc_root = next();
-    else if (a == "--prepared") c.prepared = next();
-    else if (a == "--hdd0") c.hdd0 = next();
-    else if (a == "--flash") c.flash = next();
-    else if (a == "--seconds") c.seconds = std::atof(next().c_str());
-    else if (a == "--trace-hle") c.trace_hle = true;
-    else if (a == "--trace-lle") c.trace_lle = true;
     else if (a == "--log-level") level = next();
-    else if (a == "--headless") c.headless = true;
-    else if (a == "--lenient") c.lenient = true;
-    else if (a == "--trace-spu" && i + 1 < argc) c.trace_spu = argv[++i];
-    else if (a == "--trace-spu-limit" && i + 1 < argc) c.trace_spu_limit = unsigned(std::stoul(argv[++i]));
-    else if (a == "--trace-spu-cats" && i + 1 < argc) c.trace_spu_cats = unsigned(std::stoul(argv[++i]));
-    else if (a == "--profile") c.profile = next();
-    else if (a == "--spu-collect") c.spu_collect = true;
-    else if (a == "--shader-collect") c.shader_collect = true;
     else if (a == "--warm-shaders") c.warm_shaders = true;
-    else if (a == "--spu-interp") c.spu_interp = true;
-    else if (a == "--trace-rsx") c.trace_rsx = unsigned(std::stoul(next()));
-    else if (a == "--trace-rsx-at") c.trace_rsx_at = std::atof(next().c_str());
-    else if (a == "--dump-shaders") c.dump_shaders = true;
-    else if (a == "--shot-surface") c.shot_surface = std::stol(next(), nullptr, 0);
-    else if (a == "--watch-lines") c.watch_lines = next();
-    else if (a == "--watch-access") c.watch_access = next();
-    else if (a == "--dialog") c.dialog_script = next();
-    else if (a == "--profile-at") c.profile_at = std::atof(next().c_str());
-    else if (a == "--profile-split") c.profile_split = std::atof(next().c_str());
-    else if (a == "--frame-report") c.frame_report = std::atof(next().c_str());
-    else if (a == "--skip-fp") c.skip_fp = unsigned(std::stoul(next(), nullptr, 0));
-    else if (a == "--input") c.input_script = next();
-    else if (a == "--control") c.control_file = next();
-    else if (a == "--isolate-input") c.isolate_input = true;
-    else if (a == "--gpu-submit") c.gpu_submit_thread = next() != "off";
-    else if (a == "--priority") c.priority = next();
-    else if (a == "--gpu-timing") c.gpu_timing = 1;
-    else if (a == "--gpu-timing-draws") c.gpu_timing = 2;
-    else if (a == "--spu-cache") c.spu_cache = next();
-    else if (a == "--shader-cache") c.shader_cache = next();
-    else if (a == "--audio-capture") c.audio_capture = true;
-    else if (a == "--gcm-wait") c.gcm_wait_spin = next() == "spin";
+    else if (a == "--shader-manifest") shader_manifest = next();
     else if (a == "--pacing") c.pacing = next();
     else if (a == "--fps") { std::string v = next(); c.fps = v == "display" ? 0 : std::max(30.0, std::atof(v.c_str())); }
     else if (a == "--windowed") c.fullscreen = false, c.windowed = true;
-    else if (a == "--shader-manifest") shader_manifest = next();
     else if (a == "--fullscreen") c.fullscreen = true;
-    else if (a == "--affinity") c.affinity = std::strtoull(next().c_str(), nullptr, 16);
-    else if (a == "--shot-interval") c.shot_interval = std::atof(next().c_str());
+    else if (a == "--priority") c.priority = next();
     else {
       std::fprintf(stderr, "unknown argument %s\n", a.c_str());
       return 2;
@@ -201,17 +161,6 @@ int main(int argc, char** argv) {
   }
   acfa::add_protected_root(c.disc_root);
   log_set_level(level == "trace" ? Level::Trace : level == "debug" ? Level::Debug : Level::Info);
-  hle::g_trace = c.trace_hle;
-  for (size_t p = 0; p < c.watch_lines.size();) {  // --watch-lines ea:size,...
-    size_t q = c.watch_lines.find(',', p);
-    std::string item = c.watch_lines.substr(p, q == std::string::npos ? std::string::npos : q - p);
-    size_t colon = item.find(':');
-    if (colon != std::string::npos)
-      res::watch_add(u32(std::stoul(item.substr(0, colon), nullptr, 0)), u32(std::stoul(item.substr(colon + 1), nullptr, 0)));
-    if (q == std::string::npos) break;
-    p = q + 1;
-  }
-  prof::start(c.profile);
   LOG_I("main", "run dir %s", c.run_dir.c_str());
   if (c.affinity) {  // --affinity MASK (hex): fewer logical CPUs, to estimate smaller machines
     if (SetProcessAffinityMask(GetCurrentProcess(), DWORD_PTR(c.affinity)))
@@ -233,11 +182,6 @@ int main(int argc, char** argv) {
     return w.failed ? 1 : 0;
   }
   for (const auto& n : settings_notes) LOG_I("main", "%s", n.c_str());
-  if (!c.watch_access.empty() && !datawatch::configure(c.watch_access)) return 2;
-  set_fatal_hook([] {
-    prof::write_report(cfg().run_dir + "/profile.txt");
-    datawatch::write_report(cfg().run_dir + "/access.txt");
-  });
   // Optional process priority: with other programs keeping every core busy, each handoff between
   // the game's threads otherwise waits for a time slice (the frame rate collapses); above normal,
   // the game's threads run when they become ready. Off by default: it takes CPU time from other
@@ -277,7 +221,7 @@ int main(int argc, char** argv) {
   }
   lv2_init();
   if (!c.headless) gpu::window_dpi_aware();
-  if (!c.headless && !gpu::window_create("ARMORED CORE for Answer - native port", c.window_w, c.window_h, true))
+  if (!c.headless && !gpu::window_create("ARMORED CORE for Answer", c.window_w, c.window_h, true))
     LOG_E("main", "window creation failed; running without presentation");
   else if (!c.headless && c.fullscreen)
     gpu::window_set_fullscreen(true);
@@ -300,15 +244,11 @@ int main(int argc, char** argv) {
       gpu::shader_stats(&compiled, &cached, &secs);
       LOG_I("main", "shaders: %u compiled (%.1f s), %u from the shader cache", compiled, secs, cached);
     }
-    prof::write_report(c.run_dir + "/profile.txt");
-    prof::cpu_report();
     thread_dump();
     lwmutex_dump();
     lv2::sync_dump();
     lv2::spu_dump();
     vdec_dump();
-    res::watch_dump(c.run_dir + "/watch.txt");
-    datawatch::write_report(c.run_dir + "/access.txt");
     LOG_I("dump", "PPU conditional stores refused by a change elsewhere in the 128-byte granule: %llu",
           (unsigned long long)ppu::granule_conflicts());
     rsx::dump();
@@ -326,7 +266,7 @@ int main(int argc, char** argv) {
       double now = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
       if (now - last_fps_at >= 5) {  // displayed frame rate, for performance tracking
         u64 f = rsx::flips();
-        std::string busy = prof::cpu_interval(4);
+        std::string busy = "-";
         PROCESS_MEMORY_COUNTERS pmc{};
         GetProcessMemoryInfo(GetCurrentProcess(), &pmc, sizeof pmc);
         static u64 last_faults = 0;
@@ -370,14 +310,7 @@ int main(int argc, char** argv) {
       close_at = el;
     }
     if (close_at >= 0 && el - close_at > 5.0) stop("game did not exit within 5 s of the exit request");
-    if (next_shot > 0 && el >= next_shot) {
-      ++gpu::g_capture_requests;
-      next_shot += c.shot_interval;
-    }
-    if (el >= next_title) {
-      next_title = el + 1;
-      if (!c.headless) gpu::window_set_title("ARMORED CORE for Answer - native port | " + rsx::stats());
-    }
-    if (c.seconds > 0 && el >= c.seconds) stop("--seconds limit reached");
+    (void)next_shot;
+    (void)next_title;
   }
 }

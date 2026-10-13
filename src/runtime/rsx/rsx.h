@@ -54,9 +54,6 @@ void wait_get_outside(u32 lo, u32 hi);
 // Debug statistics.
 std::string stats();
 u64 flips();  // flips executed so far
-// Renderer switches for A/B measurements ("gpu NAME VALUE" control command): "submit on|off"
-// (D3D11 calls on their own thread or on the FIFO thread). False for an unknown name or value.
-bool gpu_option(const std::string& name, const std::string& value);
 void dump();  // diagnostics: FIFO pointers, pending semaphore acquire, last methods
 
 }  // namespace rt::rsx

@@ -25,7 +25,7 @@ std::wstring norm(const fs::path& p) {
 
 // Built-in protected roots: the game folder inside the project root (tools run from the root)
 // and, on the development PC, the read/copy-only reference projects and the Manager's records.
-// Each tool also adds the game folder it is given at runtime.
+// Each tool also adds the game folders it is given at runtime.
 std::vector<std::wstring> g_protected = {
     norm(fs::current_path() / "Armored Core - For Answer (USA)"),
 };

@@ -293,6 +293,24 @@ void start_checks() {
   }).detach();
 }
 
+// The install folder must not lie inside a folder holding the game files (nothing is written there).
+bool inside(const fs::path& child, const fs::path& parent) {
+  if (child.empty() || parent.empty()) return false;
+  std::error_code ec;
+  std::wstring c = fs::weakly_canonical(fs::absolute(child, ec), ec).wstring(), p = fs::weakly_canonical(fs::absolute(parent, ec), ec).wstring();
+  for (auto* s : {&c, &p}) {
+    for (auto& ch : *s) ch = wchar_t(towlower(ch));
+    while (s->size() > 3 && (s->back() == L'\\' || s->back() == L'/')) s->pop_back();
+  }
+  return c == p || (c.size() > p.size() && c.compare(0, p.size(), p) == 0 && (c[p.size()] == L'\\' || c[p.size()] == L'/'));
+}
+bool data_ok() {
+  if (g_cfg.data.empty()) return false;
+  for (const fs::path& in : {g_cfg.disc, g_cfg.update.parent_path(), g_cfg.pup.parent_path(), g_cfg.keys.parent_path()})
+    if (inside(g_cfg.data, in)) return false;
+  return true;
+}
+
 bool inputs_ok() {
   std::lock_guard lk(g_check_mu);
   return g_checks[0].verdict == Verdict::Ok && g_checks[1].verdict != Verdict::Bad && g_checks[2].verdict == Verdict::Ok &&
@@ -302,6 +320,10 @@ bool inputs_ok() {
 void update_space() {
   if (g_cfg.data.empty()) {
     set_text(kDataState, L"Choose where the port keeps its files.");
+    return;
+  }
+  if (!data_ok()) {
+    set_text(kDataState, L"Choose a folder outside the game files' folders.");
     return;
   }
   fs::path p = g_cfg.data;
@@ -316,7 +338,7 @@ void update_space() {
 void update_buttons() {
   bool busy = g_setup.running(), playing = g_game != nullptr;
   g_ready = !g_cfg.data.empty() && Setup::ready(g_cfg);
-  EnableWindow(item(kPrepare), !busy && !playing && inputs_ok() && !g_cfg.data.empty());
+  EnableWindow(item(kPrepare), !busy && !playing && inputs_ok() && data_ok());
   EnableWindow(item(kCancel), busy);
   EnableWindow(item(kPlay), !busy && !playing && g_ready && inputs_ok());
   for (int id : {kDiscBrowse, kUpdateBrowse, kPupBrowse, kKeysBrowse, kDataBrowse, kDiscEdit, kUpdateEdit, kPupEdit, kKeysEdit, kDataEdit})

@@ -12,6 +12,16 @@ endif()
 
 add_compile_definitions(_WIN32_WINNT=0x0A00 WINVER=0x0A00 NOMINMAX UNICODE _UNICODE)
 
+# Developer diagnostics (control-file commands, profiler, memory search and watchpoints, traces,
+# frame reports, A/B switches, test autopilot). Off in player builds: compiled out, and the
+# release export (tools\release) removes their code.
+option(ACFA_DEV "Build with developer diagnostics" OFF)
+if(ACFA_DEV)
+  add_compile_definitions(ACFA_DEV=1)
+else()
+  add_compile_definitions(ACFA_DEV=0)
+endif()
+
 # Self-contained executables (no libc++/libunwind DLLs next to them), reproducible: no build
 # paths or link timestamps in the binaries.
 if(MINGW)
@@ -130,7 +140,3 @@ target_compile_options(acfa-launcher PRIVATE -Wall -Wextra -Wno-missing-field-in
 set_target_properties(acfa-launcher PROPERTIES OUTPUT_NAME ACFA-Launcher)
 
 # ---- media decoder test tool (development: checks the MPEG-2 decoder on the user's movies) ----
-add_executable(acfa-vdectest src/tools/vdectest.cpp src/runtime/media/mpeg2_video.cpp src/runtime/gpu/png.cpp)
-target_include_directories(acfa-vdectest PRIVATE ${CMAKE_SOURCE_DIR}/src)
-target_link_libraries(acfa-vdectest PRIVATE acfa_common mfplat mfuuid ole32 winmm)
-target_compile_options(acfa-vdectest PRIVATE ${ACFA_CPU_FLAGS} -Wall -Wextra -Wno-unused-parameter -g)

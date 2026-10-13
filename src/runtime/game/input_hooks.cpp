@@ -12,8 +12,6 @@
 
 #include "ppu/ppu_recomp.h"
 #include "runtime/bindings.h"
-#include "runtime/datawatch.h"
-#include "runtime/game/game_input.h"
 #include "runtime/input.h"
 #include "runtime/log.h"
 #include "runtime/memory.h"
@@ -22,49 +20,11 @@
 namespace ppu {
 namespace {
 
-// Publishes the port 0 pad object ("pad") and its normalized stick floats ("sticks": right X,
-// right Y, left X, left Y) as bases for --watch-access.
-void publish(u32 pad, u32 port_offset, u32 sticks_offset) {
-  if (r32(pad + port_offset) != 0) return;
-  static std::atomic<u32> logged{0};
-  if (logged.exchange(pad) != pad)
-    LOG_I("input", "port 0 pad object 0x%08x, stick floats at 0x%08x (right X, right Y, left X, left Y)", pad,
-          pad + sticks_offset);
-  rt::datawatch::set_base("pad", pad);
-  rt::datawatch::set_base("sticks", pad + sticks_offset);
-}
-
-// Inputs served by the axis accessor 0x70b610 (first come, first served; diagnostics).
-struct AxisSlot {
-  std::atomic<u32> input{0}, value{0}, forced{0};  // value / forced: float bits
-  std::atomic<u64> reads{0};
-  std::atomic<bool> overridden{false};
-};
-AxisSlot g_axes[48];
-
-AxisSlot* axis_slot(u32 input) {
-  for (AxisSlot& s : g_axes) {
-    u32 cur = s.input.load(std::memory_order_relaxed);
-    if (cur == input) return &s;
-    if (cur == 0) {
-      u32 expected = 0;
-      if (s.input.compare_exchange_strong(expected, input) || expected == input) return &s;
-    }
-  }
-  return nullptr;
-}
-
 float f32_of_bits(u32 bits) {
   float f;
   std::memcpy(&f, &bits, 4);
   return f;
 }
-u32 bits_of_f32(float f) {
-  u32 bits;
-  std::memcpy(&bits, &f, 4);
-  return bits;
-}
-
 // ---- Mouse look ----
 // Each AC's operator writes its turn command into a virtual pad state with 0x70eb30(input, value)
 // (the player's: the stick after the input layer's dead zone (~0.4) and curve, from 0x6eee98); the
@@ -75,7 +35,6 @@ u32 bits_of_f32(float f) {
 // any frame rate, within the AC's own turn rate limit. Input objects of every class (the player's
 // seen with vtables 0x1228610 and 0x1228550, AI-driven ACs' 0x122e3c8) read their virtual pad
 // state at +12 (vtable slot 2, 0x70b540); the player's is the one the operator writes.
-constexpr u32 kAiInputVtable = 0x0122e3c8;
 // The player operator sets the turn and pitch commands through a temporary view object on the
 // stack (vtable 0x1226c30); AI-driven units do not use that class. The operator code differs by
 // state: the reference saw the calls from 0x6eee98 (return sites 0x6ef030 turn, 0x6ef110 /
@@ -109,13 +68,7 @@ MouseAxis g_mouse_turn, g_mouse_pitch;
 std::atomic<u32> g_turn_input{0};    // last player turn input seen (diagnostics)
 std::atomic<u32> g_player_state{0};  // the player's virtual pad state (written through the view)
 std::atomic<u32> g_look{0};          // the player AC's look control object (diagnostics)
-std::atomic<int> g_trace_left{0};  // diagnostics: player turn reads / pad updates still to log
 LARGE_INTEGER g_last_turn{};       // time of the last mouse look computation
-
-// The player AC's world position (x, y, z, 1) lies at its look control - 0xD49C (found by memory
-// search, runs 190713 / 191255; four ACs in the first mission run the look update, the AI-driven
-// normals do not). Diagnostics only (axes command).
-constexpr u32 kLookToPosition = 0xD49C;
 
 bool is_player_input(u32 input) {
   u32 state = g_player_state.load(std::memory_order_relaxed);
@@ -170,35 +123,10 @@ void mouse_look_frame() {
 
 }  // namespace
 
-// Input axis accessor (0x70b610: out = the input's axis value, clamped). Records each input's
-// latest value; a forced value (axis control command) replaces what the game reads.
-void hook_input_axis_get(Ctx& ctx, void (*orig)(Ctx&)) {
-  u32 out = u32(ctx.r[3]), input = u32(ctx.r[4]);
-  orig(ctx);
-  if (g_trace_left.load(std::memory_order_relaxed) > 0 && is_player_input(input) && g_trace_left.fetch_sub(1) > 0)
-    LOG_I("input", "trace: turn read 0x%08x at 0x%08x, flip %llu, returned %.3f", input, u32(ctx.lr),
-          (unsigned long long)rt::rsx::flips(), double(f32_of_bits(r32(out))));
-  AxisSlot* s = axis_slot(input);
-  if (!s) return;
-  s->value.store(r32(out), std::memory_order_relaxed);
-  s->reads.fetch_add(1, std::memory_order_relaxed);
-  if (s->overridden.load(std::memory_order_relaxed)) w32(out, s->forced.load(std::memory_order_relaxed));
-}
-
 // Turn command setter (0x70eb30: r3 input object, f1 value). For the player's input object the
 // mouse turn of this frame is added to the stick's value.
 void hook_input_turn_set(Ctx& ctx, void (*orig)(Ctx&)) {
   u32 input = u32(ctx.r[3]);
-  {  // diagnostics: the call sites seen (the first 8 distinct ones)
-    static std::mutex mu;
-    static std::vector<u32> sites;
-    std::lock_guard lk(mu);
-    u32 lr = u32(ctx.lr);
-    if (sites.size() < 8 && std::find(sites.begin(), sites.end(), lr) == sites.end()) {
-      sites.push_back(lr);
-      LOG_I("input", "turn command setter called from 0x%08x (input 0x%08x, vtable %08x)", lr, input, input ? r32(input) : 0);
-    }
-  }
   if (u32(ctx.lr) == kPlayerTurnSetSite || (input && r32(input) == kPlayerViewVtable)) {
     static int logged = 0;
     if (g_turn_input.exchange(input) != input && logged++ < 4)
@@ -208,8 +136,6 @@ void hook_input_turn_set(Ctx& ctx, void (*orig)(Ctx&)) {
     mouse_look_frame();
     float stick = float(ctx.f[1]);
     if (g_mouse_turn.value != 0) ctx.f[1] = double(std::clamp(stick + g_mouse_turn.value, -1.0f, 1.0f));
-    if (g_trace_left.load(std::memory_order_relaxed) > 0 && g_trace_left.fetch_sub(1) > 0)
-      LOG_I("input", "trace: turn set 0x%08x, stick %.3f, set %.3f", input, double(stick), ctx.f[1]);
   }
   orig(ctx);
 }
@@ -218,23 +144,11 @@ void hook_input_turn_set(Ctx& ctx, void (*orig)(Ctx&)) {
 // mouse pitch of this frame is added to the stick's value (after the game's own inversion option).
 void hook_input_pitch_set(Ctx& ctx, void (*orig)(Ctx&)) {
   u32 lr = u32(ctx.lr);
-  {  // diagnostics: the call sites seen (the first 8 distinct ones)
-    static std::mutex mu;
-    static std::vector<u32> sites;
-    std::lock_guard lk(mu);
-    u32 view = u32(ctx.r[3]);
-    if (sites.size() < 8 && std::find(sites.begin(), sites.end(), lr) == sites.end()) {
-      sites.push_back(lr);
-      LOG_I("input", "pitch command setter called from 0x%08x (view 0x%08x, vtable %08x)", lr, view, view ? r32(view) : 0);
-    }
-  }
   u32 view = u32(ctx.r[3]);
   if (lr == kPlayerPitchSetSites[0] || lr == kPlayerPitchSetSites[1] ||
       (view && r32(view) == kPlayerViewVtable)) {
     float stick = float(ctx.f[1]);
     if (g_mouse_pitch.value != 0) ctx.f[1] = double(std::clamp(stick + g_mouse_pitch.value, -1.0f, 1.0f));
-    if (g_trace_left.load(std::memory_order_relaxed) > 0 && g_trace_left.fetch_sub(1) > 0)
-      LOG_I("input", "trace: pitch set from 0x%08x, stick %.3f, set %.3f", lr, double(stick), ctx.f[1]);
   }
   orig(ctx);
 }
@@ -251,78 +165,5 @@ void hook_look_update(Ctx& ctx, void (*orig)(Ctx&)) {
   orig(ctx);
 }
 
-// Pad object updates, once per frame and port: cellPadGetData(port) into the object, then the
-// sticks normalized to floats in [-1, 1]. Two classes with the same layout at different offsets.
-void hook_pad_update(Ctx& ctx, void (*orig)(Ctx&)) {
-  run_pending_guest_calls(ctx);  // test shortcuts queued from the control file (script_hooks.cpp)
-  u32 pad = u32(ctx.r[3]);
-  orig(ctx);
-  publish(pad, 696, 1484);
-}
-
-void hook_pad_update_b(Ctx& ctx, void (*orig)(Ctx&)) {
-  run_pending_guest_calls(ctx);
-  u32 pad = u32(ctx.r[3]);
-  orig(ctx);
-  publish(pad, 372, 1160);
-  if (r32(pad + 372) == 0 && g_trace_left.load(std::memory_order_relaxed) > 0 && g_trace_left.fetch_sub(1) > 0)
-    LOG_I("input", "trace: pad update (port 0), flip %llu", (unsigned long long)rt::rsx::flips());
-}
-
 }  // namespace ppu
 
-namespace rt::game {
-
-void axes_dump() {
-  if (u32 look = ppu::g_look.load(); look && vm::committed(look + 48, 40)) {  // the player's look pitch (0x7a22d0)
-    u32 p = look + 48;
-    auto f = [&](u32 off) { return double(ppu::f32_of_bits(ppu::r32(p + off))); };
-    LOG_I("input", "look pitch 0x%08x: angle %g, velocity %g, mode %u, max speed %g, drag %g, limits %g .. %g", p, f(0), f(4),
-          ppu::r32(p + 20), f(24), f(28), f(36), f(32));
-  }
-  if (u32 look = ppu::g_look.load(); look && vm::committed(look - ppu::kLookToPosition, 12)) {
-    u32 pos = look - ppu::kLookToPosition;
-    auto f = [](u32 a) { return double(ppu::f32_of_bits(ppu::r32(a))); };
-    LOG_I("input", "player AC position 0x%08x: %.2f %.2f %.2f", pos, f(pos), f(pos + 4), f(pos + 8));
-  }
-  for (const auto& s : ppu::g_axes) {
-    u32 input = s.input.load();
-    if (!input) break;
-    if (!vm::committed(input, 16)) continue;  // a stack temporary's frame may be gone
-    u32 vt = ppu::r32(input);
-    bool player = ppu::is_player_input(input);
-    LOG_I("input", "axis input 0x%08x: %llu reads, value %g%s, %s (vtable %08x)", input, (unsigned long long)s.reads.load(),
-          double(ppu::f32_of_bits(s.value.load())),
-          s.overridden.load() ? acfa::strprintf(" (forced %g)", double(ppu::f32_of_bits(s.forced.load()))).c_str() : "",
-          player ? "player" : vt == ppu::kAiInputVtable ? "ai" : "other", vt);
-    if (!player) continue;
-    for (u32 field : {8u, 12u}) {  // the virtual pad state copies the player's input refers to
-      u32 obj = ppu::r32(input + field) & ~3u;
-      if (!vm::committed(obj, 64)) continue;
-      std::string w;
-      for (u32 i = 0; i < 16; ++i) w += acfa::strprintf(" %08x", ppu::r32(obj + 4 * i));
-      LOG_I("input", "  +%u -> 0x%08x:%s", field, obj, w.c_str());
-    }
-  }
-}
-
-void turn_trace(int n) { ppu::g_trace_left = n; }
-
-bool axis_command(const std::string& args) {
-  std::istringstream in(args);
-  std::string a, v;
-  in >> a >> v;
-  if (a.empty() || v.empty()) return false;
-  ppu::AxisSlot* s = ppu::axis_slot(u32(std::stoul(a, nullptr, 0)));
-  if (!s) return false;
-  if (v == "off") {
-    s->overridden = false;
-  } else {
-    s->forced = ppu::bits_of_f32(std::stof(v));
-    s->overridden = true;
-  }
-  LOG_I("input", "axis input %s: %s", a.c_str(), v == "off" ? "game value" : ("forced " + v).c_str());
-  return true;
-}
-
-}  // namespace rt::game

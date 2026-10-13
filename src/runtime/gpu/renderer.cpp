@@ -39,7 +39,6 @@
 namespace rt::gpu {
 std::atomic<int> g_capture_requests{0};
 std::atomic<u32> g_capture_index{0};
-std::atomic<int> g_framehash_requests{0}, g_framehash_total{0};  // "framehash N" (maybe_capture)
 }  // namespace rt::gpu
 
 namespace rt::rsx {
@@ -1232,44 +1231,6 @@ float half_to_float(u16 h) {
   return f32_of(f);
 }
 
-// Converts one element of `type` with `size` components at `p` to float4 (rsx_facts.md §4.2).
-void convert_attr(u32 type, u32 size, const u8* p, float* out) {
-  out[0] = out[1] = out[2] = 0;
-  out[3] = 1;
-  auto be16 = [](const u8* q) { return u16((q[0] << 8) | q[1]); };
-  auto be32 = [](const u8* q) { return (u32(q[0]) << 24) | (u32(q[1]) << 16) | (u32(q[2]) << 8) | q[3]; };
-  switch (type) {
-    case 1:  // S16 normalized
-      for (u32 c = 0; c < size; ++c) out[c] = (float(s16(be16(p + 2 * c))) + 0.5f) / 32767.5f;
-      break;
-    case 2:  // F32
-      for (u32 c = 0; c < size; ++c) out[c] = f32_of(be32(p + 4 * c));
-      break;
-    case 3:  // F16
-      for (u32 c = 0; c < size; ++c) out[c] = half_to_float(be16(p + 2 * c));
-      break;
-    case 4:  // U8 normalized
-      for (u32 c = 0; c < size; ++c) out[c] = p[c] / 255.0f;
-      break;
-    case 5:  // S16 unnormalized
-      for (u32 c = 0; c < size; ++c) out[c] = float(s16(be16(p + 2 * c)));
-      break;
-    case 6: {  // CMP 11:11:10
-      u32 v = be32(p);
-      out[0] = float(s16(u16((v & 0x7ff) << 5))) / 32767.0f;
-      out[1] = float(s16(u16(((v >> 11) & 0x7ff) << 5))) / 32767.0f;
-      out[2] = float(s16(u16(((v >> 22) & 0x3ff) << 6))) / 32767.0f;
-      break;
-    }
-    case 0:
-    case 7:  // U8 unnormalized
-      for (u32 c = 0; c < size; ++c) out[c] = p[c];
-      break;
-    default:
-      break;
-  }
-}
-
 u32 type_size(u32 type) {
   switch (type) {
     case 1: case 3: case 5: return 2;
@@ -1354,14 +1315,6 @@ u8* raw_space(u32 n, u32* offset) {
   *offset = g_raw_pos;
   g_raw_pos += n;
   return static_cast<u8*>(gpu::rec().write_buffer_space(g_raw, mode, *offset, n));
-}
-
-// One attribute element at element index k, converted on the CPU (frame report only).
-void cpu_fetch(const AttrSrc& s, u32 k, float* out) {
-  u32 kk = k;
-  if (s.freq > 1) kk = s.modulo ? k % s.freq : k / s.freq;
-  if (s.stride == 0) kk = 0;
-  convert_attr(s.type, std::min(s.size, 4u), ::ppu::mem() + s.ea + size_t(kk) * s.stride, out);
 }
 
 // Appends `n` indices; returns the start index for the draw.
@@ -1452,228 +1405,12 @@ struct FpState {
   float tex_scale[16][4];
 };
 
-// ---------------------------------------------------------------------------------------------
-// Diagnostics (--frame-report T): the first complete frame after T seconds is logged clear by
-// clear and draw by draw (channel "frame"), and every surface it touched is written as PNG to
-// <run>/frame/.
-struct FrameReport {
-  int state = 0;  // 0 waiting, 1 recording, 2 done
-  u32 draws = 0, dropped = 0, clears = 0;
-  std::vector<Surface*> touched;
-  struct Tex {
-    ID3D11ShaderResourceView* srv;  // referenced until written
-    std::string name;
-    u32 w, h;
-  };
-  std::vector<Tex> textures;  // memory textures sampled in the frame (2D)
-} g_fr;
-void fr_texture(ID3D11ShaderResourceView* srv, const gpu::TexDesc& t) {
-  if (!srv || t.dim != 2 || t.cubemap || !t.width || !t.height) return;
-  for (const auto& x : g_fr.textures)
-    if (x.srv == srv) return;
-  srv->AddRef();
-  g_fr.textures.push_back({srv, acfa::strprintf("t_%s%08x_f%02x_%ux%u.png", t.location ? "m" : "l", t.offset, t.format, t.width, t.height),
-                           t.width, t.height});
-}
-bool fr_on() { return g_fr.state == 1; }
-void fr_forget(Surface* s) { g_fr.touched.erase(std::remove(g_fr.touched.begin(), g_fr.touched.end(), s), g_fr.touched.end()); }
-void fr_touch(Surface* s) {
-  if (s && std::find(g_fr.touched.begin(), g_fr.touched.end(), s) == g_fr.touched.end()) g_fr.touched.push_back(s);
-}
-std::string surf_desc(const Surface* s) {
-  return s ? acfa::strprintf("%s%x %ux%u f%u", s->location ? "M:" : "", s->offset, s->width, s->height, s->format) : "-";
-}
-std::string targets_desc(const Targets& t) {
-  std::string r = "rt[";
-  for (u32 i = 0; i < t.count; ++i) r += (i ? ", " : "") + surf_desc(t.color[i]);
-  return r + "] z[" + surf_desc(t.depth) + "]";
-}
-void fr_drop(const char* why) {
-  if (!fr_on()) return;
-  ++g_fr.dropped;
-  LOG_I("frame", "  draw dropped: %s", why);
-}
+// Player builds: no frame reports.
+constexpr bool fr_on() { return false; }
+void fr_forget(Surface*) {}
+void fr_drop(const char*) {}
 
-// Reads a surface back as 8-bit RGBA (float formats clamped, depth normalised to its range).
-bool read_surface(Surface* s, std::vector<u8>& out, std::string* note) {
-  gpu::rec().finish();  // the submission thread is idle until the next flush: direct context use
-  D3D11_TEXTURE2D_DESC td{};
-  s->tex->GetDesc(&td);
-  td.Usage = D3D11_USAGE_STAGING;
-  td.BindFlags = 0;
-  td.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
-  td.MiscFlags = 0;
-  ID3D11Texture2D* st = nullptr;
-  if (FAILED(device().dev->CreateTexture2D(&td, nullptr, &st))) return false;
-  device().ctx->CopyResource(st, s->tex);
-  D3D11_MAPPED_SUBRESOURCE ms{};
-  if (FAILED(device().ctx->Map(st, 0, D3D11_MAP_READ, 0, &ms))) {
-    st->Release();
-    return false;
-  }
-  u32 w = td.Width, h = td.Height;
-  out.assign(size_t(w) * h * 4, 255);
-  auto u8c = [](float v) { return u8(std::clamp(v, 0.0f, 1.0f) * 255.0f + 0.5f); };
-  std::vector<float> depth;
-  for (u32 y = 0; y < h; ++y) {
-    const u8* row = static_cast<const u8*>(ms.pData) + size_t(y) * ms.RowPitch;
-    u8* o = &out[size_t(y) * w * 4];
-    for (u32 x = 0; x < w; ++x, o += 4) {
-      switch (td.Format) {
-        case DXGI_FORMAT_R8G8B8A8_UNORM: std::memcpy(o, row + 4 * x, 4); break;
-        case DXGI_FORMAT_R16G16B16A16_FLOAT:
-          for (int c = 0; c < 4; ++c) {
-            u16 hv;
-            std::memcpy(&hv, row + 8 * x + 2 * c, 2);
-            o[c] = u8c(half_to_float(hv));
-          }
-          break;
-        case DXGI_FORMAT_R32G32B32A32_FLOAT:
-          for (int c = 0; c < 4; ++c) {
-            float f;
-            std::memcpy(&f, row + 16 * x + 4 * c, 4);
-            o[c] = u8c(f);
-          }
-          break;
-        case DXGI_FORMAT_R32_FLOAT: {
-          float f;
-          std::memcpy(&f, row + 4 * x, 4);
-          o[0] = o[1] = o[2] = u8c(f);
-          break;
-        }
-        case DXGI_FORMAT_R24G8_TYPELESS: {
-          u32 v;
-          std::memcpy(&v, row + 4 * x, 4);
-          depth.push_back(float(v & 0xffffff) / 16777215.0f);
-          break;
-        }
-        case DXGI_FORMAT_R16_TYPELESS: {
-          u16 v;
-          std::memcpy(&v, row + 2 * x, 2);
-          depth.push_back(float(v) / 65535.0f);
-          break;
-        }
-        default: break;
-      }
-    }
-  }
-  device().ctx->Unmap(st, 0);
-  st->Release();
-  if (!depth.empty()) {
-    auto [lo, hi] = std::minmax_element(depth.begin(), depth.end());
-    float a = *lo, b = *hi;
-    *note = acfa::strprintf("depth range %.6f..%.6f", a, b);
-    for (size_t i = 0; i < depth.size(); ++i) {
-      u8 g = b > a ? u8c((depth[i] - a) / (b - a)) : 0;
-      out[4 * i] = out[4 * i + 1] = out[4 * i + 2] = g;
-    }
-  }
-  return true;
-}
-
-// Writes mip 0 of a texture as PNG (decoded by the GPU: compressed formats included).
-ID3D11VertexShader* g_tl_vs = nullptr;
-ID3D11PixelShader* g_tl_ps = nullptr;
-const char* kTexLoadHlsl = R"(
-Texture2D t0 : register(t0);
-float4 vs_main(uint id : SV_VertexID) : SV_Position {
-  float2 uv = float2((id << 1) & 2, id & 2);
-  return float4(uv * float2(2, -2) + float2(-1, 1), 0, 1);
-}
-float4 ps_main(float4 pos : SV_Position) : SV_Target0 { return t0.Load(int3(pos.xy, 0)); }
-)";
-bool dump_texture(ID3D11ShaderResourceView* srv, u32 w, u32 h, const std::string& path) {
-  auto* dev = device().dev;
-  auto* c = &gpu::rec();
-  if (!g_tl_vs) {
-    ID3DBlob* vs = gpu::compile_hlsl(kTexLoadHlsl, "vs_main", "vs_5_0");
-    ID3DBlob* ps = gpu::compile_hlsl(kTexLoadHlsl, "ps_main", "ps_5_0");
-    if (vs) dev->CreateVertexShader(vs->GetBufferPointer(), vs->GetBufferSize(), nullptr, &g_tl_vs);
-    if (ps) dev->CreatePixelShader(ps->GetBufferPointer(), ps->GetBufferSize(), nullptr, &g_tl_ps);
-    release(vs);
-    release(ps);
-    if (!g_tl_vs || !g_tl_ps) return false;
-  }
-  D3D11_TEXTURE2D_DESC td{};
-  td.Width = w;
-  td.Height = h;
-  td.MipLevels = 1;
-  td.ArraySize = 1;
-  td.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
-  td.SampleDesc.Count = 1;
-  td.BindFlags = D3D11_BIND_RENDER_TARGET;
-  ID3D11Texture2D* rt = nullptr;
-  ID3D11RenderTargetView* rtv = nullptr;
-  if (FAILED(dev->CreateTexture2D(&td, nullptr, &rt))) return false;
-  dev->CreateRenderTargetView(rt, nullptr, &rtv);
-  c->OMSetRenderTargets(1, &rtv, nullptr);
-  D3D11_VIEWPORT v{0, 0, float(w), float(h), 0, 1};
-  c->RSSetViewports(1, &v);
-  D3D11_BLEND_DESC bd{};
-  bd.RenderTarget[0].RenderTargetWriteMask = D3D11_COLOR_WRITE_ENABLE_ALL;
-  D3D11_DEPTH_STENCIL_DESC dd{};
-  D3D11_RASTERIZER_DESC rd{};
-  rd.FillMode = D3D11_FILL_SOLID;
-  rd.CullMode = D3D11_CULL_NONE;
-  c->OMSetBlendState(blend_state(bd), nullptr, 0xffffffff);
-  c->OMSetDepthStencilState(depth_state(dd), 0);
-  c->RSSetState(raster_state(rd));
-  c->IASetInputLayout(nullptr);
-  c->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
-  c->VSSetShader(g_tl_vs, nullptr, 0);
-  c->PSSetShader(g_tl_ps, nullptr, 0);
-  c->PSSetShaderResources(0, 1, &srv);
-  c->Draw(3, 0);
-  ID3D11ShaderResourceView* none = nullptr;
-  c->PSSetShaderResources(0, 1, &none);
-  ID3D11RenderTargetView* no_rt = nullptr;
-  c->OMSetRenderTargets(1, &no_rt, nullptr);
-  shadow_reset();
-  gpu::rec().finish();  // the draw has run; direct context use until the next flush
-  std::vector<u8> rgba;
-  u32 rw = 0, rh = 0;
-  bool ok = gpu::read_back_texture(rt, rgba, rw, rh) && gpu::write_png(path, rw, rh, rgba);
-  release(rtv);
-  release(rt);
-  return ok;
-}
-
-void fr_frame_boundary() {
-  if (cfg().frame_report < 0 || g_fr.state == 2) return;
-  static int frames_left = 2;  // two frames: work done every other frame (e.g. ACFA's sun test) shows up
-  if (g_fr.state == 0) {
-    if (log_time() < cfg().frame_report) return;
-    g_fr.state = 1;
-    LOG_I("frame", "frame report: frame %llu begins", (unsigned long long)g_frame);
-    return;
-  }
-  if (--frames_left > 0) {
-    LOG_I("frame", "frame report: frame %llu begins", (unsigned long long)g_frame);
-    return;
-  }
-  g_fr.state = 2;
-  LOG_I("frame", "frame report: %u clear(s), %u draw(s), %u dropped; %zu surface(s):", g_fr.clears, g_fr.draws, g_fr.dropped,
-        g_fr.touched.size());
-  std::filesystem::path dir = std::filesystem::path(cfg().run_dir) / "frame";
-  std::error_code ec;
-  std::filesystem::create_directories(dir, ec);
-  for (Surface* s : g_fr.touched) {
-    std::vector<u8> rgba;
-    std::string note;
-    std::string name = acfa::strprintf("%s_%s%08x_%ux%u_f%u.png", s->depth ? "z" : "c", s->location ? "m" : "l", s->offset, s->width,
-                                       s->height, s->format);
-    if (read_surface(s, rgba, &note) && gpu::write_png((dir / name).string(), s->width, s->height, rgba))
-      LOG_I("frame", "  %s %s", name.c_str(), note.c_str());
-    else
-      LOG_I("frame", "  %s: not readable", name.c_str());
-  }
-  for (auto& t : g_fr.textures) {
-    if (!dump_texture(t.srv, t.w, t.h, (dir / t.name).string())) LOG_I("frame", "  %s: not readable", t.name.c_str());
-    release(t.srv);
-  }
-  LOG_I("frame", "  %zu memory texture(s) written", g_fr.textures.size());
-  g_fr.textures.clear();
-}
+void fr_frame_boundary() {}
 
 // Whether a draw can change its depth surface under the state set_pipeline_state gives it: depth
 // writes need the depth test, stencil writes a nonzero write mask and an operation other than
@@ -2455,48 +2192,9 @@ void flush_draw() {
   ++g_write_serial;
   for (u32 i = 0; i < t.count; ++i) t.color[i]->written = g_write_serial;
   if (depth_changed(t)) t.depth->written = g_write_serial;
-  if (fr_on()) {
-    ++g_fr.draws;
-    for (u32 i = 0; i < t.count; ++i) fr_touch(t.color[i]);
-    fr_touch(t.depth);
-    std::string tx;
-    for (u32 u = 0; u < 16; ++u) {
-      if (!((ps->info.tex_mask >> u) & 1) || !tex[u].enabled) continue;
-      Surface* ts = texture_surface(tex[u]);
-      fr_touch(ts);
-      if (!ts) fr_texture(srvs[u], tex[u]);
-      tx += acfa::strprintf(" t%u=%s%x/f%02x/%ux%u/%s%s", u, tex[u].location ? "M:" : "", tex[u].offset, tex[u].format, tex[u].width,
-                            tex[u].height, ts ? "surf" : "mem", srvs[u] ? "" : "(unbound)");
-    }
-    LOG_I("frame", "draw %u prim %u verts %u idx %u %s vp %u fp %08x zt %d/%x/%d blend %d cull %x%s", g_fr.draws, prim, nverts,
-          geo.ib ? geo.count : 0, targets_desc(t).c_str(), reg(m::SET_TRANSFORM_PROGRAM_START), sp, reg(m::SET_DEPTH_TEST_ENABLE) ? 1 : 0,
-          reg(m::SET_DEPTH_FUNC), reg(m::SET_DEPTH_MASK) ? 1 : 0, reg(m::SET_BLEND_ENABLE) ? 1 : 0,
-          reg(m::SET_CULL_FACE_ENABLE) ? reg(m::SET_CULL_FACE) : 0, tx.c_str());
-    if (nverts <= 64 && !geo.inline_data) {  // small draws (particles, HUD): vertex inputs of the first elements
-      std::string in;
-      for (u32 i = 0; i < 16; ++i) {
-        if (!((mask >> i) & 1)) continue;
-        in += a[i].array ? acfa::strprintf(" i%u:t%u s%u st%u", i, a[i].type, a[i].size, a[i].stride) : acfa::strprintf(" i%u:imm", i);
-        for (u32 v = 0; v < std::min(nverts, 2u); ++v) {
-          float f[4];
-          if (a[i].array) cpu_fetch(a[i], geo.lo + v, f);
-          else std::memcpy(f, g_imm[i], 16);
-          in += acfa::strprintf(" (%g %g %g %g)", f[0], f[1], f[2], f[3]);
-        }
-      }
-      LOG_I("frame", "  inputs:%s", in.c_str());
-    }
-  }
 }
 
-void fr_clear(const Targets& t, u32 mask) {
-  if (!fr_on()) return;
-  ++g_fr.clears;
-  for (u32 i = 0; i < t.count; ++i) fr_touch(t.color[i]);
-  fr_touch(t.depth);
-  LOG_I("frame", "clear mask 0x%x %s color 0x%08x z 0x%08x", mask, targets_desc(t).c_str(), reg(m::SET_COLOR_CLEAR_VALUE),
-        reg(m::SET_ZSTENCIL_CLEAR_VALUE));
-}
+void fr_clear(const Targets&, u32) {}
 
 void reset_clause() {
   g_ranges.clear();
@@ -2517,83 +2215,7 @@ void set_immediate(u32 attr, u32 comp_mask, const float* v) {
   }
 }
 
-// Captures do not stall the frame: the copy is read back once the GPU has finished it and the PNG
-// is encoded on a worker thread.
-// Distinct-frame check ("framehash N" control command): the next N presented frames are read back
-// and hashed; consecutive frames with equal hashes are repeats (frames the game presented without
-// new content). Readbacks that cannot keep up skip frames; only pairs of consecutive frame numbers
-// are compared.
-std::mutex g_fh_mu;
-std::vector<std::pair<u32, u64>> g_fh;  // (frame number, hash)
-u32 g_fh_expect = 0;
-void framehash_done(u32 frame, u64 h) {
-  std::lock_guard lk(g_fh_mu);
-  g_fh.push_back({frame, h});
-  if (g_fh.size() < g_fh_expect) return;
-  std::sort(g_fh.begin(), g_fh.end());
-  u32 pairs = 0, repeats = 0, longest = 0, run = 0;
-  for (size_t i = 1; i < g_fh.size(); ++i) {
-    if (g_fh[i].first != g_fh[i - 1].first + 1) {
-      run = 0;
-      continue;
-    }
-    ++pairs;
-    if (g_fh[i].second == g_fh[i - 1].second) {
-      ++repeats;
-      longest = std::max(longest, ++run);
-    } else {
-      run = 0;
-    }
-  }
-  LOG_I("perf", "framehash: %zu frames hashed (%u..%u), %u consecutive pairs, %u identical to the previous frame (%.1f%%), "
-        "longest run of repeats %u", g_fh.size(), g_fh.front().first, g_fh.back().first, pairs, repeats,
-        pairs ? 100.0 * repeats / pairs : 0.0, longest);
-  g_fh.clear();
-  g_fh_expect = 0;
-}
-
-void maybe_capture() {
-  gpu::rec().call([](ID3D11DeviceContext*) {  // in stream order, after the frame's presentation
-    gpu::poll_captures([](u32 n, std::vector<u8>&& rgba, u32 w, u32 h) {
-      if (n & 0x80000000u) {  // a framehash readback: n holds the frame number
-        std::thread([n, px = std::move(rgba)] { framehash_done(n & 0x7fffffffu, hash_bytes(px.data(), px.size())); }).detach();
-        return;
-      }
-      std::thread([n, w, h, px = std::move(rgba)] {
-        std::string path = cfg().run_dir + acfa::strprintf("\\shot_%04u.png", n);
-        bool uniform = !px.empty();  // a frame of one color usually means nothing was drawn: say so
-        for (size_t i = 4; i < px.size() && uniform; i += 4) uniform = std::memcmp(&px[i], &px[0], 4) == 0;
-        if (gpu::write_png(path, w, h, px))
-          LOG_I("gpu", "captured %s (%ux%u%s)", path.c_str(), w, h,
-                uniform ? acfa::strprintf(", uniform color %02x%02x%02x", px[0], px[1], px[2]).c_str() : "");
-      }).detach();
-    });
-  });
-  if (gpu::g_framehash_requests.load() > 0) {
-    if (gpu::g_framehash_requests.fetch_sub(1) == gpu::g_framehash_total.load()) {
-      std::lock_guard lk(g_fh_mu);
-      g_fh.clear();
-      g_fh_expect = gpu::g_framehash_total.load();
-    }
-    gpu::rec().call([f = u32(g_frame)](ID3D11DeviceContext*) { gpu::begin_capture(0x80000000u | (f & 0x7fffffffu)); });
-  }
-  if (gpu::g_capture_requests.load() <= 0) return;
-  gpu::g_capture_requests.fetch_sub(1);
-  u32 n = gpu::g_capture_index.fetch_add(1);
-  gpu::rec().call([n](ID3D11DeviceContext*) { gpu::begin_capture(n); });
-  std::vector<u8> rgba;
-  u32 w, h;
-  if (cfg().shot_surface >= 0) {  // diagnostics: an intermediate render target (read back at once)
-    gpu::rec().finish();
-    Surface* s = find_surface(0, u32(cfg().shot_surface));
-    if (s && !s->depth && s->dxgi == DXGI_FORMAT_R8G8B8A8_UNORM && gpu::read_back_texture(s->tex, rgba, w, h)) {
-      std::string sp = cfg().run_dir + acfa::strprintf("\\shot_%04u_surface_%lx.png", n, cfg().shot_surface);
-      gpu::write_png(sp, w, h, rgba);
-    } else {
-      LOG_I("gpu", "surface 0x%lx: %s", cfg().shot_surface, s ? "not a readable RGBA8 color surface" : "none");
-    }
-  }
-}
+void maybe_capture() {}  // player builds: no test captures
 
 // Guest-memory presentation (when no surface was rendered at the display buffer).
 ID3D11Texture2D* g_mem_tex = nullptr;
@@ -2921,43 +2543,7 @@ void pacing_frame() {
   compiled_at_start = compiled;
 }
 
-// Per-flip motion check ("track ADDR N" control command): the vector at ADDR (e.g. an entity's
-// position, entity + 0x40) is read at each of the next N flips; flips where it did not change are
-// frames without new motion for that object.
-std::atomic<u32> g_track_addr{0}, g_track_left{0};
-void track_flip() {
-  static std::vector<std::array<float, 3>> pos;
-  static std::vector<double> at;
-  u32 left = g_track_left.load(std::memory_order_relaxed);
-  if (!left) return;
-  u32 a = g_track_addr.load();
-  pos.push_back({::ppu::bitsf(::ppu::r32(a)), ::ppu::bitsf(::ppu::r32(a + 4)), ::ppu::bitsf(::ppu::r32(a + 8))});
-  at.push_back(log_time());
-  if (g_track_left.fetch_sub(1) != 1) return;
-  u32 still = 0;
-  double total = 0, min_step = 1e30, max_step = 0;
-  for (size_t i = 1; i < pos.size(); ++i) {
-    double d = std::sqrt(std::pow(pos[i][0] - pos[i - 1][0], 2) + std::pow(pos[i][1] - pos[i - 1][1], 2) + std::pow(pos[i][2] - pos[i - 1][2], 2));
-    still += d < 1e-4;
-    total += d;
-    min_step = std::min(min_step, d);
-    max_step = std::max(max_step, d);
-  }
-  double secs = at.back() - at.front();
-  LOG_I("perf", "track 0x%08x: %zu flips in %.3f s, %u without movement, path %.2f units (%.2f/s), step min %.4f max %.4f", a,
-        pos.size(), secs, still, total, secs > 0 ? total / secs : 0.0, min_step, max_step);
-  std::string csv = "t,x,y,z\n";  // the whole path: <run>/track_<addr>_<start>.csv
-  for (size_t i = 0; i < pos.size(); ++i) csv += acfa::strprintf("%.4f,%g,%g,%g\n", at[i] - at[0], pos[i][0], pos[i][1], pos[i][2]);
-  try {
-    acfa::write_text(std::filesystem::path(cfg().run_dir) / acfa::strprintf("track_%08x_%.0f.csv", a, at[0]), csv);
-  } catch (const std::exception&) {
-  }
-  pos.clear();
-  at.clear();
-}
-
 void present_buffer(u32 id, const DisplayBuffer& b) {
-  track_flip();
   if (!g_have_device || !b.width || !b.height) return;
   if (fr_on()) LOG_I("frame", "flip buffer %u at 0x%x (%ux%u)", id, b.offset, b.width, b.height);
   pacing_frame();
@@ -3173,51 +2759,6 @@ void renderer_memory_written(u32 ea, u32 size) {
   for (u32 p = ea >> 12, e = u32(std::min<u64>((u64(ea) + size + 0xfff) >> 12, 1u << 20)); p < e; ++p) g_page_serial[p] = g_mem_serial;
 }
 void renderer_flush() {}
-
-bool gpu_option(const std::string& name, const std::string& value) {
-  if (name == "submit" && (value == "on" || value == "off")) {
-    gpu::request_submit_mode(value == "on");
-    LOG_I("gpu", "D3D11 submission thread requested %s (applied at the next frame)", value.c_str());
-    return true;
-  }
-  if (name == "patch") {
-    g_patch_cb = value == "on" ? 7 : value == "off" ? 0 : u32(std::atoi(value.c_str())) & 7;
-    g_cb_reset = true;
-    LOG_I("gpu", "constant buffer changes recorded as patches: mask %u", g_patch_cb);
-    return true;
-  }
-  if (name == "wwgap") {
-    g_ww_gap = u32(std::atoi(value.c_str()));
-    LOG_I("gpu", "write tracking: runs up to %u granules apart queried together", g_ww_gap);
-    return true;
-  }
-  if (name == "zpass" && (value == "on" || value == "off")) {
-    g_zp_on = value == "on";
-    LOG_I("gpu", "pixel count reports %s", g_zp_on ? "from occlusion queries" : "answered with 0");
-    return true;
-  }
-  if (name == "zcullstats" && (value == "on" || value == "off")) {
-    g_zcull_stats = value == "on";
-    LOG_I("gpu", "zcull statistics reports %s", value == "on" ? "-1 while enabled (as RPCS3)" : "0");
-    return true;
-  }
-  if (name == "shadow" && (value == "on" || value == "off")) {
-    g_depth_compare = value == "on";
-    LOG_I("gpu", "depth compare (shadow) fetches %s", value.c_str());
-    return true;
-  }
-  if (name == "hot" && (value == "0" || value == "1")) {
-    g_hot_mode = u32(std::atoi(value.c_str()));
-    LOG_I("gpu", "write tracking: collections query the granules used %s", g_hot_mode ? "since the previous collection" : "in the last two frames");
-    return true;
-  }
-  if (name == "kick" && std::atoi(value.c_str()) > 0) {
-    gpu::set_kick_batch(u32(std::atoi(value.c_str())));
-    LOG_I("gpu", "draws per handover to an idle submission thread: %s", value.c_str());
-    return true;
-  }
-  return false;
-}
 
 // Reports (rsx_facts §8): zcull statistics (types 2-4) are not modelled; as RPCS3 they read -1
 // while zcull and its statistics are enabled, else 0 (ACFA requests type 2). Pixel counts (type

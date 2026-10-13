@@ -98,7 +98,7 @@ bool resolve(const std::string& gp, Resolved& out) {
     fs::path h = m.host;
     for (size_t k = 1; k < parts.size(); ++k) {
       if (parts[k].find(':') != std::string::npos || parts[k].find('\\') != std::string::npos) return false;
-      h /= fs::u8path(parts[k]);
+      h /= fs::path(std::u8string(parts[k].begin(), parts[k].end()));  // guest paths are UTF-8
     }
     out = {h, m.writable, m.prefix};
     return true;

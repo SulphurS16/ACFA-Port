@@ -22,38 +22,8 @@ std::atomic<int> g_active{0};
 std::mutex g_mu;  // one dialog at a time
 
 // ---- scripted answers (--dialog, and live "dialog ..." control commands) ----
-std::deque<std::string> g_script;
-bool g_script_parsed = false;
-std::mutex g_live_mu;
-std::deque<std::string> g_live;  // answers queued while running; used before the --dialog script
-bool take_live(std::string* answer) {
-  std::lock_guard lk(g_live_mu);
-  if (g_live.empty()) return false;
-  *answer = g_live.front();
-  g_live.pop_front();
-  return true;
-}
-bool scripted(std::string* answer) {
-  if (take_live(answer)) return true;
-  if (!g_script_parsed) {
-    g_script_parsed = true;
-    const std::string& s = cfg().dialog_script;
-    for (size_t p = 0; p < s.size();) {
-      size_t q = s.find(',', p);
-      g_script.push_back(s.substr(p, q == std::string::npos ? std::string::npos : q - p));
-      if (q == std::string::npos) break;
-      p = q + 1;
-    }
-  }
-  if (cfg().dialog_script.empty()) return false;
-  if (g_script.empty()) {
-    *answer = "";
-    return true;  // script exhausted: answered as "back"
-  }
-  *answer = g_script.front();
-  g_script.pop_front();
-  return true;
-}
+bool take_live(std::string*) { return false; }  // player builds: no scripted answers
+bool scripted(std::string*) { return false; }
 
 std::wstring widen(const std::string& s) {
   if (s.empty()) return {};
@@ -362,16 +332,6 @@ bool show(Dlg* d) {
 }  // namespace
 
 bool active() { return g_active.load() > 0; }
-
-void queue_answers(const std::string& csv) {
-  std::lock_guard lk(g_live_mu);
-  for (size_t p = 0; p <= csv.size();) {
-    size_t q = csv.find(',', p);
-    if (q == std::string::npos) q = csv.size();
-    g_live.push_back(csv.substr(p, q - p));
-    p = q + 1;
-  }
-}
 
 void abort() {
   if (HWND w = g_open_wnd.load()) PostMessageW(w, WM_CLOSE, 0, 0);

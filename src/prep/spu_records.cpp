@@ -48,7 +48,7 @@ SpuRecordStats rebuild_spu_records(const fs::path& manifest, const fs::path& pre
       u32 idx;
       std::string rel, sha;
       ls >> idx >> rel >> sha;
-      fs::path p = prepared / fs::u8path(rel);
+      fs::path p = prepared / fs::path(std::u8string(rel.begin(), rel.end()));
       source_names[idx] = rel;
       if (!fs::exists(p)) {
         st.notes += strprintf("source %u %s: missing\n", idx, rel.c_str());

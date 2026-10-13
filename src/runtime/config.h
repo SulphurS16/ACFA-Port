@@ -15,48 +15,26 @@ struct Config {
   std::string hdd1;         // writable /dev_hdd1 (system cache)
   std::string flash;        // read-only /dev_flash (extracted firmware)
   std::string run_dir;      // this run's log/capture directory
-  double seconds = 0;       // auto-exit after N seconds (0 = run until the game exits)
-  bool trace_hle = false;
-  bool trace_lle = false;           // log the game's calls into firmware modules run natively
-  bool headless = false;
-  double shot_interval = 0;  // seconds between automatic PNG captures (0 = off)
-  bool lenient = false;      // survey mode: unimplemented calls return 0 (never for evidence)
-  std::string trace_spu;     // SPU thread name to trace (MFC, mailboxes, events, stops)
-  unsigned trace_spu_limit = 4000;  // maximum number of traced SPU operations
-  unsigned trace_spu_cats = 7;      // 1 = MFC/atomics, 2 = channels, 4 = events/stops/group
-  double profile_at = 0;            // start sampling at this time (seconds)
-  double profile_split = 0;         // samples after this time go to profile_late.txt (0 = off)
-  std::string profile;              // sample host threads whose name contains this (profile.txt)
-  bool spu_collect = false;         // record SPU code without a recompiled version (training run)
-  bool shader_collect = false;      // record the vertex/fragment programs translated (shader manifest)
   bool warm_shaders = false;        // compile the shader manifest into the shader cache, then exit
-  bool spu_interp = false;          // never use recompiled SPU code (diagnostics)
-  unsigned trace_rsx = 0;           // log the first N RSX FIFO methods
-  double trace_rsx_at = 0;          // ... executed from this many seconds after start
-  bool dump_shaders = false;        // write generated HLSL to <run>/shaders
-  long shot_surface = -1;           // also capture the local-memory surface at this offset
-  unsigned skip_fp = 0;             // diagnostics: skip draws using this SET_SHADER_PROGRAM value
-  double frame_report = -1;         // log one frame's clears/draws and dump its surfaces (seconds)
-  std::string dialog_script;        // answers for system dialogs: "choose:N|choose:cancel|yes|no|ok,..."
-  std::string watch_lines;          // "ea:size,..." ranges whose atomic operations are recorded
-  std::string watch_access;         // hardware data watchpoints (datawatch.h), "[base+]off[:len][:w],..."
-  std::string input_script;         // timed pad presses on port 0: "t:btn[+btn][:hold],..." (seconds)
-  std::string control_file;         // live control: lines of --input items appended while running
-  bool isolate_input = false;       // tests: ignore the real keyboard, mouse and pads (scripted only)
-  bool gpu_submit_thread = true;    // D3D11 calls on their own thread (gpu/submit.h); off: FIFO thread
   std::string priority;             // process priority class: "" (normal), "above-normal", "high"
-  int gpu_timing = 0;               // GPU time per pass (gpu/gpu_timing.h), logged every 5 s; 2: per draw
-  bool audio_capture = false;       // write the mixed output to <run>/audio.f32 (48 kHz float stereo)
-  bool gcm_wait_spin = false;       // --gcm-wait spin: libgcm fragment waits spin with Sleep(0) (A/B)
   std::string pacing = "auto";      // emulated vblank source (gpu/display.h): auto | display | clock
   std::atomic<double> fps{60};      // game frame rate target (--fps N | display: 0 = the display's refresh); PC SETTINGS changes it
   bool fullscreen = false;          // start in borderless fullscreen (F11 / Alt+Enter toggle)
   bool windowed = false;            // --windowed: a window whatever the settings say
   int window_w = 1280, window_h = 720;  // window client size (windowed)
-  unsigned long long affinity = 0;  // --affinity MASK: logical CPUs the process may use (hardware range estimates)
   std::string spu_cache;            // where collected SPU code records are written
   std::string shader_cache;         // compiled HLSL (derived from the game's shaders; machine-local)
-  std::string shader_records;       // programs recorded with --shader-collect (game-derived; machine-local)
+  // Player builds: the developer options are fixed, so the code they gate is compiled out.
+  static constexpr double seconds = 0;
+  static constexpr bool trace_hle = false, trace_lle = false, headless = false, lenient = false;
+  static constexpr double shot_interval = 0, profile_at = 0, profile_split = 0, trace_rsx_at = 0, frame_report = -1;
+  static constexpr bool spu_collect = false, shader_collect = false, spu_interp = false, dump_shaders = false;
+  static constexpr unsigned trace_rsx = 0, skip_fp = 0, trace_spu_limit = 0, trace_spu_cats = 0;
+  static constexpr long shot_surface = -1;
+  static constexpr bool isolate_input = false, gpu_submit_thread = true, audio_capture = false, gcm_wait_spin = false;
+  static constexpr int gpu_timing = 0;
+  static constexpr unsigned long long affinity = 0;
+  static inline const std::string shader_records{};
 };
 
 Config& cfg();
