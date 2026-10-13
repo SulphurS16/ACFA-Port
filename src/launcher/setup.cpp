@@ -76,6 +76,9 @@ fs::path prepared(const SetupConfig& c) { return c.data / "game" / "BLUS30187"; 
 fs::path firmware(const SetupConfig& c) { return c.data / "game" / "firmware241"; }
 fs::path build_dir(const SetupConfig& c) { return c.data / "build"; }
 fs::path tools_dir(const SetupConfig& c) { return c.data / "tools"; }
+// Generated code lives inside the build folder: object files then get short relative paths there
+// (sources elsewhere would repeat the whole install path in every object path).
+fs::path gen_dir(const SetupConfig& c) { return build_dir(c) / "gen"; }
 
 std::vector<std::string> module_list() {
   std::vector<std::string> v;
@@ -143,8 +146,8 @@ bool outputs_present(const SetupConfig& c, size_t step) {
       for (const auto& m : module_list())
         if (!is_file(prepared(c) / "lle" / (m + ".elf"))) return false;
       return is_file(prepared(c) / "lle" / "manifest.txt");
-    case kRecompile: return is_file(c.data / "gen" / "ppu" / "ppu_functab.cpp");
-    case kSpu: return is_dir(c.data / "gen" / "spu");
+    case kRecompile: return is_file(gen_dir(c) / "ppu" / "ppu_functab.cpp");
+    case kSpu: return is_dir(gen_dir(c) / "spu");
     default: return false;
   }
 }
@@ -214,7 +217,7 @@ unsigned long long Setup::space_needed(const SetupConfig& c) {
   double need = 0;
   if (!is_dir(tools_dir(c) / "cmake-4.4.3-windows-x86_64")) need += 1.2;
   if (!is_file(prepared(c) / "eboot.elf")) need += 0.2;
-  if (!is_file(c.data / "gen" / "ppu" / "ppu_functab.cpp")) need += 0.2;
+  if (!is_file(gen_dir(c) / "ppu" / "ppu_functab.cpp")) need += 0.2;
   if (!is_file(game_exe(c))) need += 0.5;
   if (!is_dir(c.data / "hdd1" / "model")) need += 1.3;
   return (unsigned long long)(need * gb);
@@ -412,8 +415,8 @@ void Setup::run(SetupConfig c) {
     auto configure = [&] {
       return exec(cmake_exe(c),
                   {L"-S", fwd(c.src), L"-B", fwd(build_dir(c)), L"-G", L"Ninja", L"-DCMAKE_BUILD_TYPE=Release", L"-DCMAKE_C_COMPILER=clang",
-                   L"-DCMAKE_CXX_COMPILER=clang++", L"-DACFA_GEN_DIR=" + fwd(c.data / "gen" / "ppu"),
-                   L"-DACFA_SPU_GEN_DIR=" + fwd(c.data / "gen" / "spu")},
+                   L"-DCMAKE_CXX_COMPILER=clang++", L"-DACFA_GEN_DIR=" + fwd(gen_dir(c) / "ppu"),
+                   L"-DACFA_SPU_GEN_DIR=" + fwd(gen_dir(c) / "spu")},
                   c.data);
     };
     set_step(kTools, StepState::Running);
@@ -448,8 +451,8 @@ void Setup::run(SetupConfig c) {
          "Preparing the system modules failed"},
         {kRecompile,
          [&] {
-           fs::remove_all(c.data / "gen" / "ppu", ec);
-           std::vector<std::wstring> a = {L"emit", w(prepared(c) / "eboot.elf"), w(c.data / "gen" / "ppu")};
+           fs::remove_all(gen_dir(c) / "ppu", ec);
+           std::vector<std::wstring> a = {L"emit", w(prepared(c) / "eboot.elf"), w(gen_dir(c) / "ppu")};
            for (const auto& m : module_list()) a.insert(a.end(), {L"--module", w(prepared(c) / "lle" / widen(m + ".elf"))});
            a.insert(a.end(), {L"--hooks", w(c.src / "src" / "runtime" / "game" / "hooks.txt")});
            return exec(build_dir(c) / "acfa-recomp.exe", a, c.data);
@@ -457,11 +460,11 @@ void Setup::run(SetupConfig c) {
          "Translating the game code failed"},
         {kSpu,
          [&] {
-           fs::remove_all(c.data / "gen" / "spu", ec);
-           fs::create_directories(c.data / "gen" / "spu", ec);
+           fs::remove_all(gen_dir(c) / "spu", ec);
+           fs::create_directories(gen_dir(c) / "spu", ec);
            return exec(prep, {L"spu-records", L"--manifest", w(c.src / "data" / "spu_manifest.txt"), L"--out", w(c.data / "spu_cache"), w(prepared(c))},
                        c.data) &&
-                  exec(build_dir(c) / "acfa-spurecomp.exe", {w(c.data / "gen" / "spu"), w(c.data / "spu_cache")}, c.data);
+                  exec(build_dir(c) / "acfa-spurecomp.exe", {w(gen_dir(c) / "spu"), w(c.data / "spu_cache")}, c.data);
          },
          "Translating the SPU code failed"},
     };
