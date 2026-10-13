@@ -154,6 +154,7 @@ int main(int argc, char** argv) {
     else if (a == "--windowed") c.fullscreen = false, c.windowed = true;
     else if (a == "--fullscreen") c.fullscreen = true;
     else if (a == "--priority") c.priority = next();
+    else if (a == "--flash") c.flash = next();  // the launcher's folder for the chosen system software
     else {
       std::fprintf(stderr, "unknown argument %s\n", a.c_str());
       return 2;

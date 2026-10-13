@@ -51,6 +51,8 @@ class Setup {
   // Whether everything is built from these inputs (Play possible).
   static bool ready(const SetupConfig& c);
   static fs::path game_exe(const SetupConfig& c);
+  // The extracted system software the game reads (one folder per version: firmware241, firmware493).
+  static fs::path flash_dir(const SetupConfig& c);
   // Disk space the setup still needs in the install folder (bytes, estimate).
   static unsigned long long space_needed(const SetupConfig& c);
 

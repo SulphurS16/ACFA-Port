@@ -22,6 +22,7 @@
 #include "common/bytes.h"
 #include "common/ini.h"
 #include "common/settings_file.h"
+#include "launcher/download.h"
 #include "launcher/inputs.h"
 #include "launcher/process.h"
 #include "launcher/setup.h"
@@ -31,10 +32,10 @@ using namespace launcher;
 
 namespace {
 
-constexpr UINT WM_SETUP = WM_APP + 1, WM_CHECKED = WM_APP + 2, WM_GAME_EXIT = WM_APP + 3;
+constexpr UINT WM_SETUP = WM_APP + 1, WM_CHECKED = WM_APP + 2, WM_GAME_EXIT = WM_APP + 3, WM_DOWNLOAD = WM_APP + 4;
 enum Id {
   kDiscEdit = 100, kUpdateEdit, kPupEdit, kKeysEdit,
-  kDiscBrowse = 110, kUpdateBrowse, kPupBrowse, kKeysBrowse,
+  kDiscBrowse = 110, kUpdateBrowse, kPupBrowse, kKeysBrowse, kPupDownload,
   kDiscState = 120, kUpdateState, kPupState, kKeysState,
   kDataEdit = 130, kDataBrowse, kDataState,
   kPrepare = 140, kCancel, kOpenLog, kProgress, kStatus, kLog,
@@ -59,6 +60,13 @@ bool g_ready = false;
 std::mutex g_check_mu;
 Status g_checks[4];
 std::atomic<int> g_check_gen{0};
+
+// Sony's system software download (worker thread; WM_DOWNLOAD: wp 0 progress, 1 finished).
+std::atomic<bool> g_dl_running{false}, g_dl_cancel{false};
+std::mutex g_dl_mu;
+std::string g_dl_status, g_dl_error;
+double g_dl_fraction = 0;
+fs::path g_dl_file;
 
 HWND item(int id) { return GetDlgItem(g_wnd, id); }
 
@@ -283,7 +291,7 @@ void start_checks() {
   int gen = ++g_check_gen;
   SetupConfig c = g_cfg;
   std::thread([c, gen] {
-    Status s[4] = {check_disc(c.disc), check_update(c.update), check_pup(c.pup), check_keys(c.keys)};
+    Status s[4] = {check_disc(c.disc), check_update(c.update), check_pup(c.pup), check_keys(c.keys, pup_version(c.pup))};
     {
       std::lock_guard lk(g_check_mu);
       if (gen != g_check_gen) return;
@@ -336,12 +344,13 @@ void update_space() {
 }
 
 void update_buttons() {
-  bool busy = g_setup.running(), playing = g_game != nullptr;
+  bool busy = g_setup.running() || g_dl_running, playing = g_game != nullptr;
   g_ready = !g_cfg.data.empty() && Setup::ready(g_cfg);
   EnableWindow(item(kPrepare), !busy && !playing && inputs_ok() && data_ok());
   EnableWindow(item(kCancel), busy);
   EnableWindow(item(kPlay), !busy && !playing && g_ready && inputs_ok());
-  for (int id : {kDiscBrowse, kUpdateBrowse, kPupBrowse, kKeysBrowse, kDataBrowse, kDiscEdit, kUpdateEdit, kPupEdit, kKeysEdit, kDataEdit})
+  for (int id : {kDiscBrowse, kUpdateBrowse, kPupBrowse, kKeysBrowse, kPupDownload, kDataBrowse, kDiscEdit, kUpdateEdit, kPupEdit, kKeysEdit,
+                 kDataEdit})
     EnableWindow(item(id), !busy && !playing);
   for (int id : {kSavesBackup, kSavesRestore, kFps, kMode}) EnableWindow(item(id), !playing && !g_cfg.data.empty());
   set_text(kPrepare, g_ready ? L"Rebuild" : L"Prepare and build");
@@ -399,7 +408,7 @@ fs::path pick(bool folder, const wchar_t* title, const fs::path& start, const wc
 void play() {
   fs::path exe = Setup::game_exe(g_cfg);
   std::wstring cmd = quote_arg(exe.wstring()) + L" --data " + quote_arg(g_cfg.data.wstring()) + L" --disc " + quote_arg(g_cfg.disc.wstring()) +
-                     L" --keep-runs 10";
+                     L" --flash " + quote_arg(Setup::flash_dir(g_cfg).wstring()) + L" --keep-runs 10";
   STARTUPINFOW si{};
   si.cb = sizeof si;
   PROCESS_INFORMATION pi{};
@@ -428,6 +437,82 @@ fs::path newest_run_log() {
   return best.empty() ? best : best / "acfa.log";
 }
 
+// ---- Sony's system software download ----
+// Sony's update list names the current image; the port supports the version it was tested with
+// (the image the list named then is used when the list has moved on), and the file must match its
+// pinned SHA-256.
+void start_pup_download() {
+  const SonySystemSoftware& s = sony_system_software();
+  const wchar_t* title = L"ARMORED CORE for Answer";
+  if (g_cfg.data.empty() || !data_ok()) {
+    MessageBoxW(g_wnd, L"Choose the install folder first.", title, MB_ICONINFORMATION);
+    return;
+  }
+  fs::path to = g_cfg.data / "downloads" / ("ps3-" + std::string(s.version)) / "PS3UPDAT.PUP";
+  std::wstring msg = L"Download PS3 system software " + widen(s.version) + L" from Sony's update server (playstation.net, " +
+                     std::to_wstring(s.size / 1000000) + L" MB) into\n" + to.parent_path().wstring() + L" ?";
+  if (MessageBoxW(g_wnd, msg.c_str(), title, MB_YESNO | MB_ICONQUESTION) != IDYES) return;
+  g_dl_running = true;
+  g_dl_cancel = false;
+  {
+    std::lock_guard lk(g_dl_mu);
+    g_dl_status = "Checking Sony's update list";
+    g_dl_error.clear();
+    g_dl_fraction = 0;
+    g_dl_file.clear();
+  }
+  update_buttons();
+  PostMessageW(g_wnd, WM_DOWNLOAD, 0, 0);
+  std::thread([to, &s] {
+    auto progress = [&](const std::string& status, double f) {
+      {
+        std::lock_guard lk(g_dl_mu);
+        g_dl_status = status;
+        g_dl_fraction = f;
+      }
+      PostMessageW(g_wnd, WM_DOWNLOAD, 0, 0);
+    };
+    std::string err;
+    if (!(fs::exists(to) && is_supported_pup(to))) {  // an earlier download is reused
+      std::wstring url = widen(s.image_url);
+      std::string list, listed;
+      if (fetch_text(widen(s.list_url), &list, true).empty()) {
+        for (size_t p = 0; p < list.size();) {
+          size_t q = list.find('\n', p);
+          std::string line = list.substr(p, q == std::string::npos ? std::string::npos : q - p);
+          p = q == std::string::npos ? list.size() : q + 1;
+          size_t v = line.find("SystemSoftwareVersion="), u = line.find("CDN=");
+          if (v == std::string::npos || u == std::string::npos || line.find("PS3UPDAT.PUP") == std::string::npos) continue;
+          std::string version = line.substr(v + 22, line.find(';', v) - v - 22), cdn = line.substr(u + 4, line.find(';', u) - u - 4);
+          listed = version;
+          if (version == s.list_version) url = widen(cdn);
+        }
+      }
+      progress("Downloading system software " + std::string(s.version), 0);
+      err = download(url, to, [&](unsigned long long got, unsigned long long total) {
+        progress(acfa::strprintf("Downloading system software %s: %.0f / %.0f MB", s.version, got / 1e6, (total ? total : s.size) / 1e6),
+                 double(got) / double(total ? total : s.size));
+      }, g_dl_cancel, true);
+      if (err.empty()) {
+        progress("Checking the downloaded file", 1);
+        if (!is_supported_pup(to)) {
+          std::error_code ec;
+          fs::remove(to, ec);
+          err = "the downloaded file is not system software " + std::string(s.version);
+        }
+      }
+      if (!err.empty() && !listed.empty() && listed != s.list_version)
+        err += " (Sony now offers version " + listed.substr(0, 4) + "; this port supports " + s.version + " and the disc's 2.41)";
+    }
+    {
+      std::lock_guard lk(g_dl_mu);
+      g_dl_error = err;
+      if (err.empty()) g_dl_file = to;
+    }
+    PostMessageW(g_wnd, WM_DOWNLOAD, 1, 0);
+  }).detach();
+}
+
 // ---- layout (96-DPI units) ----
 struct Place {
   int id;
@@ -436,7 +521,8 @@ struct Place {
 const Place kPlaces[] = {
     {kDiscEdit, 132, 30, 384, 24},   {kDiscBrowse, 522, 29, 82, 26},   {kDiscState, 132, 56, 472, 18},
     {kUpdateEdit, 132, 80, 384, 24}, {kUpdateBrowse, 522, 79, 82, 26}, {kUpdateState, 132, 106, 472, 18},
-    {kPupEdit, 132, 130, 384, 24},   {kPupBrowse, 522, 129, 82, 26},   {kPupState, 132, 156, 472, 18},
+    {kPupEdit, 132, 130, 296, 24},   {kPupBrowse, 522, 129, 82, 26},   {kPupState, 132, 156, 472, 18},
+    {kPupDownload, 434, 129, 82, 26},
     {kKeysEdit, 132, 180, 384, 24},  {kKeysBrowse, 522, 179, 82, 26},  {kKeysState, 132, 206, 472, 18},
     {kDataEdit, 24, 266, 492, 24},   {kDataBrowse, 522, 265, 82, 26},  {kDataState, 24, 293, 580, 18},
     {kPrepare, 24, 344, 160, 30},    {kCancel, 192, 344, 90, 30},      {kOpenLog, 290, 344, 90, 30},
@@ -494,6 +580,7 @@ void create_controls() {
     make(L"BUTTON", L"Browse...", WS_TABSTOP | BS_PUSHBUTTON, kDiscBrowse + i);
     make(L"STATIC", L"", SS_LEFT | SS_ENDELLIPSIS, kDiscState + i);
   }
+  make(L"BUTTON", L"Download...", WS_TABSTOP | BS_PUSHBUTTON, kPupDownload);
   make(L"EDIT", L"", WS_TABSTOP | ES_AUTOHSCROLL, kDataEdit, WS_EX_CLIENTEDGE);
   make(L"BUTTON", L"Browse...", WS_TABSTOP | BS_PUSHBUTTON, kDataBrowse);
   make(L"STATIC", L"", SS_LEFT, kDataState);
@@ -575,11 +662,14 @@ LRESULT CALLBACK wndproc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
           break;
         }
         case kPupBrowse: {
-          fs::path p = pick(false, L"PS3 system software 2.41 (PS3UPDAT.PUP)", g_cfg.pup.empty() ? g_cfg.disc : g_cfg.pup, L"PS3 system software",
-                            L"*.PUP");
+          fs::path p = pick(false, L"PS3 system software (PS3UPDAT.PUP: the disc's 2.41, or 4.93)", g_cfg.pup.empty() ? g_cfg.disc : g_cfg.pup,
+                            L"PS3 system software", L"*.PUP");
           if (!p.empty()) set_text(kPupEdit, p.wstring()), refresh_paths_from_ui();
           break;
         }
+        case kPupDownload:
+          start_pup_download();
+          break;
         case kKeysBrowse: {
           fs::path p = pick(false, L"Key file", g_cfg.keys, L"Key file", L"*.txt");
           if (!p.empty()) set_text(kKeysEdit, p.wstring()), refresh_paths_from_ui();
@@ -604,7 +694,8 @@ LRESULT CALLBACK wndproc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
           update_buttons();
           break;
         case kCancel:
-          g_setup.cancel();
+          if (g_dl_running) g_dl_cancel = true;
+          else g_setup.cancel();
           break;
         case kOpenLog: {
           fs::path log = g_cfg.data / "launcher.log";
@@ -654,6 +745,34 @@ LRESULT CALLBACK wndproc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
     case WM_SETUP:
       on_setup_update();
       return 0;
+    case WM_DOWNLOAD: {
+      std::string status, error;
+      double f;
+      fs::path file;
+      {
+        std::lock_guard lk(g_dl_mu);
+        status = g_dl_status;
+        error = g_dl_error;
+        f = g_dl_fraction;
+        file = g_dl_file;
+      }
+      SendMessageW(item(kProgress), PBM_SETPOS, WPARAM(int(f * 1000)), 0);
+      if (wp == 0) {
+        set_text(kStatus, widen(status));
+        return 0;
+      }
+      g_dl_running = false;
+      if (!file.empty()) {
+        set_text(kPupEdit, file.wstring());
+        set_text(kStatus, L"System software downloaded.");
+        refresh_paths_from_ui();
+      } else {
+        SendMessageW(item(kProgress), PBM_SETPOS, 0, 0);
+        set_text(kStatus, widen(g_dl_cancel ? std::string("Download cancelled.") : "Download failed: " + error));
+        update_buttons();
+      }
+      return 0;
+    }
     case WM_CHECKED: {
       if (int(wp) != g_check_gen) return 0;
       Status checks[4];
@@ -697,6 +816,7 @@ LRESULT CALLBACK wndproc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
       return 0;
     }
     case WM_CLOSE:
+      g_dl_cancel = true;
       if (g_setup.running() &&
           MessageBoxW(h, L"Setup is running. Stop it and close?", L"ARMORED CORE for Answer", MB_YESNO | MB_ICONQUESTION) != IDYES)
         return 0;

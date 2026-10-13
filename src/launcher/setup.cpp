@@ -11,6 +11,7 @@
 
 #include "common/crypto.h"
 #include "launcher/download.h"
+#include "launcher/inputs.h"
 
 namespace launcher {
 namespace {
@@ -73,7 +74,13 @@ std::string content_hash(const fs::path& p) {
 }
 
 fs::path prepared(const SetupConfig& c) { return c.data / "game" / "BLUS30187"; }
-fs::path firmware(const SetupConfig& c) { return c.data / "game" / "firmware241"; }
+// One folder per system software version (firmware241, firmware493), named from the PUP's version.
+fs::path firmware(const SetupConfig& c) {
+  std::string digits;
+  for (char ch : pup_version(c.pup))
+    if (ch >= '0' && ch <= '9') digits += ch;
+  return c.data / "game" / ("firmware" + digits);
+}
 fs::path build_dir(const SetupConfig& c) { return c.data / "build"; }
 fs::path tools_dir(const SetupConfig& c) { return c.data / "tools"; }
 // Generated code lives inside the build folder: object files then get short relative paths there
@@ -107,8 +114,9 @@ std::string stamp(const SetupConfig& c, size_t step) {
              "\nhooks " + content_hash(c.src / "src" / "runtime" / "game" / "hooks.txt") + "\nrecompiler " +
              file_stamp(build_dir(c) / "acfa-recomp.exe");
     case kSpu:
-      return "prepared " + content_hash(prepared(c) / "manifest.txt") + "\nmanifest " + content_hash(c.src / "data" / "spu_manifest.txt") +
-             "\nspurecomp " + file_stamp(build_dir(c) / "acfa-spurecomp.exe");
+      return "prepared " + content_hash(prepared(c) / "manifest.txt") + "\nlle " + content_hash(prepared(c) / "lle" / "manifest.txt") +
+             "\nmanifest " + content_hash(c.src / "data" / "spu_manifest.txt") + "\nspurecomp " +
+             file_stamp(build_dir(c) / "acfa-spurecomp.exe");
     default:
       return "";
   }
@@ -198,6 +206,7 @@ Setup::~Setup() {
 }
 
 fs::path Setup::game_exe(const SetupConfig& c) { return build_dir(c) / "acfa.exe"; }
+fs::path Setup::flash_dir(const SetupConfig& c) { return firmware(c) / "dev_flash"; }
 
 bool Setup::ready(const SetupConfig& c) {
   if (!is_file(game_exe(c))) return false;
@@ -217,6 +226,7 @@ unsigned long long Setup::space_needed(const SetupConfig& c) {
   double need = 0;
   if (!is_dir(tools_dir(c) / "cmake-4.4.3-windows-x86_64")) need += 1.2;
   if (!is_file(prepared(c) / "eboot.elf")) need += 0.2;
+  if (!is_dir(firmware(c) / "dev_flash")) need += 0.2;
   if (!is_file(gen_dir(c) / "ppu" / "ppu_functab.cpp")) need += 0.2;
   if (!is_file(game_exe(c))) need += 0.5;
   if (!is_dir(c.data / "hdd1" / "model")) need += 1.3;
@@ -462,6 +472,7 @@ void Setup::run(SetupConfig c) {
          [&] {
            fs::remove_all(gen_dir(c) / "spu", ec);
            fs::create_directories(gen_dir(c) / "spu", ec);
+           fs::remove_all(c.data / "spu_cache", ec);  // records of another system software version go too
            return exec(prep, {L"spu-records", L"--manifest", w(c.src / "data" / "spu_manifest.txt"), L"--out", w(c.data / "spu_cache"), w(prepared(c))},
                        c.data) &&
                   exec(build_dir(c) / "acfa-spurecomp.exe", {w(gen_dir(c) / "spu"), w(c.data / "spu_cache")}, c.data);
@@ -498,8 +509,8 @@ void Setup::run(SetupConfig c) {
     set_step(kShaders, StepState::Running);
     notify();
     if (!exec(game_exe(c),
-              {L"--data", w(c.data), L"--disc", w(c.disc), L"--warm-shaders", L"--shader-manifest", w(c.src / "data" / "shader_manifest.txt"),
-               L"--keep-runs", L"10"},
+              {L"--data", w(c.data), L"--disc", w(c.disc), L"--flash", w(flash_dir(c)), L"--warm-shaders", L"--shader-manifest",
+               w(c.src / "data" / "shader_manifest.txt"), L"--keep-runs", L"10"},
               c.data)) {
       if (!cancel_) fail("Compiling the shaders failed: " + last_error);
       return false;

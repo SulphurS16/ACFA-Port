@@ -20,10 +20,14 @@ struct Handle {
   }
 };
 
-}  // namespace
+// An open GET request with status 200 (or the reason it is not).
+struct Request {
+  Handle session, conn, req;
+  unsigned long long total = 0;  // Content-Length, 0 when not sent
+  std::string error;
+};
 
-std::string download(const std::wstring& url, const std::filesystem::path& to,
-                     const std::function<void(unsigned long long, unsigned long long)>& progress, const std::atomic<bool>& cancel) {
+void open_request(Request& r, const std::wstring& url, bool allow_http) {
   URL_COMPONENTS uc{};
   uc.dwStructSize = sizeof uc;
   wchar_t host[256] = {}, path[2048] = {};
@@ -31,25 +35,51 @@ std::string download(const std::wstring& url, const std::filesystem::path& to,
   uc.dwHostNameLength = DWORD(std::size(host));
   uc.lpszUrlPath = path;
   uc.dwUrlPathLength = DWORD(std::size(path));
-  if (!WinHttpCrackUrl(url.c_str(), 0, 0, &uc) || uc.nScheme != INTERNET_SCHEME_HTTPS) return "not an https address: " + narrow(url);
-  Handle session{WinHttpOpen(L"acfa-launcher/1.0", WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY, WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0)};
-  if (!session.h) return "the internet connection could not be opened";
-  Handle conn{WinHttpConnect(session.h, host, uc.nPort, 0)};
-  if (!conn.h) return "cannot reach " + narrow(host);
-  Handle req{WinHttpOpenRequest(conn.h, L"GET", path, nullptr, WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES, WINHTTP_FLAG_SECURE)};
-  if (!req.h) return "cannot request " + narrow(url);
-  if (!WinHttpSendRequest(req.h, WINHTTP_NO_ADDITIONAL_HEADERS, 0, WINHTTP_NO_REQUEST_DATA, 0, 0, 0) ||
-      !WinHttpReceiveResponse(req.h, nullptr))
-    return "download failed (" + narrow(host) + ", error " + std::to_string(GetLastError()) + "): check the internet connection";
+  if (!WinHttpCrackUrl(url.c_str(), 0, 0, &uc) || !(uc.nScheme == INTERNET_SCHEME_HTTPS || (allow_http && uc.nScheme == INTERNET_SCHEME_HTTP))) {
+    r.error = "not an https address: " + narrow(url);
+    return;
+  }
+  r.session.h = WinHttpOpen(L"acfa-launcher/1.0", WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY, WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
+  if (!r.session.h) {
+    r.error = "the internet connection could not be opened";
+    return;
+  }
+  r.conn.h = WinHttpConnect(r.session.h, host, uc.nPort, 0);
+  if (!r.conn.h) {
+    r.error = "cannot reach " + narrow(host);
+    return;
+  }
+  r.req.h = WinHttpOpenRequest(r.conn.h, L"GET", path, nullptr, WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES,
+                               uc.nScheme == INTERNET_SCHEME_HTTPS ? WINHTTP_FLAG_SECURE : 0);
+  if (!r.req.h) {
+    r.error = "cannot request " + narrow(url);
+    return;
+  }
+  if (!WinHttpSendRequest(r.req.h, WINHTTP_NO_ADDITIONAL_HEADERS, 0, WINHTTP_NO_REQUEST_DATA, 0, 0, 0) || !WinHttpReceiveResponse(r.req.h, nullptr)) {
+    r.error = "download failed (" + narrow(host) + ", error " + std::to_string(GetLastError()) + "): check the internet connection";
+    return;
+  }
   DWORD status = 0, size = sizeof status;
-  WinHttpQueryHeaders(req.h, WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER, WINHTTP_HEADER_NAME_BY_INDEX, &status, &size,
+  WinHttpQueryHeaders(r.req.h, WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER, WINHTTP_HEADER_NAME_BY_INDEX, &status, &size,
                       WINHTTP_NO_HEADER_INDEX);
-  if (status != 200) return "download failed: the server answered " + std::to_string(status) + " for " + narrow(url);
+  if (status != 200) {
+    r.error = "download failed: the server answered " + std::to_string(status) + " for " + narrow(url);
+    return;
+  }
   wchar_t lenbuf[32] = {};
   DWORD lensize = sizeof lenbuf;
-  unsigned long long total = 0;
-  if (WinHttpQueryHeaders(req.h, WINHTTP_QUERY_CONTENT_LENGTH, WINHTTP_HEADER_NAME_BY_INDEX, lenbuf, &lensize, WINHTTP_NO_HEADER_INDEX))
-    total = _wcstoui64(lenbuf, nullptr, 10);
+  if (WinHttpQueryHeaders(r.req.h, WINHTTP_QUERY_CONTENT_LENGTH, WINHTTP_HEADER_NAME_BY_INDEX, lenbuf, &lensize, WINHTTP_NO_HEADER_INDEX))
+    r.total = _wcstoui64(lenbuf, nullptr, 10);
+}
+
+}  // namespace
+
+std::string download(const std::wstring& url, const std::filesystem::path& to,
+                     const std::function<void(unsigned long long, unsigned long long)>& progress, const std::atomic<bool>& cancel,
+                     bool allow_http) {
+  Request r;
+  open_request(r, url, allow_http);
+  if (!r.error.empty()) return r.error;
   std::filesystem::path part = to;
   part += ".part";
   std::error_code ec;
@@ -65,7 +95,7 @@ std::string download(const std::wstring& url, const std::filesystem::path& to,
       break;
     }
     DWORD n = 0;
-    if (!WinHttpReadData(req.h, buf.data(), DWORD(buf.size()), &n)) {
+    if (!WinHttpReadData(r.req.h, buf.data(), DWORD(buf.size()), &n)) {
       err = "download interrupted (error " + std::to_string(GetLastError()) + ")";
       break;
     }
@@ -75,16 +105,32 @@ std::string download(const std::wstring& url, const std::filesystem::path& to,
       break;
     }
     got += n;
-    progress(got, total);
+    progress(got, r.total);
   }
   std::fclose(f);
-  if (err.empty() && total && got != total) err = "download incomplete";
+  if (err.empty() && r.total && got != r.total) err = "download incomplete";
   if (!err.empty()) {
     std::filesystem::remove(part, ec);
     return err;
   }
   std::filesystem::rename(part, to, ec);
   if (ec) return "cannot rename " + narrow(part.wstring());
+  return "";
+}
+
+std::string fetch_text(const std::wstring& url, std::string* out, bool allow_http, size_t max_bytes) {
+  Request r;
+  open_request(r, url, allow_http);
+  if (!r.error.empty()) return r.error;
+  out->clear();
+  std::vector<char> buf(1 << 14);
+  for (;;) {
+    DWORD n = 0;
+    if (!WinHttpReadData(r.req.h, buf.data(), DWORD(buf.size()), &n)) return "download interrupted (error " + std::to_string(GetLastError()) + ")";
+    if (!n) break;
+    out->append(buf.data(), n);
+    if (out->size() > max_bytes) return "unexpectedly long answer from " + narrow(url);
+  }
   return "";
 }
 
