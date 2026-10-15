@@ -12,6 +12,12 @@ endif()
 
 add_compile_definitions(_WIN32_WINNT=0x0A00 WINVER=0x0A00 NOMINMAX UNICODE _UNICODE)
 
+# The port's version (VERSION; the release's changelog names it), shown by the launcher and logged
+# by the game.
+file(STRINGS ${CMAKE_SOURCE_DIR}/VERSION ACFA_VERSION LIMIT_COUNT 1)
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS ${CMAKE_SOURCE_DIR}/VERSION)
+add_compile_definitions(ACFA_VERSION="${ACFA_VERSION}")
+
 # Developer diagnostics (control-file commands, profiler, memory search and watchpoints, traces,
 # frame reports, A/B switches, test autopilot). Off in player builds: compiled out, and the
 # release export (tools\release) removes their code.

@@ -31,6 +31,10 @@
 namespace fs = std::filesystem;
 using namespace launcher;
 
+#define ACFA_WIDEN2(x) L##x
+#define ACFA_WIDEN(x) ACFA_WIDEN2(x)
+#define ACFA_VERSION_W ACFA_WIDEN(ACFA_VERSION)
+
 namespace {
 
 constexpr UINT WM_SETUP = WM_APP + 1, WM_CHECKED = WM_APP + 2, WM_GAME_EXIT = WM_APP + 3;
@@ -40,7 +44,7 @@ enum Id {
   kDiscState = 120, kRpcs3State, kUpdateState,
   kDataEdit = 130, kDataBrowse, kDataState,
   kPrepare = 140, kCancel, kOpenLog, kProgress, kStatus, kLog,
-  kFps = 150, kMode, kResolution, kScale, kMonitor, kResetSettings, kSafeMode,
+  kFps = 150, kMode, kResolution, kScale, kMonitor, kResetSettings, kSafeMode, kPreset,
   kSavesPath = 160, kSavesOpen, kSavesBackup, kSavesRestore,
   kPlay = 170, kPlayState,
   kLabel = 200,
@@ -331,6 +335,38 @@ void save_setting(int id) {
   }
 }
 
+void add_log_line(const std::string& s);
+
+// Presets for the display settings (the frame rate in missions and the render scale): what a
+// modest PC or a handheld runs well (estimates; docs/STATUS.md lists what was measured).
+struct Preset {
+  const wchar_t* name;
+  const char* fps;
+  int render_scale;
+};
+const Preset kPresets[] = {
+    {L"Presets...", nullptr, 0},
+    {L"Standard: 60 fps, 100 %", "60", 100},
+    {L"Modest PC: 60 fps, 75 %", "60", 75},
+    {L"Handheld / low power: 30 fps, 75 %", "30", 75},
+    {L"High refresh: 120 fps, 100 %", "120", 100},
+};
+void apply_preset(int i) {
+  if (i <= 0 || i >= int(std::size(kPresets)) || g_cfg.data.empty()) return;
+  const Preset& p = kPresets[i];
+  try {
+    acfa::Ini ini = acfa::settings::load_or_create(settings_path(), nullptr);
+    ini.set("display", "fps", p.fps);
+    ini.set("display", "render_scale", std::to_string(p.render_scale));
+    ini.save(settings_path());
+  } catch (const std::exception& e) {
+    MessageBoxW(g_wnd, widen(std::string("Settings not saved: ") + e.what()).c_str(), L"ARMORED CORE for Answer", MB_ICONWARNING);
+    return;
+  }
+  load_settings_controls();
+  add_log_line("Preset applied: " + narrow(p.name) + ".");
+}
+
 // ---- saves ----
 fs::path saves_dir() { return user_dir() / "savedata"; }
 fs::path backups_dir() { return user_dir() / "backups"; }
@@ -444,7 +480,7 @@ void update_buttons() {
   EnableWindow(item(kPlay), !busy && !playing && g_ready && inputs_ok());
   for (int id : {kDiscBrowse, kRpcs3Browse, kDataBrowse, kDiscEdit, kRpcs3Edit, kDataEdit})
     EnableWindow(item(id), !busy && !playing);
-  for (int id : {kSavesBackup, kSavesRestore, kFps, kMode, kScale, kResetSettings, kSafeMode}) EnableWindow(item(id), !playing && !g_cfg.data.empty());
+  for (int id : {kSavesBackup, kSavesRestore, kFps, kMode, kScale, kResetSettings, kSafeMode, kPreset}) EnableWindow(item(id), !playing && !g_cfg.data.empty());
   EnableWindow(item(kMonitor), !playing && !g_cfg.data.empty() && g_monitor_items.size() > 1);
   set_text(kPrepare, g_ready ? L"Rebuild" : L"Prepare and build");
   set_text(kPlayState, playing ? L"Playing." : busy ? L"" : g_ready ? L"Ready." : L"Prepare and build first.");
@@ -547,6 +583,7 @@ const Place kPlaces[] = {
     {kProgress, 24, 384, 580, 16},   {kStatus, 24, 404, 580, 18},      {kLog, 24, 426, 580, 176},
     {kFps, 748, 30, 190, 300},       {kMode, 748, 64, 190, 300},       {kResolution, 748, 98, 190, 300},
     {kScale, 748, 132, 190, 300},    {kMonitor, 748, 166, 190, 300},   {kResetSettings, 636, 202, 150, 28},
+    {kPreset, 796, 203, 144, 300},
     {kSavesPath, 636, 276, 304, 34}, {kSavesOpen, 636, 314, 96, 28},   {kSavesBackup, 740, 314, 96, 28},
     {kSavesRestore, 844, 314, 96, 28}, {kSafeMode, 632, 466, 316, 22},  {kPlayState, 624, 496, 324, 20},
     {kPlay, 624, 520, 324, 82},
@@ -615,6 +652,9 @@ void create_controls() {
   make(L"LISTBOX", L"", WS_VSCROLL | LBS_NOINTEGRALHEIGHT | LBS_NOSEL, kLog, WS_EX_CLIENTEDGE);
   for (int id : {kFps, kMode, kResolution, kScale, kMonitor}) make(L"COMBOBOX", L"", WS_TABSTOP | CBS_DROPDOWNLIST | WS_VSCROLL, id);
   make(L"BUTTON", L"Reset settings...", WS_TABSTOP | BS_PUSHBUTTON, kResetSettings);
+  make(L"COMBOBOX", L"", WS_TABSTOP | CBS_DROPDOWNLIST | WS_VSCROLL, kPreset);
+  for (const Preset& p : kPresets) SendMessageW(item(kPreset), CB_ADDSTRING, 0, LPARAM(p.name));
+  SendMessageW(item(kPreset), CB_SETCURSEL, 0, 0);
   make(L"BUTTON", L"Safe mode: default display settings for the next start", WS_TABSTOP | BS_AUTOCHECKBOX, kSafeMode);
   make(L"STATIC", L"", SS_LEFT | SS_PATHELLIPSIS, kSavesPath);
   make(L"BUTTON", L"Open", WS_TABSTOP | BS_PUSHBUTTON, kSavesOpen);
@@ -662,6 +702,11 @@ LRESULT CALLBACK wndproc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
       if (code == EN_KILLFOCUS && ((id >= kDiscEdit && id <= kRpcs3Edit) || id == kDataEdit)) {
         refresh_paths_from_ui();
         if (id == kDataEdit) load_settings_controls();
+        return 0;
+      }
+      if (code == CBN_SELCHANGE && id == kPreset) {
+        apply_preset(int(SendMessageW(item(kPreset), CB_GETCURSEL, 0, 0)));
+        SendMessageW(item(kPreset), CB_SETCURSEL, 0, 0);
         return 0;
       }
       if (code == CBN_SELCHANGE && (id == kFps || id == kMode || id == kResolution || id == kScale || id == kMonitor)) {
@@ -810,8 +855,18 @@ LRESULT CALLBACK wndproc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
       load_settings_controls();  // PC SETTINGS may have changed them
       update_buttons();
       if (wp != 0) {
+        // The error as the game logged it (logs carry no personal data: they can be shared).
         fs::path log = newest_run_log();
         set_text(kStatus, L"The game stopped with an error. Log: " + log.wstring());
+        std::ifstream in(log);
+        std::string line, error;
+        while (std::getline(in, line))
+          if (line.find(" F ") != std::string::npos && line.find("] ") != std::string::npos) {
+            error = line.substr(line.find("] ") + 2);
+            break;
+          }
+        add_log_line("The game stopped with an error" + (error.empty() ? std::string(".") : ": " + error));
+        add_log_line("Its log (no personal data in it, it can be shared as it is): " + narrow(log.wstring()));
       }
       return 0;
     }
@@ -884,7 +939,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int show) {
   DWORD style = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX;
   RECT r{0, 0, S(kClientW), S(kClientH)};
   AdjustWindowRectExForDpi(&r, style, FALSE, 0, g_dpi);
-  g_wnd = CreateWindowExW(0, wc.lpszClassName, L"ARMORED CORE for Answer - PC port", style, CW_USEDEFAULT, CW_USEDEFAULT, r.right - r.left,
+  g_wnd = CreateWindowExW(0, wc.lpszClassName, L"ARMORED CORE for Answer - PC port " ACFA_VERSION_W, style, CW_USEDEFAULT, CW_USEDEFAULT, r.right - r.left,
                           r.bottom - r.top, nullptr, nullptr, inst, nullptr);
   UINT dpi = GetDpiForWindow(g_wnd);
   if (dpi != g_dpi) {  // the window opened on a monitor with another scale

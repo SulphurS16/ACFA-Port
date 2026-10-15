@@ -177,6 +177,7 @@ int main(int argc, char** argv) {
   }
   acfa::add_protected_root(c.disc_root);
   log_set_level(level == "trace" ? Level::Trace : level == "debug" ? Level::Debug : Level::Info);
+  LOG_I("main", "ARMORED CORE for Answer PC port %s", ACFA_VERSION);
   LOG_I("main", "run dir %s", c.run_dir.c_str());
   if (c.affinity) {  // --affinity MASK (hex): fewer logical CPUs, to estimate smaller machines
     if (SetProcessAffinityMask(GetCurrentProcess(), DWORD_PTR(c.affinity)))
