@@ -35,6 +35,7 @@
 #include "runtime/memory.h"
 #include "runtime/rsx/methods.h"
 #include "runtime/rsx/rsx_internal.h"
+#include "runtime/settings.h"
 
 namespace rt::gpu {
 std::atomic<int> g_capture_requests{0};
@@ -150,8 +151,10 @@ void bind_changed(T** want, T** have, F set) {
 // ---------------------------------------------------------------------------------------------
 // Surfaces
 struct Surface {
-  u32 location = 0, offset = 0, format = 0, width = 0, height = 0;
+  u32 location = 0, offset = 0, format = 0;
+  u32 width = 0, height = 0;  // storage: the game's size times the render scale
   bool depth = false;
+  u32 gw = 0, gh = 0;  // the game's size (antialiased surfaces: their super-sized storage)
   DXGI_FORMAT dxgi = DXGI_FORMAT_UNKNOWN;
   ID3D11Texture2D* tex = nullptr;
   ID3D11RenderTargetView* rtv = nullptr;
@@ -176,6 +179,18 @@ std::vector<Surface*> g_surfaces;
 std::unordered_map<u64, Surface*> g_surface_at;
 u64 surface_key(u32 location, u32 offset) { return (u64(location) << 32) | offset; }
 u64 g_write_serial = 0;
+
+// ---- Render scale (true resolution rendering) ----
+// Surfaces are stored at the game's size times the render scale: the 16:9 picture's height in
+// the window or on the screen over the console's 720 lines (2 at 1440p, 3 at 2160p), times the
+// player's render scale (50-200 %). Vertex positions reach clip space through the game's own
+// surface size and fragment programs see window positions in the game's pixels, so only the
+// resolution changes. A new scale applies at a frame boundary, once the output size has settled;
+// surfaces are re-created at their new size, color ones with their content stretched into them.
+float g_scale = 1.0f;
+float g_last_area = 1.0f;  // storage pixels per game sample of the last bound targets (pixel counts)
+constexpr u32 kMaxStorage = 8192;  // per dimension (memory; D3D11 allows 16384)
+u32 scaled(u32 v, float f) { return std::max<u32>(1, u32(std::lround(double(v) * f))); }
 
 DXGI_FORMAT color_dxgi(u32 f) {
   switch (f) {
@@ -215,7 +230,7 @@ void shadow_reset();
 // Render targets of earlier scenes stay until their address is reused: once they exceed the
 // budget, surfaces neither rendered to nor sampled for a minute are destroyed.
 void surface_trim() {
-  constexpr u64 kBudget = 512ull << 20;
+  const u64 kBudget = std::min<u64>(u64((512ull << 20) * std::max(1.0f, g_scale * g_scale)), 3072ull << 20);
   u64 total = 0;
   for (const Surface* s : g_surfaces) total += surface_bytes(s);
   if (total <= kBudget) return;
@@ -238,24 +253,35 @@ void surface_trim() {
   }
 }
 
-Surface* get_surface(u32 location, u32 offset, u32 format, u32 w, u32 h, bool depth) {
+void stretch_copy(Surface* from, Surface* to);
+// gw, gh: the game's size of the surface; it is stored at that size times the render scale.
+Surface* get_surface(u32 location, u32 offset, u32 format, u32 gw, u32 gh, bool depth) {
+  float f = std::min({g_scale, float(kMaxStorage) / float(gw), float(kMaxStorage) / float(gh)});
+  u32 w = scaled(gw, f), h = scaled(gh, f);
   Surface* s = find_surface(location, offset);
-  if (s && s->depth == depth && s->format == format && s->width == w && s->height == h) {
+  if (s && s->depth == depth && s->format == format && s->gw == gw && s->gh == gh && s->width == w && s->height == h) {
     s->last_frame = g_frame;
     return s;
   }
+  Surface* old = nullptr;  // a re-scaled color surface keeps its content
   if (s) {
-    static int logged = 0;
-    if (logged < 24) {
-      ++logged;
-      LOG_I("gpu", "surface at %s 0x%08x recreated: %s %ux%u fmt %u -> %s %ux%u fmt %u", location ? "main" : "local", offset,
-            s->depth ? "depth" : "color", s->width, s->height, s->format, depth ? "depth" : "color", w, h, format);
+    if (!depth && !s->depth && s->format == format && s->gw == gw && s->gh == gh) {
+      old = s;
+    } else {
+      static int logged = 0;
+      if (logged < 24) {
+        ++logged;
+        LOG_I("gpu", "surface at %s 0x%08x recreated: %s %ux%u fmt %u -> %s %ux%u fmt %u", location ? "main" : "local", offset,
+              s->depth ? "depth" : "color", s->gw, s->gh, s->format, depth ? "depth" : "color", gw, gh, format);
+      }
     }
     g_surfaces.erase(std::find(g_surfaces.begin(), g_surfaces.end(), s));
     g_surface_at.erase(surface_key(location, offset));
-    destroy(s);
+    if (!old) destroy(s);
   }
   s = new Surface{location, offset, format, w, h, depth};
+  s->gw = gw;
+  s->gh = gh;
   ++g_rs.surfaces;
   auto* dev = device().dev;
   D3D11_TEXTURE2D_DESC td{};
@@ -298,6 +324,11 @@ Surface* get_surface(u32 location, u32 offset, u32 format, u32 w, u32 h, bool de
   s->last_frame = g_frame;
   g_surfaces.push_back(s);
   g_surface_at[surface_key(location, offset)] = s;
+  if (old) {
+    stretch_copy(old, s);
+    s->written = old->written;
+    destroy(old);
+  }
   LOG_D("gpu", "surface %s %ux%u fmt %u at %s 0x%08x", depth ? "depth" : "color", w, h, format, location ? "main" : "local",
         offset);
   return s;
@@ -313,7 +344,9 @@ struct Targets {
   u32 count = 0;
   Surface* depth = nullptr;
   u32 width = 0, height = 0, color_format = 0, depth_format = 0;
-  u32 sx = 1, sy = 1;
+  u32 sx = 1, sy = 1;    // antialiasing: samples per pixel in x and y (the game's storage is clip size * s)
+  u32 sw = 0, sh = 0;    // the bound targets' storage size
+  float fx = 1, fy = 1;  // storage pixels per clip pixel (antialiasing times the render scale)
   bool valid = false;
 };
 
@@ -329,7 +362,7 @@ Targets bind_targets(bool want_depth) {
   t.sx = aa == 3 || aa == 4 || aa == 5 ? 2 : 1;
   t.sy = aa == 4 || aa == 5 ? 2 : 1;
   if (aa == 5) warn_once("aa-rotated", "SQUARE_ROTATED_4 surfaces are rendered with a square sample grid");
-  const u32 sw = t.width * t.sx, shh = t.height * t.sy;  // storage size
+  const u32 gsw = t.width * t.sx, gsh = t.height * t.sy;  // the game's storage size
   static const u32 kOffsetReg[4] = {m::SET_SURFACE_COLOR_AOFFSET, m::SET_SURFACE_COLOR_BOFFSET, m::SET_SURFACE_COLOR_COFFSET,
                                     m::SET_SURFACE_COLOR_DOFFSET};
   static const u32 kDmaReg[4] = {m::SET_CONTEXT_DMA_COLOR_A, m::SET_CONTEXT_DMA_COLOR_B, m::SET_CONTEXT_DMA_COLOR_C,
@@ -346,9 +379,16 @@ Targets bind_targets(bool want_depth) {
   }
   if ((sf >> 8 & 15) == 2) warn_once("swizzled-rt", "swizzled render targets are rendered as linear surfaces");
   for (u32 i = 0; i < n; ++i)
-    t.color[t.count++] = get_surface(dma_location(reg(kDmaReg[idx[i]])), reg(kOffsetReg[idx[i]]), t.color_format, sw, shh, false);
+    t.color[t.count++] = get_surface(dma_location(reg(kDmaReg[idx[i]])), reg(kOffsetReg[idx[i]]), t.color_format, gsw, gsh, false);
   if (want_depth && t.depth_format)
-    t.depth = get_surface(dma_location(reg(m::SET_CONTEXT_DMA_ZETA)), reg(m::SET_SURFACE_ZETA_OFFSET), t.depth_format, sw, shh, true);
+    t.depth = get_surface(dma_location(reg(m::SET_CONTEXT_DMA_ZETA)), reg(m::SET_SURFACE_ZETA_OFFSET), t.depth_format, gsw, gsh, true);
+  const Surface* first = t.count ? t.color[0] : t.depth;
+  const u32 sw = first ? first->width : gsw, shh = first ? first->height : gsh;
+  t.sw = sw;
+  t.sh = shh;
+  t.fx = float(sw) / float(t.width);
+  t.fy = float(shh) / float(t.height);
+  g_last_area = (t.fx / float(t.sx)) * (t.fy / float(t.sy));
   ID3D11RenderTargetView* rtvs[4] = {};
   for (u32 i = 0; i < t.count; ++i) rtvs[i] = t.color[i]->rtv;
   ID3D11DepthStencilView* dsv = t.depth ? t.depth->dsv : nullptr;
@@ -390,7 +430,9 @@ D3D11_RECT scissor_rect(const Targets& t, bool clear) {
   D3D11_RECT r{std::max<LONG>(x0, 0), std::max<LONG>(y0, 0), std::min<LONG>(x1, LONG(t.width)), std::min<LONG>(y1, LONG(t.height))};
   if (r.right < r.left) r.right = r.left;
   if (r.bottom < r.top) r.bottom = r.top;
-  r.left *= LONG(t.sx), r.right *= LONG(t.sx), r.top *= LONG(t.sy), r.bottom *= LONG(t.sy);  // storage pixels
+  // Storage pixels (the same rounding as the surface size, so a full rectangle is the whole surface).
+  r.left = std::lround(r.left * t.fx), r.right = std::lround(r.right * t.fx);
+  r.top = std::lround(r.top * t.fy), r.bottom = std::lround(r.bottom * t.fy);
   return r;
 }
 
@@ -423,7 +465,7 @@ void clear_surface(u32 mask) {
   float col[4] = {((cv >> 16) & 0xff) / 255.0f, ((cv >> 8) & 0xff) / 255.0f, (cv & 0xff) / 255.0f, (cv >> 24) / 255.0f};
   if (t.color_format == 16 || t.color_format == 14 || t.color_format == 15) std::swap(col[0], col[2]);  // ABGR formats
   D3D11_RECT r = scissor_rect(t, true);
-  bool full = r.left == 0 && r.top == 0 && r.right == LONG(t.width * t.sx) && r.bottom == LONG(t.height * t.sy);
+  bool full = r.left == 0 && r.top == 0 && r.right == LONG(t.sw) && r.bottom == LONG(t.sh);
   u32 cmask = (mask >> 4) & 0xf;  // R G B A in bits 0..3
   if (cmask && t.count) {
     if (full && cmask == 0xf) {
@@ -936,6 +978,87 @@ float4 ps_main(float4 pos : SV_Position) : SV_Target0 {
   return float4(((z >> 8) & 255) / 255.0, (z & 255) / 255.0, s / 255.0, (z >> 16) / 255.0);
 }
 )";
+// A full-screen pass into `out` (w x h pixels) with the given shaders and inputs. It is recorded
+// as one call that saves and restores every state it changes: passes run while a draw is being
+// prepared, in stream order (submit.h), where the state they save is current.
+void fullscreen_pass(ID3D11RenderTargetView* out, u32 w, u32 h, ID3D11VertexShader* vs, ID3D11PixelShader* ps,
+                     ID3D11ShaderResourceView* in0, ID3D11ShaderResourceView* in1, ID3D11SamplerState* smp) {
+  D3D11_BLEND_DESC bd{};
+  bd.RenderTarget[0].RenderTargetWriteMask = D3D11_COLOR_WRITE_ENABLE_ALL;
+  D3D11_DEPTH_STENCIL_DESC dd{};
+  D3D11_RASTERIZER_DESC rd{};
+  rd.FillMode = D3D11_FILL_SOLID;
+  rd.CullMode = D3D11_CULL_NONE;
+  ID3D11BlendState* pass_bs = blend_state(bd);
+  ID3D11DepthStencilState* pass_ds = depth_state(dd);
+  ID3D11RasterizerState* pass_rs = raster_state(rd);
+  gpu::rec().call([=](ID3D11DeviceContext* c) {
+    ID3D11RenderTargetView* rtvs[4] = {};
+    ID3D11DepthStencilView* dsv = nullptr;
+    c->OMGetRenderTargets(4, rtvs, &dsv);
+    D3D11_VIEWPORT vp[1];
+    UINT nvp = 1;
+    c->RSGetViewports(&nvp, vp);
+    ID3D11BlendState* old_bs = nullptr;
+    float old_bf[4];
+    UINT old_mask = 0;
+    c->OMGetBlendState(&old_bs, old_bf, &old_mask);
+    ID3D11DepthStencilState* old_ds = nullptr;
+    UINT old_ref = 0;
+    c->OMGetDepthStencilState(&old_ds, &old_ref);
+    ID3D11RasterizerState* old_rs = nullptr;
+    c->RSGetState(&old_rs);
+    D3D11_RECT old_sc[1];
+    UINT nsc = 1;
+    c->RSGetScissorRects(&nsc, old_sc);
+    D3D11_PRIMITIVE_TOPOLOGY old_topo;
+    c->IAGetPrimitiveTopology(&old_topo);
+    ID3D11VertexShader* old_vs = nullptr;
+    ID3D11PixelShader* old_ps = nullptr;
+    c->VSGetShader(&old_vs, nullptr, nullptr);
+    c->PSGetShader(&old_ps, nullptr, nullptr);
+    ID3D11ShaderResourceView* old_srv[2] = {};
+    c->PSGetShaderResources(0, 2, old_srv);
+    ID3D11SamplerState* old_smp = nullptr;
+    c->PSGetSamplers(0, 1, &old_smp);
+    ID3D11ShaderResourceView* none[2] = {};
+    c->PSSetShaderResources(0, 2, none);  // the output may be bound as an input of the pending draw
+    c->OMSetRenderTargets(1, &out, nullptr);
+    D3D11_VIEWPORT v{0, 0, float(w), float(h), 0, 1};
+    c->RSSetViewports(1, &v);
+    c->OMSetBlendState(pass_bs, nullptr, 0xffffffff);
+    c->OMSetDepthStencilState(pass_ds, 0);
+    c->RSSetState(pass_rs);
+    c->IASetInputLayout(nullptr);
+    c->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    c->VSSetShader(vs, nullptr, 0);
+    c->PSSetShader(ps, nullptr, 0);
+    ID3D11ShaderResourceView* in[2] = {in0, in1};
+    c->PSSetShaderResources(0, 2, in);
+    if (smp) c->PSSetSamplers(0, 1, &smp);
+    c->Draw(3, 0);
+    c->PSSetShaderResources(0, 2, none);
+    c->OMSetRenderTargets(4, rtvs, dsv);
+    c->PSSetShaderResources(0, 2, old_srv);
+    if (smp) c->PSSetSamplers(0, 1, &old_smp);
+    if (nvp) c->RSSetViewports(nvp, vp);
+    c->OMSetBlendState(old_bs, old_bf, old_mask);
+    c->OMSetDepthStencilState(old_ds, old_ref);
+    c->RSSetState(old_rs);
+    if (nsc) c->RSSetScissorRects(nsc, old_sc);
+    c->IASetPrimitiveTopology(old_topo);
+    c->VSSetShader(old_vs, nullptr, 0);
+    c->PSSetShader(old_ps, nullptr, 0);
+    for (IUnknown* o : {static_cast<IUnknown*>(rtvs[0]), static_cast<IUnknown*>(rtvs[1]), static_cast<IUnknown*>(rtvs[2]),
+                        static_cast<IUnknown*>(rtvs[3]), static_cast<IUnknown*>(dsv), static_cast<IUnknown*>(old_bs),
+                        static_cast<IUnknown*>(old_ds), static_cast<IUnknown*>(old_rs), static_cast<IUnknown*>(old_vs),
+                        static_cast<IUnknown*>(old_ps), static_cast<IUnknown*>(old_srv[0]), static_cast<IUnknown*>(old_srv[1]),
+                        static_cast<IUnknown*>(old_smp)})
+      if (o) o->Release();  // references taken by the Get calls above (this thread)
+  });
+  shadow_reset();
+}
+
 ID3D11ShaderResourceView* depth_as_color(Surface* s) {
   if (s->format != 2 || !s->stencil_srv) {
     warn_once("z16-as-color", "16-bit depth sampled with a color format: raw depth used");
@@ -966,80 +1089,73 @@ ID3D11ShaderResourceView* depth_as_color(Surface* s) {
     dev->CreateShaderResourceView(s->as_color, nullptr, &s->as_color_srv);
   }
   if (s->as_color_serial == s->written) return s->as_color_srv;
-  // The pass runs while a draw is being prepared: everything it changes is saved and restored.
-  // It runs as one closure in stream order (submit.h), where the state it saves is current.
-  D3D11_BLEND_DESC bd{};
-  bd.RenderTarget[0].RenderTargetWriteMask = D3D11_COLOR_WRITE_ENABLE_ALL;
-  D3D11_DEPTH_STENCIL_DESC dd{};
-  D3D11_RASTERIZER_DESC rd{};
-  rd.FillMode = D3D11_FILL_SOLID;
-  rd.CullMode = D3D11_CULL_NONE;
-  ID3D11BlendState* pass_bs = blend_state(bd);
-  ID3D11DepthStencilState* pass_ds = depth_state(dd);
-  ID3D11RasterizerState* pass_rs = raster_state(rd);
-  ID3D11RenderTargetView* out_rtv = s->as_color_rtv;
-  ID3D11ShaderResourceView* in[2] = {s->srv, s->stencil_srv};
-  u32 width = s->width, height = s->height;
-  gpu::timing::mark(acfa::strprintf("depth as color %ux%u", width, height));
-  gpu::rec().call([=](ID3D11DeviceContext* c) {
-  ID3D11RenderTargetView* rtvs[4] = {};
-  ID3D11DepthStencilView* dsv = nullptr;
-  c->OMGetRenderTargets(4, rtvs, &dsv);
-  D3D11_VIEWPORT vp[1];
-  UINT nvp = 1;
-  c->RSGetViewports(&nvp, vp);
-  ID3D11BlendState* old_bs = nullptr;
-  float old_bf[4];
-  UINT old_mask = 0;
-  c->OMGetBlendState(&old_bs, old_bf, &old_mask);
-  ID3D11DepthStencilState* old_ds = nullptr;
-  UINT old_ref = 0;
-  c->OMGetDepthStencilState(&old_ds, &old_ref);
-  ID3D11RasterizerState* old_rs = nullptr;
-  c->RSGetState(&old_rs);
-  D3D11_RECT old_sc[1];
-  UINT nsc = 1;
-  c->RSGetScissorRects(&nsc, old_sc);
-  D3D11_PRIMITIVE_TOPOLOGY old_topo;
-  c->IAGetPrimitiveTopology(&old_topo);
-  ID3D11VertexShader* old_vs = nullptr;
-  ID3D11PixelShader* old_ps = nullptr;
-  c->VSGetShader(&old_vs, nullptr, nullptr);
-  c->PSGetShader(&old_ps, nullptr, nullptr);
-  ID3D11ShaderResourceView* none[2] = {};
-  c->OMSetRenderTargets(1, &out_rtv, nullptr);
-  D3D11_VIEWPORT v{0, 0, float(width), float(height), 0, 1};
-  c->RSSetViewports(1, &v);
-  c->OMSetBlendState(pass_bs, nullptr, 0xffffffff);
-  c->OMSetDepthStencilState(pass_ds, 0);
-  c->RSSetState(pass_rs);
-  c->IASetInputLayout(nullptr);
-  c->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
-  c->VSSetShader(g_d2c_vs, nullptr, 0);
-  c->PSSetShader(g_d2c_ps, nullptr, 0);
-  c->PSSetShaderResources(0, 2, in);
-  c->Draw(3, 0);
-  c->PSSetShaderResources(0, 2, none);
-  c->OMSetRenderTargets(4, rtvs, dsv);
-  for (auto* r : rtvs)
-    if (r) r->Release();  // references taken by the Get calls above (this thread)
-  if (dsv) dsv->Release();
-  if (nvp) c->RSSetViewports(nvp, vp);
-  c->OMSetBlendState(old_bs, old_bf, old_mask);
-  c->OMSetDepthStencilState(old_ds, old_ref);
-  c->RSSetState(old_rs);
-  if (nsc) c->RSSetScissorRects(nsc, old_sc);
-  c->IASetPrimitiveTopology(old_topo);
-  c->VSSetShader(old_vs, nullptr, 0);
-  c->PSSetShader(old_ps, nullptr, 0);
-  for (IUnknown* o : {static_cast<IUnknown*>(old_bs), static_cast<IUnknown*>(old_ds), static_cast<IUnknown*>(old_rs),
-                      static_cast<IUnknown*>(old_vs), static_cast<IUnknown*>(old_ps)})
-    if (o) o->Release();
-  });
+  gpu::timing::mark(acfa::strprintf("depth as color %ux%u", s->width, s->height));
+  fullscreen_pass(s->as_color_rtv, s->width, s->height, g_d2c_vs, g_d2c_ps, s->srv, s->stencil_srv, nullptr);
   gpu::timing::mark(g_rt_label);
   s->as_color_serial = s->written;
-  shadow_reset();
   return s->as_color_srv;
+}
+
+// A color surface re-created at another render scale gets its old content stretched into it, so
+// what the game rendered once (and keeps sampling) survives the change.
+ID3D11VertexShader* g_stretch_vs = nullptr;
+ID3D11PixelShader* g_stretch_ps = nullptr;
+const char* kStretchHlsl = R"(
+Texture2D src : register(t0);
+SamplerState smp : register(s0);
+struct V { float4 pos : SV_Position; float2 uv : TEXCOORD0; };
+V vs_main(uint id : SV_VertexID) {
+  V o;
+  o.uv = float2((id << 1) & 2, id & 2);
+  o.pos = float4(o.uv * float2(2, -2) + float2(-1, 1), 0, 1);
+  return o;
+}
+float4 ps_main(V i) : SV_Target0 { return src.SampleLevel(smp, i.uv, 0); }
+)";
+void stretch_copy(Surface* from, Surface* to) {
+  if (!from->srv || !to->rtv) return;
+  auto* dev = device().dev;
+  if (!g_stretch_vs) {
+    ID3DBlob* vs = gpu::compile_hlsl(kStretchHlsl, "vs_main", "vs_5_0");
+    ID3DBlob* ps = gpu::compile_hlsl(kStretchHlsl, "ps_main", "ps_5_0");
+    if (vs) dev->CreateVertexShader(vs->GetBufferPointer(), vs->GetBufferSize(), nullptr, &g_stretch_vs);
+    if (ps) dev->CreatePixelShader(ps->GetBufferPointer(), ps->GetBufferSize(), nullptr, &g_stretch_ps);
+    release(vs);
+    release(ps);
+    if (!g_stretch_vs || !g_stretch_ps) return;
+  }
+  D3D11_SAMPLER_DESC sd{};
+  sd.Filter = D3D11_FILTER_MIN_MAG_MIP_LINEAR;
+  sd.AddressU = sd.AddressV = sd.AddressW = D3D11_TEXTURE_ADDRESS_CLAMP;
+  sd.MaxLOD = D3D11_FLOAT32_MAX;
+  fullscreen_pass(to->rtv, to->width, to->height, g_stretch_vs, g_stretch_ps, from->srv, nullptr, sampler_state(sd));
+}
+
+// The render scale for the next frame: the output's 16:9 picture height over 720 times the
+// player's render scale, applied once it has held for 20 frames (a window being resized).
+void update_render_scale() {
+  int w = 0, h = 0;
+  gpu::window_client_size(&w, &h);
+  if (w <= 0 || h <= 0) return;  // minimized: keep the scale
+  int pct = cfg().render_scale ? cfg().render_scale : settings::display().render_scale;
+  float fit_h = std::min(float(h), float(w) * 9.0f / 16.0f);
+  float target = std::clamp(fit_h / 720.0f * float(pct) / 100.0f, 0.5f, 4.0f);
+  static float pending = 0;
+  static int stable = 0;
+  if (std::abs(target - g_scale) < 0.001f) {
+    pending = 0;
+    return;
+  }
+  if (std::abs(target - pending) > 0.001f) {
+    pending = target;
+    stable = 0;
+    return;
+  }
+  if (++stable < 20) return;
+  g_scale = target;
+  pending = 0;
+  LOG_I("gpu", "render scale %.3f (output %dx%d, render scale %d%%): the game's 1280x720 renders at %ux%u", g_scale, w, h, pct,
+        scaled(1280, g_scale), scaled(720, g_scale));
 }
 
 // The rendered surface a texture refers to, if any. Rendered data never reaches guest memory
@@ -1053,16 +1169,16 @@ Surface* texture_surface(const gpu::TexDesc& t) {
   bool compressed = t.format == 0x86 || t.format == 0x87 || t.format == 0x88;
   bool depth_fmt = t.format >= 0x90 && t.format <= 0x93;
   if (s->depth) {
-    bool ok = (depth_fmt || t.format == 0x85 || t.format == 0x9e) && t.width <= s->width && t.height <= s->height;
+    bool ok = (depth_fmt || t.format == 0x85 || t.format == 0x9e) && t.width <= s->gw && t.height <= s->gh;
     return ok ? s : nullptr;
   }
   if (depth_fmt) return nullptr;
   if (compressed) {
-    if (t.width != s->width || t.height != s->height) return nullptr;
+    if (t.width != s->gw || t.height != s->gh) return nullptr;
     warn_once("dxt-alias", "compressed textures at rendered surfaces read the rendered pixels (GPU results are not written back)");
     return s;
   }
-  return t.width <= s->width && t.height <= s->height ? s : nullptr;
+  return t.width <= s->gw && t.height <= s->gh ? s : nullptr;
 }
 
 ID3D11ShaderResourceView* texture_view(const gpu::TexDesc& t, float* scale) {
@@ -1501,7 +1617,10 @@ void set_pipeline_state(const Targets& t) {
   rd.ScissorEnable = TRUE;
   if (reg(m::SET_POLY_OFFSET_FILL_ENABLE)) {
     rd.DepthBias = INT(f32_of(reg(m::SET_POLYGON_OFFSET_BIAS)));
-    rd.SlopeScaledDepthBias = f32_of(reg(m::SET_POLYGON_OFFSET_SCALE_FACTOR));
+    // The slope is measured per storage pixel: at render scale f a pixel spans 1/f of the game's,
+    // so the factor grows by f for the same offset in depth (shadow maps keep their bias).
+    float f = std::max(t.fx / float(t.sx), t.fy / float(t.sy));
+    rd.SlopeScaledDepthBias = f32_of(reg(m::SET_POLYGON_OFFSET_SCALE_FACTOR)) * f;
   }
   ID3D11RasterizerState* rs = raster_state(rd);
   if (rs != g_sh.raster) {
@@ -2103,8 +2222,8 @@ void flush_draw() {
   bool float_rt = t.color_format >= 11 && t.color_format <= 13;
   fst.flags[1] = reg(m::SET_ALPHA_TEST_ENABLE) && !float_rt ? (reg(m::SET_ALPHA_FUNC) & 7) + 1 : 0;
   fst.alpha[0] = (reg(m::SET_ALPHA_REF) & 0xff) / 255.0f;
-  fst.alpha[2] = 1.0f / float(t.sx);  // window position: storage pixels -> pixels
-  fst.alpha[3] = 1.0f / float(t.sy);
+  fst.alpha[2] = 1.0f / t.fx;  // window position: storage pixels -> the game's pixels
+  fst.alpha[3] = 1.0f / t.fy;
   if (t.color_format == 11) fst.alpha[0] = half_to_float(u16(reg(m::SET_ALPHA_REF)));
   u32 fog_mode = reg(m::SET_FOG_MODE);
   std::memcpy(&fst.fog[0], &fog_mode, 4);
@@ -2282,17 +2401,23 @@ int phase_switch(int p) {
 // CLEAR_REPORT_VALUE(1). Each counting span is a D3D11 occlusion query. A report gets at once the
 // last count known for its address (ACFA asks about every other frame in missions and reads the
 // value later), and the submission thread writes the real count into guest memory once the GPU
-// has it (polled at frame ends). Was always 0 before (nothing ever counted as visible).
+// has it (polled at frame ends). Was always 0 before (nothing ever counted as visible). Counts are
+// in the game's samples: at a render scale a sample covers more storage pixels (the sun glare's
+// strength follows the count).
 namespace {
+struct ZpSpan {
+  ID3D11Query* q;
+  float area;  // storage pixels per game sample while it counted
+};
 ID3D11Query* g_zp_open = nullptr;        // FIFO thread: the query of the counting span in progress
-std::vector<ID3D11Query*> g_zp_closed;   // FIFO thread: spans ended since the last clear
+std::vector<ZpSpan> g_zp_closed;         // FIFO thread: spans ended since the last clear
 bool g_zp_used = false;                  // FIFO thread: a pixel count was reported (frame-end polls)
 bool g_zp_on = true;                     // "gpu zpass on|off" (A/B: off answers 0 as before)
 std::mutex g_zp_mu;
 std::unordered_map<u32, u32> g_zp_last;  // report address -> last count written (under g_zp_mu)
 struct ZpReport {
   u32 ea;
-  std::vector<ID3D11Query*> qs;
+  std::vector<ZpSpan> qs;
 };
 std::vector<ZpReport> g_zp_pending;  // submission thread (recorded calls) only
 
@@ -2307,7 +2432,7 @@ void zpass_end() {
   ID3D11Query* q = g_zp_open;
   if (!q) return;
   gpu::rec().call([q](ID3D11DeviceContext* c) { c->End(q); });
-  g_zp_closed.push_back(q);
+  g_zp_closed.push_back({q, std::max(g_last_area, 1e-3f)});
   g_zp_open = nullptr;
   if (g_zp_closed.size() == 1024) warn_once("zpass-spans", "pixel counting: 1024 spans without CLEAR_REPORT_VALUE");
 }
@@ -2320,28 +2445,28 @@ void zpass_enable(bool on) {
 void zpass_clear() {
   bool counting = g_zp_open != nullptr;
   zpass_end();
-  for (ID3D11Query* q : g_zp_closed) gpu::rec().release(q);
+  for (const ZpSpan& z : g_zp_closed) gpu::rec().release(z.q);
   g_zp_closed.clear();
   if (counting) zpass_begin();  // counting stays enabled across the clear
 }
 // Submission thread: writes the counts of the reports whose queries have finished.
 void zpass_poll(ID3D11DeviceContext* c) {
   for (auto it = g_zp_pending.begin(); it != g_zp_pending.end();) {
-    u64 total = 0;
+    double total = 0;
     bool done = true;
-    for (ID3D11Query* q : it->qs) {
+    for (const ZpSpan& z : it->qs) {
       UINT64 n = 0;
-      if (c->GetData(q, &n, sizeof n, D3D11_ASYNC_GETDATA_DONOTFLUSH) != S_OK) {
+      if (c->GetData(z.q, &n, sizeof n, D3D11_ASYNC_GETDATA_DONOTFLUSH) != S_OK) {
         done = false;
         break;
       }
-      total += n;
+      total += double(n) / z.area;
     }
     if (!done) {
       ++it;
       continue;
     }
-    u32 v = u32(std::min<u64>(total, 0xffffffffu));
+    u32 v = u32(std::min(std::round(total), 4294967295.0));
     static int logged = 0;
     if (logged < 6) {
       ++logged;
@@ -2352,7 +2477,7 @@ void zpass_poll(ID3D11DeviceContext* c) {
       std::lock_guard lk(g_zp_mu);
       g_zp_last[it->ea] = v;
     }
-    for (ID3D11Query* q : it->qs) q->Release();
+    for (const ZpSpan& z : it->qs) z.q->Release();
     it = g_zp_pending.erase(it);
   }
 }
@@ -2364,8 +2489,8 @@ u32 zpass_report(u32 ea) {
     zpass_end();
     zpass_begin();
   }
-  std::vector<ID3D11Query*> qs = g_zp_closed;
-  for (ID3D11Query* q : qs) q->AddRef();  // the resolver's references
+  std::vector<ZpSpan> qs = g_zp_closed;
+  for (const ZpSpan& z : qs) z.q->AddRef();  // the resolver's references
   gpu::rec().call([qs, ea](ID3D11DeviceContext*) { g_zp_pending.push_back({ea, qs}); });
   std::lock_guard lk(g_zp_mu);
   auto it = g_zp_last.find(ea);
@@ -2573,6 +2698,7 @@ void present_buffer(u32 id, const DisplayBuffer& b) {
   }
   ++g_frame;
   gpu::timing::mark("present");
+  update_render_scale();
   Surface* s = find_surface(0, b.offset);
   if (s && !s->depth) {
     ID3D11RenderTargetView* none = nullptr;

@@ -1,7 +1,9 @@
 // ACFA-Launcher: the player's way in. Finds and checks the game files (the disc folder and the
 // files the player decrypted with RPCS3) and the install folder, runs the first-time preparation and build
-// (setup.h), sets the frame rate, display mode and resolution (the shared settings file, also
-// changed in game under SYSTEM > PC SETTINGS), backs up and restores saves, and starts the game.
+// (setup.h), sets the frame rate, display mode, resolution, render scale and monitor (the shared
+// settings file, also changed in game under SYSTEM > PC SETTINGS), backs up and restores saves,
+// and starts the game (optionally in safe mode). Settings and saves are the player's own: they
+// live in Saved Games\ARMORED CORE for Answer, the install folder holds the rest.
 // Contains no game data or game-derived code.
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
@@ -38,7 +40,7 @@ enum Id {
   kDiscState = 120, kRpcs3State, kUpdateState,
   kDataEdit = 130, kDataBrowse, kDataState,
   kPrepare = 140, kCancel, kOpenLog, kProgress, kStatus, kLog,
-  kFps = 150, kMode, kResolution,
+  kFps = 150, kMode, kResolution, kScale, kMonitor, kResetSettings, kSafeMode,
   kSavesPath = 160, kSavesOpen, kSavesBackup, kSavesRestore,
   kPlay = 170, kPlayState,
   kLabel = 200,
@@ -51,6 +53,7 @@ UINT g_dpi = 96;
 int S(int v) { return MulDiv(v, int(g_dpi), 96); }
 
 fs::path g_src, g_ini_path;
+fs::path g_user_override;  // launcher.ini [paths] user
 SetupConfig g_cfg;
 Setup g_setup;
 HANDLE g_game = nullptr;
@@ -80,6 +83,7 @@ void load_paths() {
   g_cfg.disc = p("disc");
   g_cfg.rpcs3 = p("rpcs3");
   g_cfg.data = p("install");
+  g_user_override = p("user");  // optional: settings and saves somewhere else than Saved Games
 }
 
 void save_paths() {
@@ -114,6 +118,18 @@ fs::path local_appdata() {
   return r / L"ACFA Port";
 }
 
+// The player's own folder: settings.ini, savedata\ and backups\ (Saved Games\ARMORED CORE for
+// Answer; under Local AppData when Windows has no Saved Games folder; launcher.ini [paths] user
+// names another folder).
+fs::path user_dir() {
+  if (!g_user_override.empty()) return g_user_override;
+  PWSTR p = nullptr;
+  fs::path r;
+  if (SUCCEEDED(SHGetKnownFolderPath(FOLDERID_SavedGames, KF_FLAG_CREATE, nullptr, &p))) r = fs::path(p) / L"ARMORED CORE for Answer";
+  CoTaskMemFree(p);
+  return r.empty() ? local_appdata() / L"user" : r;
+}
+
 // The port's sources: the launcher sits in their folder (a release) or in a build folder below.
 fs::path find_sources() {
   wchar_t buf[MAX_PATH * 4];
@@ -128,18 +144,47 @@ fs::path find_sources() {
   return {};
 }
 
-// ---- settings (the shared file in the install folder) ----
-fs::path settings_path() { return acfa::settings::file_in(g_cfg.data); }
+// ---- settings (the shared file in the player's folder) ----
+fs::path settings_path() { return user_dir() / "settings.ini"; }
+
+// The monitors (Windows' order) and the one the settings choose ("" or unknown: the primary).
+struct MonitorItem {
+  std::wstring device;
+  RECT rect{}, work{};
+  bool primary = false;
+};
+std::vector<MonitorItem> monitors() {
+  std::vector<MonitorItem> out;
+  EnumDisplayMonitors(nullptr, nullptr, [](HMONITOR hm, HDC, LPRECT, LPARAM lp) -> BOOL {
+    MONITORINFOEXW mi{};
+    mi.cbSize = sizeof mi;
+    if (GetMonitorInfoW(hm, &mi))
+      reinterpret_cast<std::vector<MonitorItem>*>(lp)->push_back({mi.szDevice, mi.rcMonitor, mi.rcWork, (mi.dwFlags & MONITORINFOF_PRIMARY) != 0});
+    return TRUE;
+  }, reinterpret_cast<LPARAM>(&out));
+  return out;
+}
+std::vector<MonitorItem> g_monitor_items;  // the monitor combo's entries
+MonitorItem chosen_monitor(const acfa::settings::Display& d) {
+  std::vector<MonitorItem> ms = monitors();
+  MonitorItem pick;
+  for (const MonitorItem& m : ms)
+    if (m.primary) pick = m;
+  for (const MonitorItem& m : ms)
+    if (!d.monitor.empty() && narrow(m.device) == d.monitor) pick = m;
+  return pick;
+}
 
 struct ModeItem {
   int w, h, hz;
 };
 std::vector<ModeItem> g_res_items;  // the resolution combo's entries for the current mode
+std::vector<int> g_scale_items;     // the render scale combo's percentages
 
-void monitor_size(int* w, int* h, int* hz) {
+void monitor_size(const MonitorItem& mon, int* w, int* h, int* hz) {
   DEVMODEW dm{};
   dm.dmSize = sizeof dm;
-  EnumDisplaySettingsW(nullptr, ENUM_CURRENT_SETTINGS, &dm);
+  EnumDisplaySettingsW(mon.device.empty() ? nullptr : mon.device.c_str(), ENUM_CURRENT_SETTINGS, &dm);
   *w = int(dm.dmPelsWidth);
   *h = int(dm.dmPelsHeight);
   *hz = int(dm.dmDisplayFrequency);
@@ -149,16 +194,16 @@ void fill_resolutions(const acfa::settings::Display& d) {
   HWND cb = item(kResolution);
   SendMessageW(cb, CB_RESETCONTENT, 0, 0);
   g_res_items.clear();
+  MonitorItem mon = chosen_monitor(d);
   int mw, mh, mhz;
-  monitor_size(&mw, &mh, &mhz);
+  monitor_size(mon, &mw, &mh, &mhz);
   int sel = 0;
   auto add = [&](const std::wstring& text, ModeItem m) {
     SendMessageW(cb, CB_ADDSTRING, 0, LPARAM(text.c_str()));
     g_res_items.push_back(m);
   };
   if (d.mode == acfa::settings::Mode::Windowed) {
-    RECT wa{};
-    SystemParametersInfoW(SPI_GETWORKAREA, 0, &wa, 0);
+    RECT wa = mon.work;
     for (const auto& s : acfa::settings::window_sizes()) {
       if ((s.w > wa.right - wa.left || s.h > wa.bottom - wa.top) && !(s.w == d.width && s.h == d.height)) continue;
       if (s.w == d.width && s.h == d.height) sel = int(g_res_items.size());
@@ -175,7 +220,7 @@ void fill_resolutions(const acfa::settings::Display& d) {
     std::vector<ModeItem> modes;
     DEVMODEW dm{};
     dm.dmSize = sizeof dm;
-    for (DWORD i = 0; EnumDisplaySettingsW(nullptr, i, &dm); ++i)
+    for (DWORD i = 0; EnumDisplaySettingsW(mon.device.empty() ? nullptr : mon.device.c_str(), i, &dm); ++i)
       if (dm.dmBitsPerPel == 32 && dm.dmPelsWidth >= 640 && seen.insert({int(dm.dmPelsWidth), int(dm.dmPelsHeight), int(dm.dmDisplayFrequency)}).second)
         modes.push_back({int(dm.dmPelsWidth), int(dm.dmPelsHeight), int(dm.dmDisplayFrequency)});
     std::sort(modes.begin(), modes.end(), [](const ModeItem& a, const ModeItem& b) {
@@ -205,7 +250,7 @@ void load_settings_controls() {
   int sel = -1;
   const auto& choices = acfa::settings::fps_choices();
   for (size_t i = 0; i < choices.size(); ++i) {
-    std::wstring t = widen(choices[i].label) + (choices[i].validated ? L"" : L" (untested)");
+    std::wstring t = widen(choices[i].label);
     SendMessageW(fps, CB_ADDSTRING, 0, LPARAM(t.c_str()));
     if (std::abs(choices[i].fps - d.fps) < 0.01) sel = int(i);
   }
@@ -220,6 +265,31 @@ void load_settings_controls() {
   for (const wchar_t* m : {L"Windowed", L"Fullscreen", L"Borderless fullscreen"}) SendMessageW(mode, CB_ADDSTRING, 0, LPARAM(m));
   SendMessageW(mode, CB_SETCURSEL, d.mode == acfa::settings::Mode::Fullscreen ? 1 : d.mode == acfa::settings::Mode::Borderless ? 2 : 0, 0);
   fill_resolutions(d);
+  HWND scale = item(kScale);
+  SendMessageW(scale, CB_RESETCONTENT, 0, 0);
+  g_scale_items.clear();
+  for (int pct = acfa::settings::kRenderScaleMin; pct <= acfa::settings::kRenderScaleMax; pct += 25) g_scale_items.push_back(pct);
+  if (std::find(g_scale_items.begin(), g_scale_items.end(), d.render_scale) == g_scale_items.end()) {
+    g_scale_items.push_back(d.render_scale);
+    std::sort(g_scale_items.begin(), g_scale_items.end());
+  }
+  for (int pct : g_scale_items) {
+    std::wstring t = std::to_wstring(pct) + L" %" + (pct == 100 ? L" (the output resolution)" : L"");
+    SendMessageW(scale, CB_ADDSTRING, 0, LPARAM(t.c_str()));
+    if (pct == d.render_scale) SendMessageW(scale, CB_SETCURSEL, WPARAM(SendMessageW(scale, CB_GETCOUNT, 0, 0) - 1), 0);
+  }
+  HWND mon = item(kMonitor);
+  SendMessageW(mon, CB_RESETCONTENT, 0, 0);
+  g_monitor_items = monitors();
+  MonitorItem cur = chosen_monitor(d);
+  for (size_t i = 0; i < g_monitor_items.size(); ++i) {
+    const MonitorItem& m = g_monitor_items[i];
+    std::wstring t = std::to_wstring(i + 1) + L": " + std::to_wstring(m.rect.right - m.rect.left) + L" x " +
+                     std::to_wstring(m.rect.bottom - m.rect.top) + (m.primary ? L" (primary)" : L"");
+    SendMessageW(mon, CB_ADDSTRING, 0, LPARAM(t.c_str()));
+    if (m.device == cur.device) SendMessageW(mon, CB_SETCURSEL, WPARAM(i), 0);
+  }
+  EnableWindow(mon, g_monitor_items.size() > 1 && g_game == nullptr);
 }
 
 void save_setting(int id) {
@@ -234,6 +304,15 @@ void save_setting(int id) {
     } else if (id == kMode) {
       d.mode = sel == 1 ? acfa::settings::Mode::Fullscreen : sel == 2 ? acfa::settings::Mode::Borderless : acfa::settings::Mode::Windowed;
       ini.set("display", "mode", acfa::settings::mode_name(d.mode));
+      fill_resolutions(d);
+    } else if (id == kScale && sel >= 0 && sel < int(g_scale_items.size())) {
+      ini.set("display", "render_scale", std::to_string(g_scale_items[size_t(sel)]));
+    } else if (id == kMonitor && sel >= 0 && sel < int(g_monitor_items.size())) {
+      const MonitorItem& m = g_monitor_items[size_t(sel)];
+      d.monitor = m.primary ? "" : narrow(m.device);
+      d.fs_width = d.fs_height = d.fs_hz = 0;  // that monitor's desktop mode
+      ini.set("display", "monitor", d.monitor);
+      ini.set("display", "fullscreen_mode", acfa::settings::fullscreen_text(d));
       fill_resolutions(d);
     } else if (id == kResolution && sel >= 0 && sel < int(g_res_items.size())) {
       const ModeItem& m = g_res_items[size_t(sel)];
@@ -253,8 +332,8 @@ void save_setting(int id) {
 }
 
 // ---- saves ----
-fs::path saves_dir() { return g_cfg.data / "hdd0" / "home" / "00000001" / "savedata"; }
-fs::path backups_dir() { return g_cfg.data / "backups"; }
+fs::path saves_dir() { return user_dir() / "savedata"; }
+fs::path backups_dir() { return user_dir() / "backups"; }
 
 std::wstring stamp_now() {
   std::time_t t = std::time(nullptr);
@@ -274,6 +353,29 @@ size_t copy_saves(const fs::path& from, const fs::path& to) {
     if (!ec) ++n;
   }
   return n;
+}
+
+void add_log_line(const std::string& s);
+
+// Earlier versions kept settings and saves in the install folder: copied to the player's folder
+// once (the originals stay where they are).
+void move_to_user_dir() {
+  if (g_cfg.data.empty()) return;
+  std::error_code ec;
+  fs::create_directories(user_dir(), ec);
+  fs::path old_settings = acfa::settings::file_in(g_cfg.data);
+  if (!fs::exists(settings_path(), ec) && fs::exists(old_settings, ec) && fs::copy_file(old_settings, settings_path(), ec))
+    add_log_line("Settings copied from the install folder to " + narrow(settings_path().wstring()) + ".");
+  fs::path old_saves = g_cfg.data / "hdd0" / "home" / "00000001" / "savedata";
+  bool have = false;
+  for (const auto& e : fs::directory_iterator(saves_dir(), ec))
+    have |= e.is_directory() && e.path().filename().wstring().rfind(L"BLUS30187", 0) == 0;
+  if (!have && fs::exists(old_saves, ec)) {
+    if (size_t n = copy_saves(old_saves, saves_dir()))
+      add_log_line(acfa::strprintf("%zu save(s) copied from the install folder to ", n) + narrow(saves_dir().wstring()) + ".");
+  }
+  fs::path old_backups = g_cfg.data / "backups";
+  if (!fs::exists(backups_dir(), ec) && fs::exists(old_backups, ec)) fs::copy(old_backups, backups_dir(), fs::copy_options::recursive, ec);
 }
 
 // ---- checks of the chosen files (background: hashing takes a moment) ----
@@ -342,7 +444,8 @@ void update_buttons() {
   EnableWindow(item(kPlay), !busy && !playing && g_ready && inputs_ok());
   for (int id : {kDiscBrowse, kRpcs3Browse, kDataBrowse, kDiscEdit, kRpcs3Edit, kDataEdit})
     EnableWindow(item(id), !busy && !playing);
-  for (int id : {kSavesBackup, kSavesRestore, kFps, kMode}) EnableWindow(item(id), !playing && !g_cfg.data.empty());
+  for (int id : {kSavesBackup, kSavesRestore, kFps, kMode, kScale, kResetSettings, kSafeMode}) EnableWindow(item(id), !playing && !g_cfg.data.empty());
+  EnableWindow(item(kMonitor), !playing && !g_cfg.data.empty() && g_monitor_items.size() > 1);
   set_text(kPrepare, g_ready ? L"Rebuild" : L"Prepare and build");
   set_text(kPlayState, playing ? L"Playing." : busy ? L"" : g_ready ? L"Ready." : L"Prepare and build first.");
 }
@@ -353,7 +456,8 @@ void refresh_paths_from_ui() {
   g_cfg.data = get_text(kDataEdit);
   save_paths();
   update_space();
-  set_text(kSavesPath, g_cfg.data.empty() ? L"" : saves_dir().wstring());
+  move_to_user_dir();
+  set_text(kSavesPath, saves_dir().wstring());
   start_checks();
   update_buttons();
 }
@@ -395,8 +499,12 @@ fs::path pick(bool folder, const wchar_t* title, const fs::path& start, const wc
 // ---- the game ----
 void play() {
   fs::path exe = Setup::game_exe(g_cfg);
-  std::wstring cmd = quote_arg(exe.wstring()) + L" --data " + quote_arg(g_cfg.data.wstring()) + L" --disc " + quote_arg(g_cfg.disc.wstring()) +
-                     L" --flash " + quote_arg(Setup::flash_dir(g_cfg).wstring()) + L" --keep-runs 10";
+  std::wstring cmd = quote_arg(exe.wstring()) + L" --data " + quote_arg(g_cfg.data.wstring()) + L" --user " + quote_arg(user_dir().wstring()) +
+                     L" --disc " + quote_arg(g_cfg.disc.wstring()) + L" --flash " + quote_arg(Setup::flash_dir(g_cfg).wstring()) + L" --keep-runs 10";
+  if (SendMessageW(item(kSafeMode), BM_GETCHECK, 0, 0) == BST_CHECKED) {
+    cmd += L" --safe-mode";
+    SendMessageW(item(kSafeMode), BM_SETCHECK, BST_UNCHECKED, 0);  // for this start only
+  }
   STARTUPINFOW si{};
   si.cb = sizeof si;
   PROCESS_INFORMATION pi{};
@@ -438,8 +546,10 @@ const Place kPlaces[] = {
     {kPrepare, 24, 344, 160, 30},    {kCancel, 192, 344, 90, 30},      {kOpenLog, 290, 344, 90, 30},
     {kProgress, 24, 384, 580, 16},   {kStatus, 24, 404, 580, 18},      {kLog, 24, 426, 580, 176},
     {kFps, 748, 30, 190, 300},       {kMode, 748, 64, 190, 300},       {kResolution, 748, 98, 190, 300},
-    {kSavesPath, 636, 166, 304, 34}, {kSavesOpen, 636, 204, 96, 28},   {kSavesBackup, 740, 204, 96, 28},
-    {kSavesRestore, 844, 204, 96, 28}, {kPlayState, 624, 496, 324, 20}, {kPlay, 624, 520, 324, 82},
+    {kScale, 748, 132, 190, 300},    {kMonitor, 748, 166, 190, 300},   {kResetSettings, 636, 202, 150, 28},
+    {kSavesPath, 636, 276, 304, 34}, {kSavesOpen, 636, 314, 96, 28},   {kSavesBackup, 740, 314, 96, 28},
+    {kSavesRestore, 844, 314, 96, 28}, {kSafeMode, 632, 466, 316, 22},  {kPlayState, 624, 496, 324, 20},
+    {kPlay, 624, 520, 324, 82},
 };
 struct Label {
   int x, y, w, h;
@@ -450,8 +560,9 @@ const Label kLabels[] = {
     {12, 6, 604, 232, L"Game files", true},    {24, 33, 104, 20, L"Disc folder", false},     {24, 87, 104, 20, L"RPCS3 folder", false},
     {24, 140, 104, 20, L"Update 01.35", false}, {330, 182, 274, 20, L"Files you decrypt once with RPCS3", false},
     {12, 244, 604, 76, L"Install folder", true},
-    {12, 324, 604, 286, L"Setup", true},          {624, 6, 324, 128, L"Settings", true},      {636, 33, 108, 20, L"Frame rate", false},
-    {636, 67, 108, 20, L"Display mode", false},   {636, 101, 108, 20, L"Resolution", false}, {624, 142, 324, 100, L"Saves", true},
+    {12, 324, 604, 286, L"Setup", true},          {624, 6, 324, 238, L"Settings", true},      {636, 33, 108, 20, L"Frame rate", false},
+    {636, 67, 108, 20, L"Display mode", false},   {636, 101, 108, 20, L"Resolution", false}, {624, 252, 324, 100, L"Saves", true},
+    {636, 135, 108, 20, L"Render scale", false},  {636, 169, 108, 20, L"Monitor", false},
 };
 constexpr int kClientW = 960, kClientH = 616;
 
@@ -502,7 +613,9 @@ void create_controls() {
   SendMessageW(item(kProgress), PBM_SETRANGE32, 0, 1000);
   make(L"STATIC", L"", SS_LEFT | SS_ENDELLIPSIS, kStatus);
   make(L"LISTBOX", L"", WS_VSCROLL | LBS_NOINTEGRALHEIGHT | LBS_NOSEL, kLog, WS_EX_CLIENTEDGE);
-  for (int id : {kFps, kMode, kResolution}) make(L"COMBOBOX", L"", WS_TABSTOP | CBS_DROPDOWNLIST | WS_VSCROLL, id);
+  for (int id : {kFps, kMode, kResolution, kScale, kMonitor}) make(L"COMBOBOX", L"", WS_TABSTOP | CBS_DROPDOWNLIST | WS_VSCROLL, id);
+  make(L"BUTTON", L"Reset settings...", WS_TABSTOP | BS_PUSHBUTTON, kResetSettings);
+  make(L"BUTTON", L"Safe mode: default display settings for the next start", WS_TABSTOP | BS_AUTOCHECKBOX, kSafeMode);
   make(L"STATIC", L"", SS_LEFT | SS_PATHELLIPSIS, kSavesPath);
   make(L"BUTTON", L"Open", WS_TABSTOP | BS_PUSHBUTTON, kSavesOpen);
   make(L"BUTTON", L"Back up", WS_TABSTOP | BS_PUSHBUTTON, kSavesBackup);
@@ -551,7 +664,7 @@ LRESULT CALLBACK wndproc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
         if (id == kDataEdit) load_settings_controls();
         return 0;
       }
-      if (code == CBN_SELCHANGE && (id == kFps || id == kMode || id == kResolution)) {
+      if (code == CBN_SELCHANGE && (id == kFps || id == kMode || id == kResolution || id == kScale || id == kMonitor)) {
         save_setting(id);
         return 0;
       }
@@ -603,6 +716,20 @@ LRESULT CALLBACK wndproc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
         case kOpenLog: {
           fs::path log = g_cfg.data / "launcher.log";
           if (fs::exists(log)) ShellExecuteW(g_wnd, L"open", log.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+          break;
+        }
+        case kResetSettings: {
+          if (MessageBoxW(g_wnd,
+                          L"Reset every setting (display, frame rate, mouse, key bindings) to its default?\n"
+                          L"The current file is kept as settings.ini.bak.",
+                          L"ARMORED CORE for Answer", MB_YESNO | MB_ICONQUESTION) != IDYES)
+            break;
+          std::error_code ec;
+          fs::path bak = settings_path();
+          bak += ".bak";
+          fs::rename(settings_path(), bak, ec);
+          load_settings_controls();  // creates the file with the defaults
+          add_log_line("Settings reset to the defaults (the previous file: " + narrow(bak.wstring()) + ").");
           break;
         }
         case kSavesOpen: {

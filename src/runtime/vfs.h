@@ -1,7 +1,8 @@
 // Guest file system: maps LV2 mount points to host directories.
 //   /dev_bdvd  -> disc root (read-only)        /app_home -> disc PS3_GAME/USRDIR (read-only)
 //   /dev_hdd0  -> local/hdd0 (writable)         /dev_hdd1 -> local/hdd1 (writable)
-//   /dev_flash -> extracted firmware dev_flash (read-only, from the user's PS3UPDAT.PUP)
+//   /dev_flash -> the dev_flash file(s) imported from the player's RPCS3 (read-only)
+//   /dev_hdd0/home/00000001/savedata -> the player's own save folder when one is given (--user)
 #pragma once
 #include <filesystem>
 #include <string>
@@ -11,7 +12,8 @@
 
 namespace rt::vfs {
 
-void init(const std::string& disc_root, const std::string& hdd0, const std::string& hdd1, const std::string& flash);
+void init(const std::string& disc_root, const std::string& hdd0, const std::string& hdd1, const std::string& flash,
+          const std::string& saves = "");
 
 struct Resolved {
   std::filesystem::path host;

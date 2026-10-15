@@ -21,8 +21,8 @@ struct PadOut {
 };
 
 struct MouseSettings {
-  double sensitivity = 1.0;  // scale on raw counts
-  bool invert_y = false;
+  double sensitivity_x = 1.0, sensitivity_y = 1.0;  // scale on raw counts: turning, looking up and down
+  bool invert_x = false, invert_y = false;
 };
 
 // Input codes: Windows virtual-key codes 1-255, mouse buttons kMouse + 0..4, wheel up/down.

@@ -19,6 +19,7 @@ struct Mount {
   std::string prefix;  // e.g. "/dev_bdvd"
   fs::path host;
   bool writable;
+  std::vector<std::string> parts;  // the prefix's components
 };
 std::vector<Mount> g_mounts;
 
@@ -63,14 +64,26 @@ s32 win_err(DWORD e) {
 
 }  // namespace
 
-void init(const std::string& disc, const std::string& hdd0, const std::string& hdd1, const std::string& flash) {
+void init(const std::string& disc, const std::string& hdd0, const std::string& hdd1, const std::string& flash,
+          const std::string& saves) {
   g_mounts = {
-      {"/dev_bdvd", fs::path(disc), false},
-      {"/app_home", fs::path(disc) / "PS3_GAME" / "USRDIR", false},
-      {"/dev_hdd0", fs::path(hdd0), true},
-      {"/dev_hdd1", fs::path(hdd1), true},
-      {"/dev_flash", fs::path(flash), false},
+      {"/dev_bdvd", fs::path(disc), false, {}},
+      {"/app_home", fs::path(disc) / "PS3_GAME" / "USRDIR", false, {}},
+      {"/dev_hdd0", fs::path(hdd0), true, {}},
+      {"/dev_hdd1", fs::path(hdd1), true, {}},
+      {"/dev_flash", fs::path(flash), false, {}},
   };
+  if (!saves.empty()) {
+    g_mounts.push_back({"/dev_hdd0/home/00000001/savedata", fs::path(saves), true, {}});
+    fs::create_directories(saves);
+  }
+  for (Mount& m : g_mounts) {
+    for (size_t i = 1; i <= m.prefix.size();) {
+      size_t j = std::min(m.prefix.find('/', i), m.prefix.size());
+      m.parts.push_back(m.prefix.substr(i, j - i));
+      i = j + 1;
+    }
+  }
   fs::create_directories(hdd0);
   fs::create_directories(hdd1);
 }
@@ -92,18 +105,21 @@ bool resolve(const std::string& gp, Resolved& out) {
     i = j + 1;
   }
   if (parts.empty()) return false;
-  std::string mount = "/" + parts[0];
+  const Mount* best = nullptr;  // the longest mount prefix that matches whole components
   for (const auto& m : g_mounts) {
-    if (_stricmp(m.prefix.c_str(), mount.c_str()) != 0) continue;
-    fs::path h = m.host;
-    for (size_t k = 1; k < parts.size(); ++k) {
-      if (parts[k].find(':') != std::string::npos || parts[k].find('\\') != std::string::npos) return false;
-      h /= fs::path(std::u8string(parts[k].begin(), parts[k].end()));  // guest paths are UTF-8
-    }
-    out = {h, m.writable, m.prefix};
-    return true;
+    if (m.parts.size() > parts.size() || (best && m.parts.size() <= best->parts.size())) continue;
+    bool match = true;
+    for (size_t k = 0; k < m.parts.size() && match; ++k) match = _stricmp(m.parts[k].c_str(), parts[k].c_str()) == 0;
+    if (match) best = &m;
   }
-  return false;
+  if (!best) return false;
+  fs::path h = best->host;
+  for (size_t k = best->parts.size(); k < parts.size(); ++k) {
+    if (parts[k].find(':') != std::string::npos || parts[k].find('\\') != std::string::npos) return false;
+    h /= fs::path(std::u8string(parts[k].begin(), parts[k].end()));  // guest paths are UTF-8
+  }
+  out = {h, best->writable, best->prefix};
+  return true;
 }
 
 static s32 resolve_for(const std::string& path, bool want_write, Resolved& r) {

@@ -40,20 +40,24 @@ std::atomic<bool> g_locked{false};  // the last vblank came from the display (el
 std::atomic<int> g_movies{0};
 std::atomic<int> g_gameplay{0};  // missions running (frame_policy.cpp)
 
-// The game's frame rate target: --fps N (default 60), or the display's refresh (--fps display).
-// The game advances its simulation by measured time (GAME_NOTES "Frame pacing": movement, turning
-// and per-frame motion identical at 60 and 120 Hz), so the emulated vblank rate sets the frame rate.
-// Targets above 60 apply in missions only: some menu fades count frames, and movies need 60.
+// The game's frame rate target: --fps N (default 60), the display's refresh (--fps display) or
+// uncapped (a vblank every millisecond: the game's own work sets the rate). The game advances its
+// simulation by measured time (GAME_NOTES "Frame pacing": movement, turning and per-frame motion
+// identical at 60 and 120 Hz), so the emulated vblank rate sets the frame rate. Other targets than
+// 60 apply in missions only: some menu fades count frames, and movies need 60.
+constexpr double kUncappedHz = 1000;
 double target_fps() {
-  double fps;
-  if (cfg().fps > 0) {
-    fps = cfg().fps;
+  double want = cfg().fps, fps;
+  if (want < 0) {
+    fps = kUncappedHz;
+  } else if (want > 0) {
+    fps = want;
   } else {
     std::lock_guard lk(g_mu);
     fps = g_refresh >= 30 ? double(g_refresh) : 60.0;
   }
-  bool capped = g_movies.load(std::memory_order_relaxed) > 0 || g_gameplay.load(std::memory_order_relaxed) == 0;
-  return fps > 60.5 && capped ? 60.0 : fps;
+  bool outside = g_movies.load(std::memory_order_relaxed) > 0 || g_gameplay.load(std::memory_order_relaxed) == 0;
+  return outside && std::fabs(fps - 60.0) > 0.5 ? 60.0 : fps;
 }
 
 // Display-locked pacing needs a refresh that is a whole multiple of the target (within 1.5 Hz).
@@ -64,6 +68,7 @@ u32 divisor_for(u32 hz, double fps) {
 }
 // The divisor under the configured pacing (auto, display, clock).
 u32 pacing_divisor(u32 hz, double fps) {
+  if (fps >= kUncappedHz) return 0;
   u32 div = divisor_for(hz, fps);
   const std::string& want = cfg().pacing;
   if (want == "clock") div = 0;
@@ -74,7 +79,13 @@ u32 pacing_divisor(u32 hz, double fps) {
 // ---- clock pacing (the target rate from the performance counter) ----
 double g_next_tick_us = 0;
 void wait_clock() {
-  const double period = 1e6 / target_fps();
+  const double fps = target_fps();
+  if (fps >= kUncappedHz) {  // uncapped: a tick every millisecond, slept (the exact rate is irrelevant)
+    g_next_tick_us = 0;
+    lv2::sleep_us(1000);
+    return;
+  }
+  const double period = 1e6 / fps;
   double now = double(lv2::system_time_us());
   if (g_next_tick_us == 0 || now - g_next_tick_us > 4 * period) g_next_tick_us = now;  // start or resynchronise
   g_next_tick_us += period;
@@ -148,10 +159,11 @@ void movie_stopped() {
   if (g_movies.fetch_sub(1) == 1 && cfg().fps != 60) LOG_I("display", "video playback ended");
 }
 void gameplay_started() {
-  if (g_gameplay.fetch_add(1) == 0 && cfg().fps != 60) LOG_I("display", "mission started: frame rate target %.0f", target_fps());
+  if (g_gameplay.fetch_add(1) == 0 && cfg().fps != 60)
+    LOG_I("display", "mission started: frame rate target %s", cfg().fps < 0 ? "uncapped" : acfa::strprintf("%.0f", target_fps()).c_str());
 }
 void gameplay_stopped() {
-  if (g_gameplay.fetch_sub(1) == 1 && cfg().fps != 60) LOG_I("display", "mission ended: up to 60 Hz outside missions");
+  if (g_gameplay.fetch_sub(1) == 1 && cfg().fps != 60) LOG_I("display", "mission ended: 60 Hz outside missions");
 }
 
 void wait_next_vblank() {
@@ -277,7 +289,8 @@ std::string report() {
     tearing = g_tearing;
   }
   std::string pacing = div && g_locked.load() ? acfa::strprintf("display-locked every %u vblank%s", div, div > 1 ? "s" : "")
-                           : acfa::strprintf("%.0f Hz clock%s", target_fps(), tearing ? ", tearing allowed" : "");
+                           : target_fps() >= kUncappedHz ? std::string(tearing ? "uncapped, tearing allowed" : "uncapped")
+                                                         : acfa::strprintf("%.0f Hz clock%s", target_fps(), tearing ? ", tearing allowed" : "");
   if (!s.presents) return acfa::strprintf("display: %u Hz, %s; no frames presented", hz, pacing.c_str());
   std::string shown;
   u64 known = 0;

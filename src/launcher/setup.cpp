@@ -11,6 +11,7 @@
 
 #include "common/crypto.h"
 #include "common/known_inputs.h"
+#include "common/privacy.h"
 #include "launcher/download.h"
 #include "launcher/inputs.h"
 
@@ -222,7 +223,7 @@ void Setup::log(const std::string& line) {
   std::lock_guard lk(mu_);
   view_.lines.push_back(line);
   if (log_file_) {
-    std::fputs(line.c_str(), log_file_);
+    std::fputs(acfa::redact_personal(line).c_str(), log_file_);  // shared as it is
     std::fputc('\n', log_file_);
     std::fflush(log_file_);
   }

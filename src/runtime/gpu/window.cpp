@@ -77,6 +77,57 @@ void set_fullscreen(bool on) {
   LOG_I("gpu", "window: %s", on ? "borderless fullscreen" : "windowed");
 }
 
+std::vector<Monitor> list_monitors() {
+  std::vector<Monitor> out;
+  EnumDisplayMonitors(nullptr, nullptr, [](HMONITOR hm, HDC, LPRECT, LPARAM lp) -> BOOL {
+    MONITORINFOEXW mi{};
+    mi.cbSize = sizeof mi;
+    if (GetMonitorInfoW(hm, &mi)) {
+      Monitor m;
+      std::wstring d = mi.szDevice;
+      m.device.assign(d.begin(), d.end());
+      m.x = mi.rcMonitor.left;
+      m.y = mi.rcMonitor.top;
+      m.w = mi.rcMonitor.right - mi.rcMonitor.left;
+      m.h = mi.rcMonitor.bottom - mi.rcMonitor.top;
+      m.primary = (mi.dwFlags & MONITORINFOF_PRIMARY) != 0;
+      reinterpret_cast<std::vector<Monitor>*>(lp)->push_back(m);
+    }
+    return TRUE;
+  }, reinterpret_cast<LPARAM>(&out));
+  return out;
+}
+
+void set_client_size(int w, int h);
+// Moves the window to the monitor (by device name; "" or an unknown name: the primary) keeping
+// its mode: covering it when borderless, centred at the same client size when windowed.
+void move_to_monitor(const std::string& device) {
+  if (!g_hwnd || exclusive_active()) return;
+  std::vector<Monitor> ms = list_monitors();
+  const Monitor* target = nullptr;
+  for (const Monitor& m : ms)
+    if (m.device == device || (!target && m.primary)) target = &m;
+  for (const Monitor& m : ms)
+    if (m.device == device) target = &m;
+  if (!target) return;
+  HMONITOR now = MonitorFromWindow(g_hwnd, MONITOR_DEFAULTTONEAREST);
+  MONITORINFOEXW mi{};
+  mi.cbSize = sizeof mi;
+  GetMonitorInfoW(now, &mi);
+  std::wstring d = mi.szDevice;
+  if (std::string(d.begin(), d.end()) == target->device) return;
+  if (g_fullscreen) {
+    SetWindowPos(g_hwnd, HWND_TOP, target->x, target->y, target->w, target->h, SWP_NOOWNERZORDER | SWP_FRAMECHANGED);
+  } else {
+    RECT rc{};
+    GetClientRect(g_hwnd, &rc);
+    // Somewhere on the target monitor first (MonitorFromWindow decides the work area), then centred.
+    SetWindowPos(g_hwnd, nullptr, target->x + 16, target->y + 16, 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOOWNERZORDER | SWP_NOACTIVATE);
+    set_client_size(rc.right, rc.bottom);
+  }
+  LOG_I("gpu", "window moved to monitor %s (%dx%d)", target->device.c_str(), target->w, target->h);
+}
+
 void work_area(int* w, int* h) {
   MONITORINFO mi{};
   mi.cbSize = sizeof mi;
@@ -299,6 +350,11 @@ void window_monitor_size(int* w, int* h) {
     *w = mi.rcMonitor.right - mi.rcMonitor.left;
     *h = mi.rcMonitor.bottom - mi.rcMonitor.top;
   }
+}
+
+std::vector<Monitor> window_monitors() { return list_monitors(); }
+void window_move_to_monitor(const std::string& device) {
+  run_on_window_thread([device] { move_to_monitor(device); });
 }
 
 void window_set_mouse_capture(bool on) {

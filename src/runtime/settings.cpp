@@ -1,5 +1,6 @@
 #include "runtime/settings.h"
 
+#include <algorithm>
 #include <mutex>
 
 #include "common/ini.h"
@@ -41,6 +42,12 @@ void init(const std::string& file, std::vector<std::string>* notes) {
   g_display = acfa::settings::read_display(ini);
   if (g_display.mode != Mode::Windowed) g_last_full = g_display.mode;
   bindings::load(ini);
+}
+
+void use_safe_display() {
+  std::lock_guard lk(g_mu);
+  g_display = acfa::settings::Display{};
+  g_display.mode = Mode::Windowed;
 }
 
 const std::string& file() { return g_file; }
@@ -106,6 +113,37 @@ void set_fullscreen_mode(int w, int h, int hz) {
   LOG_I("settings", "fullscreen mode %s", acfa::settings::fullscreen_text(d).c_str());
 }
 
+void set_render_scale(int percent) {
+  percent = std::clamp(percent, acfa::settings::kRenderScaleMin, acfa::settings::kRenderScaleMax);
+  {
+    std::lock_guard lk(g_mu);
+    g_display.render_scale = percent;
+    update_file([&](acfa::Ini& ini) { ini.set("display", "render_scale", std::to_string(percent)); });
+  }
+  LOG_I("settings", "render scale %d%%", percent);
+}
+
+void set_monitor(const std::string& device) {
+  acfa::settings::Display d;
+  {
+    std::lock_guard lk(g_mu);
+    if (g_display.monitor == device) return;
+    g_display.monitor = device;
+    g_display.fs_width = g_display.fs_height = g_display.fs_hz = 0;  // the new monitor's desktop mode
+    d = g_display;
+    update_file([&](acfa::Ini& ini) {
+      ini.set("display", "monitor", device);
+      ini.set("display", "fullscreen_mode", acfa::settings::fullscreen_text(d));
+    });
+  }
+  LOG_I("settings", "monitor %s", device.empty() ? "primary" : device.c_str());
+  if (d.mode == Mode::Fullscreen && gpu::exclusive_active()) {
+    gpu::request_exclusive(false);  // leaves exclusive mode; apply_window_mode re-enters it on the new monitor
+  } else {
+    gpu::window_move_to_monitor(device);
+  }
+}
+
 void toggle_fullscreen() {
   Mode now, next;
   {
@@ -117,12 +155,13 @@ void toggle_fullscreen() {
 }
 
 void apply_window_mode() {
-  Mode m;
-  {
-    std::lock_guard lk(g_mu);
-    m = g_display.mode;
+  acfa::settings::Display cur = display();
+  Mode m = cur.mode;
+  gpu::window_move_to_monitor(cur.monitor);
+  if (m == Mode::Fullscreen) {  // exclusive fullscreen left for another monitor: entered again there
+    if (!gpu::exclusive_active()) gpu::request_exclusive(true, u32(cur.fs_width), u32(cur.fs_height), u32(cur.fs_hz));
+    return;
   }
-  if (m == Mode::Fullscreen) return;
   gpu::window_set_fullscreen(m == Mode::Borderless);
   if (m == Mode::Windowed) {
     acfa::settings::Display d = display();

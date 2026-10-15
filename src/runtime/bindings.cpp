@@ -68,8 +68,8 @@ const KeyName kKeys[] = {
 
 std::mutex g_mu;  // bindings change on the window thread (PC SETTINGS) while pads are read
 std::vector<u32> g_bind[kControlCount];
-std::atomic<double> g_sensitivity{1.0};
-std::atomic<bool> g_invert_y{false};
+std::atomic<double> g_sensitivity_x{1.0}, g_sensitivity_y{1.0};
+std::atomic<bool> g_invert_x{false}, g_invert_y{false};
 std::chrono::steady_clock::time_point g_wheel_up_until, g_wheel_down_until;
 
 std::string trim(std::string s) {
@@ -146,11 +146,18 @@ bool bindable(u32 code) { return code != VK_F1 && code != VK_F11 && !input_name(
 void load(const acfa::Ini& ini) {
   parse_keyboard(ini);
   MouseSettings m;
-  if (auto v = ini.get("mouse", "sensitivity")) {
-    double s = std::atof(v->c_str());
-    if (s > 0 && s <= 100) m.sensitivity = s;
-    else LOG_W("input", "settings [mouse] sensitivity '%s' ignored (use a number above 0)", v->c_str());
-  }
+  auto sens = [&](const char* key, double* out) {
+    if (auto v = ini.get("mouse", key)) {
+      double s = std::atof(v->c_str());
+      if (s > 0 && s <= 100) *out = s;
+      else LOG_W("input", "settings [mouse] %s '%s' ignored (use a number above 0)", key, v->c_str());
+    }
+  };
+  sens("sensitivity", &m.sensitivity_x);  // the earlier single setting: both axes
+  m.sensitivity_y = m.sensitivity_x;
+  sens("sensitivity_x", &m.sensitivity_x);
+  sens("sensitivity_y", &m.sensitivity_y);
+  if (auto v = ini.get("mouse", "invert_x")) m.invert_x = equal_ci(*v, "true") || *v == "1";
   if (auto v = ini.get("mouse", "invert_y")) m.invert_y = equal_ci(*v, "true") || *v == "1";
   set_mouse(m);
   size_t bound = 0;
@@ -158,8 +165,8 @@ void load(const acfa::Ini& ini) {
     std::lock_guard lk(g_mu);
     for (const auto& b : g_bind) bound += !b.empty();
   }
-  LOG_I("input", "keyboard/mouse: %zu of %zu pad controls bound; mouse sensitivity %.3f%s", bound, kControlCount, m.sensitivity,
-        m.invert_y ? ", Y inverted" : "");
+  LOG_I("input", "keyboard/mouse: %zu of %zu pad controls bound; mouse sensitivity %.3f x, %.3f y%s%s", bound, kControlCount,
+        m.sensitivity_x, m.sensitivity_y, m.invert_x ? ", X inverted" : "", m.invert_y ? ", Y inverted" : "");
 }
 
 void store(acfa::Ini& ini) {
@@ -169,7 +176,10 @@ void store(acfa::Ini& ini) {
     for (u32 code : g_bind[c]) v += (v.empty() ? "" : ", ") + input_name(code);
     ini.set("keyboard", kControls[c].name, v);
   }
-  ini.set("mouse", "sensitivity", acfa::strprintf("%.2f", g_sensitivity.load()));
+  ini.remove("mouse", "sensitivity");  // the earlier single setting
+  ini.set("mouse", "sensitivity_x", acfa::strprintf("%.2f", g_sensitivity_x.load()));
+  ini.set("mouse", "sensitivity_y", acfa::strprintf("%.2f", g_sensitivity_y.load()));
+  ini.set("mouse", "invert_x", g_invert_x.load() ? "true" : "false");
   ini.set("mouse", "invert_y", g_invert_y.load() ? "true" : "false");
 }
 
@@ -216,10 +226,15 @@ PadOut sample() {
   return o;
 }
 
-MouseSettings mouse() { return {g_sensitivity.load(std::memory_order_relaxed), g_invert_y.load(std::memory_order_relaxed)}; }
+MouseSettings mouse() {
+  return {g_sensitivity_x.load(std::memory_order_relaxed), g_sensitivity_y.load(std::memory_order_relaxed),
+          g_invert_x.load(std::memory_order_relaxed), g_invert_y.load(std::memory_order_relaxed)};
+}
 
 void set_mouse(const MouseSettings& m) {
-  g_sensitivity = m.sensitivity;
+  g_sensitivity_x = m.sensitivity_x;
+  g_sensitivity_y = m.sensitivity_y;
+  g_invert_x = m.invert_x;
   g_invert_y = m.invert_y;
 }
 

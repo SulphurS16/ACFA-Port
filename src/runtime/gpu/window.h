@@ -2,6 +2,7 @@
 #pragma once
 #include <functional>
 #include <string>
+#include <vector>
 
 namespace rt::gpu {
 
@@ -22,6 +23,15 @@ void window_client_size(int* w, int* h);
 // Work area of the monitor the window is on (the largest window that fits), and its full size.
 void window_work_area(int* w, int* h);
 void window_monitor_size(int* w, int* h);
+// The monitors (in Windows' order) and moving the window to one of them by device name (windowed:
+// centred there; borderless: covering it; exclusive fullscreen then uses its output).
+struct Monitor {
+  std::string device;  // e.g. \\.\DISPLAY2
+  int x = 0, y = 0, w = 0, h = 0;
+  bool primary = false;
+};
+std::vector<Monitor> window_monitors();
+void window_move_to_monitor(const std::string& device);
 // Mouse capture for mouse look (hidden cursor confined to the window; click into the window
 // to capture, focus loss releases it).
 void window_set_mouse_capture(bool on);

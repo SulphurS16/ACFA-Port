@@ -25,26 +25,31 @@ enum class Mode { Windowed, Fullscreen, Borderless };
 const char* mode_name(Mode m);  // as in the file: windowed, fullscreen, borderless
 
 struct Display {
-  double fps = 60;              // frame rate target in missions; 0 = the display's refresh rate
+  double fps = 60;              // frame rate target in missions; 0 = the display's refresh rate, kFpsUncapped
   std::string pacing = "auto";  // auto | display | clock
-  Mode mode = Mode::Windowed;   // fullscreen: exclusive, in the display mode below; borderless: the monitor as it is
+  Mode mode = Mode::Borderless;  // fullscreen: exclusive, in the display mode below; borderless: the monitor as it is
   int width = 1280, height = 720;  // window client size (windowed)
   int fs_width = 0, fs_height = 0, fs_hz = 0;  // fullscreen display mode (0: the desktop's resolution / refresh rate)
+  // The game renders at the output resolution (the 16:9 picture's size in the window or on the
+  // screen) times this percentage: 100 = the output's own pixels.
+  int render_scale = 100;
+  std::string monitor;  // fullscreen / borderless / the window's monitor: its device name ("" = the primary)
 };
+constexpr int kRenderScaleMin = 50, kRenderScaleMax = 200;
 Display read_display(const Ini& ini);
 void write_display(Ini& ini, const Display& d);
 std::string fullscreen_text(const Display& d);  // "desktop", "1920x1080@60"
 
-// Frame rate choices offered by the launcher and the PC SETTINGS screen, in display order.
-// Validated: checked by game execution (movement, turn rates, fire rate and boost physics match
-// 60 fps in missions); the others are offered as untested.
+// Frame rate choices offered by the launcher and the PC SETTINGS screen, in display order: only
+// rates checked by game execution (movement, turn rate and fire rate in a mission match 60 fps;
+// docs/STATUS.md). A rate set in the file by hand is shown as untested.
+constexpr double kFpsUncapped = -1;  // no frame rate limit in missions
 struct FpsChoice {
-  double fps;  // 0 = display refresh
+  double fps;  // 0 = display refresh, kFpsUncapped
   const char* label;
-  bool validated;
 };
 const std::vector<FpsChoice>& fps_choices();
-std::string fps_text(double fps);  // "60", "display"
+std::string fps_text(double fps);  // "60", "display", "uncapped"
 
 // Window sizes offered for windowed mode.
 struct Size {

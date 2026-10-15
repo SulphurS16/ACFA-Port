@@ -19,15 +19,20 @@ const char* const kHead =
 
 const char* const kDisplay =
     "[display]\n"
-    "# Frame rate in missions: 60 (as on the console) and 120 are validated; 90, 144, 165, 240 and\n"
-    "# display (the display's refresh rate) are untested. Menus and movies run at up to 60.\n"
+    "# Frame rate in missions: 30, 60 (as on the console), 120, 144, display (the display's refresh\n"
+    "# rate) or uncapped. Menus and movies run at 60 (some menu fades count frames).\n"
     "fps = 60\n"
     "# windowed, fullscreen or borderless (borderless fullscreen); F11 or Alt+Enter switch\n"
-    "mode = windowed\n"
+    "mode = borderless\n"
     "# Window size in windowed mode (client area), such as 1280x720 or 1920x1080\n"
     "window = 1280x720\n"
     "# Fullscreen display mode: WIDTHxHEIGHT@HZ, such as 1920x1080@60, or desktop\n"
     "fullscreen_mode = desktop\n"
+    "# Monitor for the game (its device name, such as \\\\.\\DISPLAY2; empty: the primary monitor)\n"
+    "monitor =\n"
+    "# Render scale in percent of the output resolution (50 to 200): the game renders its 3D scene and\n"
+    "# its interface at the window's or screen's resolution times this\n"
+    "render_scale = 100\n"
     "# Source of the game's vertical blank: auto (the display's own when its refresh is a whole\n"
     "# multiple of fps, else a clock, with tearing allowed for variable-refresh displays), display\n"
     "# or clock\n"
@@ -35,8 +40,11 @@ const char* const kDisplay =
 
 const char* const kMouse =
     "[mouse]\n"
-    "# Rotation per raw mouse count relative to the default (1.0). No acceleration or smoothing.\n"
-    "sensitivity = 1.0\n"
+    "# Rotation per raw mouse count relative to the default (1.0): x turns, y looks up and down.\n"
+    "# Raw input: no acceleration, smoothing or dead zone.\n"
+    "sensitivity_x = 1.0\n"
+    "sensitivity_y = 1.0\n"
+    "invert_x = false\n"
     "invert_y = false\n";
 
 const char* const kKeyboardHead =
@@ -170,6 +178,7 @@ Display read_display(const Ini& ini) {
   Display d;
   std::string fps = ini.get_or("display", "fps", "60");
   if (fps == "display") d.fps = 0;
+  else if (fps == "uncapped") d.fps = kFpsUncapped;
   else if (double v = std::atof(fps.c_str()); v >= 30 && v <= 1000) d.fps = v;
   std::string pacing = ini.get_or("display", "pacing", "auto");
   if (pacing == "auto" || pacing == "display" || pacing == "clock") d.pacing = pacing;
@@ -182,6 +191,9 @@ Display read_display(const Ini& ini) {
     d.fs_height = fh;
     d.fs_hz = hz > 0 && hz <= 1000 ? hz : 0;
   }
+  if (int v = std::atoi(ini.get_or("display", "render_scale", "100").c_str()); v >= kRenderScaleMin && v <= kRenderScaleMax)
+    d.render_scale = v;
+  d.monitor = ini.get_or("display", "monitor", "");
   std::string win = ini.get_or("display", "window", "1280x720");
   int w = 0, h = 0;
   if (std::sscanf(win.c_str(), "%dx%d", &w, &h) == 2 && w >= 640 && h >= 360 && w <= 16384 && h <= 16384) {
@@ -197,6 +209,8 @@ void write_display(Ini& ini, const Display& d) {
   ini.set("display", "mode", mode_name(d.mode));
   ini.set("display", "window", strprintf("%dx%d", d.width, d.height));
   ini.set("display", "fullscreen_mode", fullscreen_text(d));
+  ini.set("display", "render_scale", std::to_string(d.render_scale));
+  ini.set("display", "monitor", d.monitor);
 }
 
 const char* mode_name(Mode m) { return m == Mode::Borderless ? "borderless" : m == Mode::Fullscreen ? "fullscreen" : "windowed"; }
@@ -208,14 +222,14 @@ std::string fullscreen_text(const Display& d) {
 
 const std::vector<FpsChoice>& fps_choices() {
   static const std::vector<FpsChoice> v = {
-      {60, "60", true},    {90, "90", false},   {120, "120", true}, {144, "144", false},
-      {165, "165", false}, {240, "240", false}, {0, "Display refresh rate", false},
+      {30, "30"}, {60, "60"}, {120, "120"}, {144, "144"}, {0, "Display refresh rate"}, {kFpsUncapped, "Uncapped"},
   };
   return v;
 }
 
 std::string fps_text(double fps) {
-  if (fps <= 0) return "display";
+  if (fps < 0) return "uncapped";
+  if (fps == 0) return "display";
   return std::fabs(fps - std::round(fps)) < 1e-6 ? strprintf("%.0f", fps) : strprintf("%.2f", fps);
 }
 

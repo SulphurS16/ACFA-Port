@@ -12,13 +12,15 @@ struct Config {
   std::string disc_root;    // read-only PS3 disc folder (contains PS3_GAME)
   std::string prepared;     // acfa-prep output (eboot.elf, update/)
   std::string hdd0;         // writable /dev_hdd0 (game data, saves)
+  std::string saves;        // the player's save folder (--user DIR: DIR\savedata), else hdd0's own
   std::string hdd1;         // writable /dev_hdd1 (system cache)
   std::string flash;        // read-only /dev_flash (extracted firmware)
   std::string run_dir;      // this run's log/capture directory
   bool warm_shaders = false;        // compile the shader manifest into the shader cache, then exit
   std::string priority;             // process priority class: "" (normal), "above-normal", "high"
   std::string pacing = "auto";      // emulated vblank source (gpu/display.h): auto | display | clock
-  std::atomic<double> fps{60};      // game frame rate target (--fps N | display: 0 = the display's refresh); PC SETTINGS changes it
+  int render_scale = 0;             // percent; 0 = the settings file's (development override --render-scale)
+  std::atomic<double> fps{60};      // game frame rate target (--fps N | display: 0 = the display's refresh | uncapped: -1); PC SETTINGS changes it
   bool fullscreen = false;          // start in borderless fullscreen (F11 / Alt+Enter toggle)
   bool windowed = false;            // --windowed: a window whatever the settings say
   int window_w = 1280, window_h = 720;  // window client size (windowed)

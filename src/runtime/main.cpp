@@ -1,5 +1,5 @@
 // acfa: runtime host for the recompiled ARMORED CORE for Answer executable.
-//   acfa [--disc <dir>] [--prepared <dir>] [--hdd0 <dir>] [--seconds N] [--trace-hle] [--log-level trace|debug|info]
+//   acfa [--data <dir>] [--user <dir>] [--disc <dir>] [--flash <dir>] [--seconds N] [--fps N|display|uncapped] ...; options below
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 #include <psapi.h>
@@ -85,11 +85,12 @@ int main(int argc, char** argv) {
   // Where everything machine-local lives: --data DIR (the launcher's data folder), by default
   // local\ in the current directory (the development layout). --settings FILE replaces the
   // shared settings file for a run (tests).
-  fs::path data = root / "local";
+  fs::path data = root / "local", user;
   std::string settings_override;
   for (int i = 1; i + 1 < argc; ++i) {
     std::string a = argv[i];
     if (a == "--data") data = fs::absolute(argv[i + 1]);
+    else if (a == "--user") user = fs::absolute(argv[i + 1]);
     else if (a == "--settings") settings_override = argv[i + 1];
     else if (a == "--keep-runs") c.keep_runs = unsigned(std::strtoul(argv[i + 1], nullptr, 10));
   }
@@ -110,7 +111,12 @@ int main(int argc, char** argv) {
   c.flash = (data / "game" / "dev_flash").string();  // the dev_flash file(s) imported from the player's RPCS3
   c.spu_cache = (data / "spu_cache").string();
   c.shader_cache = (data / "shader_cache").string();
-  c.settings_file = settings_override.empty() ? acfa::settings::file_in(data).string() : settings_override;
+  // The player's own folder (--user, from the launcher): settings.ini and savedata\ there. Without
+  // it both stay in the data folder (development runs, test profiles).
+  c.settings_file = !settings_override.empty() ? settings_override
+                    : !user.empty()            ? (user / "settings.ini").string()
+                                               : acfa::settings::file_in(data).string();
+  if (!user.empty()) c.saves = (user / "savedata").string();
   std::string shader_manifest = (root / "data" / "shader_manifest.txt").string();
   // Run directory: <data>\runs\<UTC timestamp>
   std::time_t now = std::time(nullptr);
@@ -132,6 +138,11 @@ int main(int argc, char** argv) {
   // Shared settings (launcher and PC SETTINGS), before the command line overrides them.
   std::vector<std::string> settings_notes;
   settings::init(c.settings_file, &settings_notes);
+  bool safe_mode = std::any_of(argv + 1, argv + argc, [](const char* a) { return std::string(a) == "--safe-mode"; });
+  if (safe_mode) {
+    settings::use_safe_display();
+    settings_notes.push_back("safe mode: default display settings in a 1280x720 window for this run (the settings file is unchanged)");
+  }
   {
     acfa::settings::Display d = settings::display();
     c.fps = d.fps;
@@ -144,13 +155,17 @@ int main(int argc, char** argv) {
   for (int i = 1; i < argc; ++i) {
     std::string a = argv[i];
     auto next = [&]() -> std::string { return i + 1 < argc ? argv[++i] : std::string(); };
-    if (a == "--data" || a == "--settings" || a == "--keep-runs") next();  // read above
+    if (a == "--data" || a == "--user" || a == "--settings" || a == "--keep-runs") next();  // read above
+    else if (a == "--safe-mode") continue;  // read above
     else if (a == "--disc") c.disc_root = next();
     else if (a == "--log-level") level = next();
     else if (a == "--warm-shaders") c.warm_shaders = true;
     else if (a == "--shader-manifest") shader_manifest = next();
     else if (a == "--pacing") c.pacing = next();
-    else if (a == "--fps") { std::string v = next(); c.fps = v == "display" ? 0 : std::max(30.0, std::atof(v.c_str())); }
+    else if (a == "--fps") {
+      std::string v = next();
+      c.fps = v == "display" ? 0 : v == "uncapped" ? acfa::settings::kFpsUncapped : std::max(30.0, std::atof(v.c_str()));
+    }
     else if (a == "--windowed") c.fullscreen = false, c.windowed = true;
     else if (a == "--fullscreen") c.fullscreen = true;
     else if (a == "--priority") c.priority = next();
@@ -196,7 +211,8 @@ int main(int argc, char** argv) {
   }
   if (c.isolate_input) LOG_I("input", "--isolate-input: the real keyboard, mouse and pads are ignored (scripted input only)");
   if (c.lenient) LOG_W("main", "SURVEY MODE (--lenient): unimplemented calls return 0; results are not evidence of working behaviour");
-  LOG_I("main", "disc %s, prepared %s, hdd0 %s", c.disc_root.c_str(), c.prepared.c_str(), c.hdd0.c_str());
+  LOG_I("main", "disc %s, prepared %s, hdd0 %s, saves %s, settings %s", c.disc_root.c_str(), c.prepared.c_str(), c.hdd0.c_str(),
+        c.saves.empty() ? "in hdd0" : c.saves.c_str(), c.settings_file.c_str());
 
   if (!vm::init()) return 1;
   install_fault_handler();
@@ -222,13 +238,15 @@ int main(int argc, char** argv) {
   }
   lv2_init();
   if (!c.headless) gpu::window_dpi_aware();
-  if (!c.headless && !gpu::window_create("ARMORED CORE for Answer", c.window_w, c.window_h, true))
+  if (!c.headless && !gpu::window_create("ARMORED CORE for Answer", c.window_w, c.window_h, true)) {
     LOG_E("main", "window creation failed; running without presentation");
-  else if (!c.headless && c.fullscreen)
-    gpu::window_set_fullscreen(true);
-  else if (!c.headless && !c.windowed && settings::display().mode == acfa::settings::Mode::Fullscreen) {
-    acfa::settings::Display d = settings::display();  // exclusive fullscreen from the first frame
-    gpu::request_exclusive(true, u32(d.fs_width), u32(d.fs_height), u32(d.fs_hz));
+  } else if (!c.headless) {
+    acfa::settings::Display d = settings::display();
+    if (!d.monitor.empty()) gpu::window_move_to_monitor(d.monitor);  // the chosen monitor, before any fullscreen mode
+    if (c.fullscreen)
+      gpu::window_set_fullscreen(true);
+    else if (!c.windowed && d.mode == acfa::settings::Mode::Fullscreen)  // exclusive fullscreen from the first frame
+      gpu::request_exclusive(true, u32(d.fs_width), u32(d.fs_height), u32(d.fs_hz));
   }
   start_main_thread(ex.entry_opd, ex.primary_stack, ex.primary_prio, ex.tls_vaddr, ex.tls_filesz, ex.tls_memsz,
                     ex.malloc_pagesize, "/dev_bdvd/PS3_GAME/USRDIR/EBOOT.BIN");

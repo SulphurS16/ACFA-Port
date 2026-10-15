@@ -11,6 +11,10 @@ namespace rt::settings {
 
 // Loads (or creates/migrates) the file; notes are for the log, which may not be open yet.
 void init(const std::string& file, std::vector<std::string>* notes);
+// Safe mode (launcher option, --safe-mode): this run uses the default display settings in a
+// 1280x720 window (60 fps, render scale 100 %, the primary monitor); the file keeps its values
+// unless the player changes them in PC SETTINGS.
+void use_safe_display();
 const std::string& file();
 
 acfa::settings::Display display();
@@ -19,6 +23,8 @@ void set_fps(double fps);  // 0: the display's refresh rate
 void set_mode(acfa::settings::Mode m);
 void set_window_size(int w, int h);
 void set_fullscreen_mode(int w, int h, int hz);  // 0, 0, 0: the desktop's
+void set_render_scale(int percent);  // the renderer picks it up at the next frame
+void set_monitor(const std::string& device);  // moves the game there (exclusive fullscreen: re-entered there)
 // F11 / Alt+Enter: windowed <-> the last fullscreen kind (borderless at first).
 void toggle_fullscreen();
 // Window thread: the window takes the configured mode (at startup; after exclusive fullscreen

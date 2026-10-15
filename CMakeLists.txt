@@ -44,6 +44,7 @@ add_library(acfa_common STATIC
   src/common/known_inputs.cpp
   src/common/file.cpp
   src/common/ini.cpp
+  src/common/privacy.cpp
   src/common/settings_file.cpp
   src/common/sfo.cpp)
 target_include_directories(acfa_common PUBLIC ${CMAKE_SOURCE_DIR}/src)

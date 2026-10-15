@@ -32,7 +32,7 @@ using Clock = std::chrono::steady_clock;
 // ---------------------------------------------------------------------------------------------
 // Model: two pages of rows, rebuilt from the live settings after every change.
 enum class Kind { Choice, Slider, Binding, Buttons };
-enum Id { kFps, kMode, kWindow, kFsResolution, kFsRefresh, kSensitivity, kInvert, kBind, kButtons };
+enum Id { kFps, kMode, kMonitor, kWindow, kFsResolution, kFsRefresh, kRenderScale, kSensitivityX, kSensitivityY, kInvertX, kInvertY, kBind, kButtons };
 
 struct Row {
   Kind kind = Kind::Choice;
@@ -132,7 +132,7 @@ std::vector<Row> build_rows(int page) {
     r.label = "FRAME RATE";
     r.index = -1;
     for (const auto& c : acfa::settings::fps_choices()) {
-      r.options.push_back(upper(c.label) + (c.validated ? "" : "  (UNTESTED)"));
+      r.options.push_back(upper(c.label));
       if (std::fabs(c.fps - fps) < 0.01) r.index = int(r.options.size()) - 1;
     }
     if (r.index < 0) {
@@ -148,6 +148,20 @@ std::vector<Row> build_rows(int page) {
     m.options = {"WINDOWED", "FULLSCREEN", "BORDERLESS FULLSCREEN"};
     m.index = d.mode == Mode::Fullscreen ? 1 : d.mode == Mode::Borderless ? 2 : 0;
     rows.push_back(m);
+    std::vector<gpu::Monitor> monitors = gpu::window_monitors();
+    if (monitors.size() > 1) {  // which monitor the game uses
+      Row mon;
+      mon.kind = Kind::Choice;
+      mon.id = kMonitor;
+      mon.label = "MONITOR";
+      mon.index = 0;
+      for (size_t i = 0; i < monitors.size(); ++i) {
+        const gpu::Monitor& g = monitors[i];
+        mon.options.push_back(acfa::strprintf("%zu   %d x %d%s", i + 1, g.w, g.h, g.primary ? "   (PRIMARY)" : ""));
+        if (d.monitor.empty() ? g.primary : g.device == d.monitor) mon.index = int(i);
+      }
+      rows.push_back(mon);
+    }
     Row w;
     w.kind = Kind::Choice;
     w.label = "RESOLUTION";
@@ -207,25 +221,46 @@ std::vector<Row> build_rows(int page) {
       }
       rows.push_back(hz);
     }
+    // The resolution the game renders at: the 16:9 picture in the window or on the screen, times this.
+    Row rs;
+    rs.kind = Kind::Slider;
+    rs.id = kRenderScale;
+    rs.label = "RENDER SCALE";
+    rs.value = d.render_scale;
+    rs.lo = acfa::settings::kRenderScaleMin;
+    rs.hi = acfa::settings::kRenderScaleMax;
+    rs.step = 5;
+    {
+      int cw = 0, ch = 0;
+      gpu::window_client_size(&cw, &ch);
+      double fit_h = std::min(double(ch), double(cw) * 9.0 / 16.0) * d.render_scale / 100.0;
+      long rh = std::lround(std::clamp(fit_h, 360.0, 2880.0)), rw = std::lround(double(rh) * 16.0 / 9.0);
+      rs.value_note = acfa::strprintf("%d %%   %ld x %ld", d.render_scale, rw, rh);
+    }
+    rows.push_back(rs);
   } else {
     bindings::MouseSettings ms = bindings::mouse();
-    Row s;
-    s.kind = Kind::Slider;
-    s.id = kSensitivity;
-    s.label = "MOUSE SENSITIVITY";
-    s.value = ms.sensitivity;
-    s.lo = 0.1;
-    s.hi = 5.0;
-    s.step = 0.05;
-    s.value_note = acfa::strprintf("%.2f", ms.sensitivity);
-    rows.push_back(s);
-    Row inv;
-    inv.kind = Kind::Choice;
-    inv.id = kInvert;
-    inv.label = "INVERT MOUSE Y";
-    inv.options = {"OFF", "ON"};
-    inv.index = ms.invert_y ? 1 : 0;
-    rows.push_back(inv);
+    for (int axis = 0; axis < 2; ++axis) {
+      Row s;
+      s.kind = Kind::Slider;
+      s.id = axis ? kSensitivityY : kSensitivityX;
+      s.label = axis ? "MOUSE SENSITIVITY Y" : "MOUSE SENSITIVITY X";
+      s.value = axis ? ms.sensitivity_y : ms.sensitivity_x;
+      s.lo = 0.1;
+      s.hi = 5.0;
+      s.step = 0.05;
+      s.value_note = acfa::strprintf("%.2f", s.value);
+      rows.push_back(s);
+    }
+    for (int axis = 0; axis < 2; ++axis) {
+      Row inv;
+      inv.kind = Kind::Choice;
+      inv.id = axis ? kInvertY : kInvertX;
+      inv.label = axis ? "INVERT MOUSE Y" : "INVERT MOUSE X";
+      inv.options = {"OFF", "ON"};
+      inv.index = (axis ? ms.invert_y : ms.invert_x) ? 1 : 0;
+      rows.push_back(inv);
+    }
     for (size_t c = 0; c < bindings::control_count(); ++c) {
       const ControlText* t = control_text(c);
       Row b;
@@ -331,14 +366,20 @@ void apply_choice(Row& r, int index) {
         settings::set_fullscreen_mode(d.fs_width ? d.fs_width : mw, d.fs_width ? d.fs_height : mh, hz);
       break;
     }
+    case kMonitor: {
+      std::vector<gpu::Monitor> monitors = gpu::window_monitors();
+      if (size_t(index) < monitors.size()) settings::set_monitor(monitors[size_t(index)].primary ? "" : monitors[size_t(index)].device);
+      break;
+    }
     case kWindow: {
       int w = 0, h = 0;
       if (std::sscanf(r.options[size_t(index)].c_str(), "%d x %d", &w, &h) == 2) settings::set_window_size(w, h);
       break;
     }
-    case kInvert: {
+    case kInvertX:
+    case kInvertY: {
       bindings::MouseSettings m = bindings::mouse();
-      m.invert_y = index == 1;
+      (r.id == kInvertX ? m.invert_x : m.invert_y) = index == 1;
       bindings::set_mouse(m);
       settings::save_bindings();
       break;
@@ -352,11 +393,13 @@ void apply_choice(Row& r, int index) {
 void apply_slider(Row& r, double v) {
   v = std::clamp(std::round(v / r.step) * r.step, r.lo, r.hi);
   if (std::fabs(v - r.value) < 1e-9) return;
-  if (r.id == kSensitivity) {
+  if (r.id == kSensitivityX || r.id == kSensitivityY) {
     bindings::MouseSettings m = bindings::mouse();
-    m.sensitivity = v;
+    (r.id == kSensitivityX ? m.sensitivity_x : m.sensitivity_y) = v;
     bindings::set_mouse(m);
     settings::save_bindings();
+  } else if (r.id == kRenderScale) {
+    settings::set_render_scale(int(std::lround(v)));
   }
   rebuild();
 }
@@ -400,6 +443,7 @@ void defaults() {
     settings::set_mode(acfa::settings::Mode::Windowed);
     settings::set_fullscreen_mode(0, 0, 0);
     settings::set_window_size(1280, 720);
+    settings::set_render_scale(100);
   } else {
     bindings::reset_defaults();
     bindings::set_mouse(bindings::MouseSettings{});
