@@ -1,5 +1,6 @@
 // ACFA-Launcher: the player's way in. Takes the game's folder and the folder with the files the
-// player decrypted (checked by SHA-256; the port decrypts nothing), runs the first-time setup
+// player decrypted (checked by SHA-256; the port decrypts nothing), or prepares those files with
+// the player's own RPCS3 in one step (rpcs3.h: a private copy of RPCS3 does it), runs the first-time setup
 // (setup.h), offers the display mode, resolution and frame rate (the shared settings file, also
 // changed in game under SYSTEM > PC SETTINGS) and starts the game. The More menu holds the rest:
 // render scale, monitor, presets, saves (open, back up, restore), safe mode, settings reset, the
@@ -27,6 +28,7 @@
 #include "common/settings_file.h"
 #include "launcher/inputs.h"
 #include "launcher/process.h"
+#include "launcher/rpcs3.h"
 #include "launcher/setup.h"
 
 namespace fs = std::filesystem;
@@ -38,11 +40,11 @@ using namespace launcher;
 
 namespace {
 
-constexpr UINT WM_SETUP = WM_APP + 1, WM_CHECKED = WM_APP + 2, WM_GAME_EXIT = WM_APP + 3;
+constexpr UINT WM_SETUP = WM_APP + 1, WM_CHECKED = WM_APP + 2, WM_GAME_EXIT = WM_APP + 3, WM_PREP = WM_APP + 4;
 constexpr const wchar_t* kTitle = L"ARMORED CORE for Answer";
 enum Id {
   kDiscEdit = 100, kFilesEdit,
-  kDiscBrowse = 110, kFilesBrowse, kHelp,
+  kDiscBrowse = 110, kFilesBrowse, kPrepFiles,
   kDiscState = 120, kFilesState,
   kPrepare = 140, kCancel, kProgress = 143, kStatus,
   kFps = 150, kMode, kResolution,
@@ -55,7 +57,7 @@ enum Id {
   kMenuPreset = 340,   // + index into kPresets
   kMenuSavesOpen = 360, kMenuSavesBackup, kMenuSavesRestore,
   kMenuSafePlay = 370, kMenuResetSettings,
-  kMenuInstall = 380, kMenuRebuild, kMenuOpenLog,
+  kMenuInstall = 380, kMenuRebuild, kMenuOpenLog, kMenuWhichFiles,
 };
 
 HINSTANCE g_inst;
@@ -68,6 +70,8 @@ fs::path g_src, g_ini_path;
 fs::path g_user_override;  // launcher.ini [paths] user
 SetupConfig g_cfg;
 Setup g_setup;
+Rpcs3Prep g_prep;
+fs::path g_rpcs3, g_pup;  // the player's rpcs3.exe and PS3UPDAT.PUP (Prepare files)
 HANDLE g_game = nullptr;
 bool g_ready = false;
 std::wstring g_note;  // a message for the status line (a setup or game error) until the next action
@@ -96,6 +100,8 @@ void load_paths() {
   g_cfg.disc = p("disc");
   g_cfg.files = p("files");
   g_cfg.data = p("install");
+  g_rpcs3 = p("rpcs3");
+  g_pup = p("pup");
   g_user_override = p("user");  // optional: settings and saves somewhere else than Saved Games
 }
 
@@ -106,6 +112,8 @@ void save_paths() {
     ini.set("paths", "disc", narrow(g_cfg.disc.wstring()));
     ini.set("paths", "files", narrow(g_cfg.files.wstring()));
     ini.set("paths", "install", narrow(g_cfg.data.wstring()));
+    ini.set("paths", "rpcs3", narrow(g_rpcs3.wstring()));
+    ini.set("paths", "pup", narrow(g_pup.wstring()));
     std::error_code ec;
     fs::create_directories(g_ini_path.parent_path(), ec);
     ini.save(g_ini_path);
@@ -418,13 +426,12 @@ bool inputs_ok() {
   return g_disc_check.verdict == Verdict::Ok && g_files_check.verdict == Verdict::Ok;
 }
 
-// Decrypted files are missing or wrong (not merely a folder still to choose): the window says how
-// to get them.
+// Decrypted files are missing or wrong: the window offers to prepare them with RPCS3.
 bool files_missing() {
   std::lock_guard lk(g_check_mu);
   if (!g_checked) return false;
   bool eboot = g_disc_check.verdict == Verdict::Bad && g_disc_check.text.find("EBOOT") != std::string::npos;
-  return eboot || g_files_check.verdict == Verdict::Bad;
+  return eboot || g_files_check.verdict != Verdict::Ok;
 }
 
 // What the status line says when setup is not running.
@@ -440,19 +447,21 @@ std::wstring idle_status() {
   double need = double(Setup::space_needed(g_cfg)) / (1ull << 30), free = double(avail.QuadPart) / (1ull << 30);
   std::wstring where = widen(acfa::strprintf("%.1f GB in ", need)) + g_cfg.data.wstring() + widen(acfa::strprintf(" (%.0f GB free)", free));
   if (free < need) return L"Not enough space: setup needs " + where + L". More > Install folder chooses another place.";
-  if (files_missing()) return L"Decrypt the missing files yourself, for example with RPCS3 (Utilities > Decrypt PS3 Binaries). The port only checks them.";
+  if (files_missing())
+    return L"Prepare files makes them with your RPCS3 (rpcs3.net) and the PS3 update file PS3UPDAT.PUP 4.93 (playstation.com).";
   if (!inputs_ok()) return L"Setup starts when the files above are found: about " + where + L".";
   return L"Set up prepares and builds the game once, a few minutes: " + where + L".";
 }
 
 void update_buttons() {
-  bool busy = g_setup.running(), playing = g_game != nullptr;
+  bool busy = g_setup.running() || g_prep.running(), playing = g_game != nullptr;
   g_ready = !g_cfg.data.empty() && Setup::ready(g_cfg);
-  bool help = !busy && files_missing();
-  show(kHelp, help);
-  show(kPrepare, !busy && !g_ready && !help);
+  bool prep = !busy && files_missing();
+  show(kPrepFiles, prep);
+  EnableWindow(item(kPrepFiles), !playing);
+  show(kPrepare, !busy && !g_ready && !prep);
   show(kCancel, busy);
-  show(kProgress, busy);
+  show(kProgress, g_setup.running());
   EnableWindow(item(kPrepare), !playing && inputs_ok() && data_ok());
   EnableWindow(item(kPlay), !busy && !playing && g_ready && inputs_ok());
   for (int id : {kDiscBrowse, kFilesBrowse, kDiscEdit, kFilesEdit}) EnableWindow(item(id), !busy && !playing);
@@ -474,14 +483,19 @@ void refresh_paths_from_ui() {
 }
 
 // ---- file and folder pickers ----
-fs::path pick_folder(const wchar_t* title, const fs::path& start) {
+fs::path pick(bool folder, const wchar_t* title, const fs::path& start, const wchar_t* filter_name = nullptr,
+              const wchar_t* filter = nullptr) {
   IFileOpenDialog* dlg = nullptr;
   fs::path result;
   if (FAILED(CoCreateInstance(CLSID_FileOpenDialog, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&dlg)))) return result;
   DWORD opts = 0;
   dlg->GetOptions(&opts);
-  dlg->SetOptions(opts | FOS_FORCEFILESYSTEM | FOS_PICKFOLDERS);
+  dlg->SetOptions(opts | FOS_FORCEFILESYSTEM | (folder ? FOS_PICKFOLDERS : FOS_FILEMUSTEXIST));
   dlg->SetTitle(title);
+  if (!folder && filter) {
+    COMDLG_FILTERSPEC spec[2] = {{filter_name, filter}, {L"All files", L"*.*"}};
+    dlg->SetFileTypes(2, spec);
+  }
   std::error_code ec;
   fs::path dir = start;
   while (!dir.empty() && !fs::is_directory(dir, ec)) dir = dir.parent_path();
@@ -501,6 +515,78 @@ fs::path pick_folder(const wchar_t* title, const fs::path& start) {
   }
   dlg->Release();
   return result;
+}
+fs::path pick_folder(const wchar_t* title, const fs::path& start) { return pick(true, title, start); }
+
+fs::path downloads_dir() {
+  PWSTR p = nullptr;
+  fs::path r;
+  if (SUCCEEDED(SHGetKnownFolderPath(FOLDERID_Downloads, 0, nullptr, &p))) r = p;
+  CoTaskMemFree(p);
+  return r;
+}
+
+// ---- Prepare files: the player's RPCS3 makes the decrypted files (rpcs3.h) ----
+void prepare_files() {
+  std::error_code ec;
+  if (!fs::is_regular_file(g_cfg.disc / "PS3_GAME" / "USRDIR" / "EBOOT.BIN", ec)) {
+    MessageBoxW(g_wnd, L"Choose the game's folder first (the one with PS3_GAME).", kTitle, MB_ICONINFORMATION);
+    return;
+  }
+  fs::path exe = g_rpcs3;
+  if (!fs::is_regular_file(exe, ec)) {
+    exe = pick(false, L"Your RPCS3 (rpcs3.exe; get it from rpcs3.net): it prepares the files once", downloads_dir(), L"RPCS3", L"rpcs3.exe");
+    if (exe.empty()) return;
+  }
+  fs::path pup;
+  if (rpcs3_system_software(exe) != "4.93") {  // else RPCS3 has the system modules already
+    pup = g_pup;
+    if (pup_version(pup) != "4.93") {
+      pup = pick(false, L"PS3 system software 4.93 update file (PS3UPDAT.PUP, from playstation.com)", downloads_dir(), L"PS3 system software update",
+                 L"*.PUP");
+      if (pup.empty()) return;
+      std::string v = pup_version(pup);
+      if (v != "4.93") {
+        MessageBoxW(g_wnd,
+                    v.empty() ? L"This is not a PS3 system software update file (PS3UPDAT.PUP)."
+                              : (L"This update file is PS3 system software " + widen(v) + L"; the port needs 4.93 (playstation.com).").c_str(),
+                    kTitle, MB_ICONWARNING);
+        return;
+      }
+    }
+  }
+  g_rpcs3 = exe;
+  if (!pup.empty()) g_pup = pup;
+  save_paths();
+  Rpcs3Job job;
+  job.rpcs3_exe = exe;
+  job.pup = pup;
+  job.disc = g_cfg.disc;
+  job.update_pkg = find_update_pkg(g_cfg.disc, pup.empty() ? fs::path() : pup.parent_path());
+  job.work = g_cfg.data / "rpcs3-work";
+  job.out = g_cfg.data / "decrypted";
+  g_note.clear();
+  g_prep.start(job, [] { PostMessageW(g_wnd, WM_PREP, 0, 0); });
+  update_buttons();
+}
+
+void start_checks();
+void refresh_paths_from_ui();
+
+void on_prep_update() {
+  Rpcs3Prep::View v = g_prep.view();
+  if (!v.finished) {
+    set_text(kStatus, widen(v.status));
+    return;
+  }
+  if (v.ok) {
+    set_text(kFilesEdit, (g_cfg.data / "decrypted").wstring());
+    g_note = widen(v.note);
+    refresh_paths_from_ui();
+  } else {
+    g_note = widen(v.error);
+    update_buttons();
+  }
 }
 
 // ---- the game ----
@@ -547,7 +633,7 @@ struct Place {
 const Place kPlaces[] = {
     {kDiscEdit, 124, 14, 324, 24},   {kDiscBrowse, 454, 13, 90, 26},   {kDiscState, 124, 41, 420, 18},
     {kFilesEdit, 124, 68, 324, 24},  {kFilesBrowse, 454, 67, 90, 26},  {kFilesState, 124, 95, 420, 18},
-    {kPrepare, 16, 124, 98, 28},     {kCancel, 16, 124, 98, 28},       {kHelp, 16, 124, 98, 28},
+    {kPrepare, 16, 124, 98, 28},     {kCancel, 16, 124, 98, 28},       {kPrepFiles, 16, 124, 98, 28},
     {kStatus, 124, 124, 420, 34},    {kProgress, 124, 162, 420, 10},
     {kMode, 124, 186, 190, 300},     {kResolution, 320, 186, 224, 300}, {kFps, 124, 220, 190, 300},
     {kMore, 16, 266, 98, 30},        {kPlayState, 124, 272, 200, 20},  {kPlay, 334, 254, 210, 50},
@@ -599,7 +685,7 @@ void create_controls() {
     make(L"BUTTON", L"Browse...", WS_TABSTOP | BS_PUSHBUTTON, kDiscBrowse + i);
     make(L"STATIC", L"", SS_LEFT | SS_ENDELLIPSIS, kDiscState + i);
   }
-  make(L"BUTTON", L"Which files?", WS_TABSTOP | BS_PUSHBUTTON, kHelp);
+  make(L"BUTTON", L"Prepare files", WS_TABSTOP | BS_PUSHBUTTON, kPrepFiles);
   make(L"BUTTON", L"Set up", WS_TABSTOP | BS_PUSHBUTTON, kPrepare);
   make(L"BUTTON", L"Cancel", WS_TABSTOP | BS_PUSHBUTTON, kCancel);
   make(L"STATIC", L"", SS_LEFT, kStatus);
@@ -609,7 +695,7 @@ void create_controls() {
   make(L"BUTTON", L"More...", WS_TABSTOP | BS_PUSHBUTTON, kMore);
   make(L"STATIC", L"", SS_RIGHT, kPlayState);
   make(L"BUTTON", L"PLAY", WS_TABSTOP | BS_DEFPUSHBUTTON, kPlay);
-  show(kHelp, false);
+  show(kPrepFiles, false);
   show(kCancel, false);
   show(kProgress, false);
 }
@@ -661,6 +747,7 @@ void more_menu() {
   AppendMenuW(m, MF_STRING | (!busy && !playing ? 0 : MF_GRAYED), kMenuInstall, (L"Install folder: " + g_cfg.data.wstring() + L"...").c_str());
   AppendMenuW(m, MF_STRING | (!busy && !playing && g_ready && inputs_ok() ? 0 : MF_GRAYED), kMenuRebuild, L"Rebuild the game");
   AppendMenuW(m, MF_STRING | (data ? 0 : MF_GRAYED), kMenuOpenLog, L"Open the setup log");
+  AppendMenuW(m, MF_STRING, kMenuWhichFiles, L"Which files does the port need?");
   RECT r{};
   GetWindowRect(item(kMore), &r);
   TrackPopupMenu(m, TPM_LEFTALIGN | TPM_BOTTOMALIGN | TPM_RIGHTBUTTON, r.left, r.top, 0, g_wnd, nullptr);
@@ -763,14 +850,18 @@ LRESULT CALLBACK wndproc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
           if (!p.empty()) set_text(kFilesEdit, p.wstring()), refresh_paths_from_ui();
           break;
         }
-        case kHelp:
+        case kMenuWhichFiles:
           MessageBoxW(g_wnd, files_help().c_str(), L"The files the port needs", MB_ICONINFORMATION);
+          break;
+        case kPrepFiles:
+          if (IsWindowEnabled(item(kPrepFiles)) && !g_prep.running() && !g_setup.running()) prepare_files();
           break;
         case kPrepare:
           if (IsWindowEnabled(item(kPrepare))) start_setup();
           break;
         case kCancel:
-          g_setup.cancel();
+          if (g_prep.running()) g_prep.cancel();
+          else g_setup.cancel();
           break;
         case kMore:
           more_menu();
@@ -857,6 +948,9 @@ LRESULT CALLBACK wndproc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
     case WM_SETUP:
       on_setup_update();
       return 0;
+    case WM_PREP:
+      on_prep_update();
+      return 0;
     case WM_CHECKED:
       if (int(wp) != g_check_gen) return 0;
       show_checks();
@@ -898,8 +992,11 @@ LRESULT CALLBACK wndproc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
       return 0;
     }
     case WM_CLOSE:
-      if (g_setup.running() && MessageBoxW(h, L"Setup is running. Stop it and close?", kTitle, MB_YESNO | MB_ICONQUESTION) != IDYES) return 0;
+      if ((g_setup.running() || g_prep.running()) &&
+          MessageBoxW(h, L"The launcher is still working. Stop it and close?", kTitle, MB_YESNO | MB_ICONQUESTION) != IDYES)
+        return 0;
       g_setup.cancel();
+      g_prep.cancel();
       DestroyWindow(h);
       return 0;
     case WM_DESTROY:
@@ -913,9 +1010,36 @@ LRESULT CALLBACK wndproc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
 
 int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int show_cmd) {
   g_inst = inst;
-  HANDLE single = CreateMutexW(nullptr, TRUE, L"Local\\ACFA-Port-Launcher");
+  // One launcher per install (a copy of the port in another folder may run beside it).
+  wchar_t self_path[MAX_PATH * 4];
+  GetModuleFileNameW(nullptr, self_path, DWORD(std::size(self_path)));
+  std::wstring self_key = self_path;
+  for (auto& ch : self_key) ch = wchar_t(towlower(ch));
+  unsigned long long fnv = 1469598103934665603ull;
+  for (wchar_t ch : self_key) fnv = (fnv ^ unsigned(ch)) * 1099511628211ull;
+  HANDLE single = CreateMutexW(nullptr, TRUE, (L"Local\\ACFA-Port-Launcher-" + std::to_wstring(fnv)).c_str());
   if (GetLastError() == ERROR_ALREADY_EXISTS) {
-    if (HWND other = FindWindowW(L"AcfaLauncher", nullptr)) SetForegroundWindow(other);
+    struct Find {
+      std::wstring self;
+      HWND found = nullptr;
+    } find{self_key};
+    EnumWindows([](HWND h, LPARAM lp) -> BOOL {
+      auto* f = reinterpret_cast<Find*>(lp);
+      wchar_t cls[64] = {};
+      GetClassNameW(h, cls, 64);
+      DWORD pid = 0;
+      GetWindowThreadProcessId(h, &pid);
+      HANDLE p = std::wcscmp(cls, L"AcfaLauncher") == 0 ? OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid) : nullptr;
+      if (!p) return TRUE;
+      wchar_t path[MAX_PATH * 4];
+      DWORD n = DWORD(std::size(path));
+      std::wstring other = QueryFullProcessImageNameW(p, 0, path, &n) ? path : L"";
+      CloseHandle(p);
+      for (auto& ch : other) ch = wchar_t(towlower(ch));
+      if (other == f->self) f->found = h;
+      return f->found ? FALSE : TRUE;
+    }, reinterpret_cast<LPARAM>(&find));
+    if (find.found) SetForegroundWindow(find.found);
     return 0;
   }
   CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
@@ -934,6 +1058,10 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int show_cmd) {
   load_paths();
   g_cfg.src = g_src;
   if (g_cfg.data.empty()) g_cfg.data = writable(g_src / "local") ? g_src / "local" : local_appdata();
+  {
+    std::error_code ec;
+    if (g_cfg.files.empty() && fs::is_regular_file(g_cfg.data / "decrypted" / "EBOOT.elf", ec)) g_cfg.files = g_cfg.data / "decrypted";
+  }
 
   WNDCLASSEXW wc{};
   wc.cbSize = sizeof wc;

@@ -184,7 +184,8 @@ std::wstring files_help() {
          L"\u2022 The 10 system modules of PS3 system software " + widen(ki::kSystemSoftware) + L" (sys\\external), decrypted to .prx: " + mods +
          L"; with flashATRAC.pic from the same folder.\n\n"
          L"\u2022 Optional, for the game's final balance data: regulation.bin of update 01.35.\n\n"
-         L"Choose the folder that holds them (they may also be in folders below it).";
+         L"Choose the folder that holds them (they may also be in folders below it), or let the launcher prepare them: Prepare "
+         L"files asks for your RPCS3 and the PS3 system software 4.93 update file (PS3UPDAT.PUP from playstation.com).";
 }
 
 }  // namespace launcher

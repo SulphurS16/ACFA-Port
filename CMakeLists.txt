@@ -140,6 +140,7 @@ add_executable(acfa-launcher WIN32
   src/launcher/setup.cpp
   src/launcher/inputs.cpp
   src/launcher/process.cpp
+  src/launcher/rpcs3.cpp
   src/launcher/download.cpp
   src/launcher/launcher.rc)
 target_include_directories(acfa-launcher PRIVATE ${CMAKE_SOURCE_DIR}/src)
