@@ -665,6 +665,17 @@ void open_from_menu() {
   g_open_request = true;  // opened on the window thread (tick)
 }
 
+void decline_install() {
+  std::lock_guard<std::recursive_mutex> lk(g_mu);
+  if (g_state != State::Closed) return;
+  g_task_started = Clock::now();
+  auto from = after(g_task_started, kQuestionReady);
+  g_cancel_from = ticks(from);
+  g_cancel_to = ticks(after(from, kPressTime));
+  g_closed_at = ticks(after(from, kPressTime + kAfterPress));
+  g_state = State::Closing;  // as when the screen closes: black while the question is answered
+}
+
 void close() {
   std::lock_guard<std::recursive_mutex> lk(g_mu);
   close_locked();
@@ -1127,7 +1138,7 @@ void render(ID3D11Device* dev, ID3D11DeviceContext* ctx, ID3D11Texture2D* backbu
     s.capturing = g_capturing;
     if (!g_toast.empty() && Clock::now() < g_toast_until) s.toast = g_toast;
   }
-  if (s.rows.empty()) return;
+  if (s.rows.empty() && !s.closing) return;
   ID3D11DeviceContext1* ctx1 = nullptr;
   if (FAILED(ctx->QueryInterface(__uuidof(ID3D11DeviceContext1), reinterpret_cast<void**>(&ctx1)))) return;
   ID3DDeviceContextState* prev = nullptr;

@@ -1,6 +1,7 @@
 #include "runtime/game/pc_settings_entry.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cstring>
 #include <mutex>
 
@@ -22,6 +23,10 @@ const char* const kHelpNew = "Configure PC settings.";  // shorter: the rest is 
 
 std::mutex g_mu;
 u32 g_label_ea = 0, g_help_ea = 0;
+// The game's install task also starts on its own at a new install's first start, between the title
+// and the hub (cellGameDataCheckCreate2: new data, run 20261015-123128); the SYSTEM menu, and its
+// entry, exist only in the hub.
+std::atomic<bool> g_before_hub{true};
 
 std::string utf16be(const char* s, bool terminated) {
   std::string out;
@@ -83,12 +88,20 @@ void patch_text() {
 }  // namespace
 
 void pc_settings_thread_started(const std::string& name) {
-  if (name == "HDDInstallTask") {  // the SYSTEM menu's entry was chosen
-    LOG_I("game", "SYSTEM menu: PC SETTINGS chosen");
-    ui::open_from_menu();
-  } else if (name == "TitleAfterInitScene" || name == "MenuTop/MenuTopSelectScene" || name == "SystemSetting/MenuSysSelectScene") {
-    patch_text();  // the UI text is loaded at boot; checked again before the menus that show it
+  if (name == "HDDInstallTask") {
+    if (g_before_hub.load()) {  // the first start's question (the port reads the disc in place)
+      LOG_I("game", "first start: the game's HDD install question is declined");
+      ui::decline_install();
+    } else {  // the SYSTEM menu's entry was chosen
+      LOG_I("game", "SYSTEM menu: PC SETTINGS chosen");
+      ui::open_from_menu();
+    }
+    return;
   }
+  if (name == "Title_$(Platform)") g_before_hub = true;
+  if (name == "MenuTop/MenuTopSelectScene") g_before_hub = false;
+  if (name == "TitleAfterInitScene" || name == "MenuTop/MenuTopSelectScene" || name == "SystemSetting/MenuSysSelectScene")
+    patch_text();  // the UI text is loaded at boot; checked again before the menus that show it
 }
 
 }  // namespace rt::game

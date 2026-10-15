@@ -18,6 +18,9 @@ bool is_open();  // any thread
 // From the SYSTEM menu (the game's install task started): opens the screen; when it closes, the
 // game's install question behind it is answered with CANCEL (a Circle press).
 void open_from_menu();
+// A new install's first start (the game asks on its own whether to install to the HDD): the
+// question is answered with CANCEL behind a black page, without opening the screen.
+void decline_install();
 void close();  // window thread
 
 // Window thread, while open: input events (client-area pixel coordinates).
