@@ -9,7 +9,9 @@
 // under it through the dialog's own SetFocus (the D-pad's path, with its highlight, help line and
 // notifications); a click presses Cross after focusing what was clicked, a right click Circle,
 // the wheel the D-pad. A click or drag on a slider's bar moves the slider with the D-pad (held
-// while far, single steps near) until its value matches the cursor. Nothing here changes the
+// while far, single steps near) until its value matches the cursor. In a list the row under the
+// cursor is selected with the list's own move routine (and its notification), as far as that
+// does not scroll the list; a click on a row selects and chooses it. Nothing here changes the
 // game's state other than through those calls and presses.
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
@@ -31,6 +33,8 @@
 #include "runtime/memory.h"
 #include "runtime/ui/overlay.h"
 
+void f_003e71a0(ppu::Ctx&);  // menu object: tell its parent dialog (r3 object, r4 code)
+
 namespace rt::game {
 namespace {
 
@@ -51,6 +55,11 @@ constexpr u32 kObjFocusable = 56;  // object vtable: focusable
 // CMenuSliderCtrl (vtable 0x120dff8): min, max, value, step (ints), the bar (floats l, t, r, b).
 constexpr u32 kSliderVtable = 0x0120dff8;
 constexpr u32 kSliderMin = 0x34, kSliderMax = 0x38, kSliderValue = 0x3c, kSliderStep = 0x40, kSliderBar = 0x44;
+// The list control (vtable 0x120dd08, FREE PLAY's missions and others): column +68, selected row
+// +104, rows on a page +108, rows +112, first row shown +116; vtable slot 21 moves the selection
+// (out, list, current {column, row}, delta), then the list's parent is told (0x3e71a0, code 5).
+constexpr u32 kListVtable = 0x0120dd08;
+constexpr u32 kListCol = 68, kListRow = 104, kListPage = 108, kListCount = 112, kListTop = 116, kListMove = 84;
 
 // Pad bits (cellPad digital words).
 constexpr u16 kStart = 0x8, kUp = 0x10, kRight = 0x20, kDown = 0x40, kLeft = 0x80;
@@ -96,7 +105,7 @@ bool valid(u32 a, u32 size = 4) { return a >= 0x10000 && !(a & 3) && vm::committ
 
 // Calls the guest function behind descriptor `opd` with r3, r4 on a frame below the current stack
 // pointer (leaving the 0x100 bytes under it to the caller); every register is restored after.
-u64 call(Ctx& ctx, u32 opd, u64 r3, u64 r4 = 0) {
+u64 call(Ctx& ctx, u32 opd, u64 r3, u64 r4 = 0, u64 r5 = 0, u64 r6 = 0) {
   if (!valid(opd, 8)) return 0;
   Ctx saved = ctx;
   u32 sp = (u32(ctx.r[1]) - 0x300) & ~15u;
@@ -105,10 +114,23 @@ u64 call(Ctx& ctx, u32 opd, u64 r3, u64 r4 = 0) {
   ctx.r[2] = ppu::r32(opd + 4);
   ctx.r[3] = r3;
   ctx.r[4] = r4;
+  ctx.r[5] = r5;
+  ctx.r[6] = r6;
   ppu::icall(ctx, ppu::r32(opd));
   u64 ret = ctx.r[3];
   ctx = saved;
   return ret;
+}
+// The same for a recompiled function called directly (its own TOC handling).
+void call_fn(Ctx& ctx, void (*fn)(Ctx&), u64 r3, u64 r4) {
+  Ctx saved = ctx;
+  u32 sp = (u32(ctx.r[1]) - 0x300) & ~15u;
+  ppu::w64(sp, ctx.r[1]);
+  ctx.r[1] = sp;
+  ctx.r[3] = r3;
+  ctx.r[4] = r4;
+  fn(ctx);
+  ctx = saved;
 }
 u32 vfunc(u32 obj, u32 slot) {
   if (!valid(obj)) return 0;
@@ -208,6 +230,38 @@ u32 object_at(Ctx& ctx, u32 dialog, float gx, float gy, u32* slider) {
   return best;
 }
 
+bool is_list(u32 obj) { return valid(obj + kListTop + 4) && ppu::r32(obj) == kListVtable; }
+
+// The list row under (gx, gy) of `list` with rect `r`, or -1; *safe: selecting it does not scroll
+// the list. Wherever it can, the game keeps the selection on the middle row of the page (first
+// row shown = selection - page / 2, within the list: FREE PLAY, run 20261015-100154).
+s32 list_row_at(u32 list, const Rect& r, float gy, bool* safe) {
+  s32 page = s32(ppu::r32(list + kListPage)), count = s32(ppu::r32(list + kListCount)), top = s32(ppu::r32(list + kListTop));
+  if (page <= 0 || page > 64 || count <= 0 || top < 0 || !(r.b > r.t)) return -1;
+  s32 visible = s32((gy - r.t) / ((r.b - r.t) / float(page)));
+  if (visible < 0 || visible >= page || top + visible >= count) return -1;
+  s32 target = top + visible;
+  *safe = std::clamp(target - page / 2, 0, std::max(0, count - page)) == top;
+  return target;
+}
+
+// Selects row `target` of `list` as its key handler does (the list's own move, then the parent's
+// notification). Returns whether the list scrolled.
+bool list_select(Ctx& ctx, u32 list, s32 target) {
+  s32 row = s32(ppu::r32(list + kListRow)), col = s32(ppu::r32(list + kListCol)), top = s32(ppu::r32(list + kListTop));
+  if (target == row) return false;
+  u32 m = (u32(ctx.r[1]) - 0x60) & ~15u;  // {current}, {delta}, {out}: inside the 0x100 bytes call() leaves free
+  ppu::w32(m, u32(col));
+  ppu::w32(m + 4, u32(row));
+  ppu::w32(m + 8, 0);
+  ppu::w32(m + 12, u32(target - row));
+  ppu::w32(m + 16, u32(col));
+  ppu::w32(m + 20, u32(row));
+  call(ctx, vfunc(list, kListMove), m + 16, list, m, m + 8);
+  if (s32(ppu::r32(m + 16)) != col || s32(ppu::r32(m + 20)) != row) call_fn(ctx, f_003e71a0, list, 5);
+  return s32(ppu::r32(list + kListTop)) != top;
+}
+
 void press(u16 d1, u16 d2, s64 at) {
   std::lock_guard lk(g_mu);
   g_presses.push_back({d1, d2, at});
@@ -303,10 +357,19 @@ void frame(Ctx& ctx) {
   g_last_dialog = dialog;
   bool down = std::any_of(events.begin(), events.end(), [](const Event& e) { return e.kind == Event::LeftDown; });
   u32 hit = 0, slider = 0;
+  s32 row = -1;  // a list's row under the cursor
+  bool row_safe = false;
   if (show && (moved || down) && !(g_drag.slider && g_drag.button)) {
     hit = object_at(ctx, dialog, gx, gy, &slider);
     if (hit && hit != ppu::r32(dialog + kDlgFocus)) {
       call(ctx, vfunc(dialog, kDlgSetFocus), dialog, hit);
+    }
+    if (hit && is_list(hit)) {
+      row = list_row_at(hit, rect_of(ctx, hit), gy, &row_safe);
+      // Hover selects rows that do not scroll the list; after a scroll the cursor has to move a
+      // row's height before hover selects again (no runaway scrolling under a resting cursor).
+      static float scrolled_y = -1e9f;
+      if (row >= 0 && row_safe && !down && std::fabs(gy - scrolled_y) > 40 && list_select(ctx, hit, row)) scrolled_y = gy;
     }
   }
   s64 t = now_ms();
@@ -315,7 +378,8 @@ void frame(Ctx& ctx) {
       if (slider) {  // on a slider's bar: the slider follows the cursor while the button is down
         g_drag = {slider, true, 0, 0};
       } else if (hit) {
-        press(0, kCross, t);  // a click on an item chooses it; elsewhere it does nothing
+        if (row >= 0) list_select(ctx, hit, row);  // a list's row: selected, then chosen
+        press(0, kCross, t + (row >= 0 ? 50 : 0));  // a click on an item chooses it; elsewhere nothing
       }
     } else if (e.kind == Event::LeftUp) {
       g_drag.button = false;
