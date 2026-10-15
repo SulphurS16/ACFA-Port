@@ -302,6 +302,12 @@ LRESULT CALLBACK wndproc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
       last = lp;
       break;
     }
+    case WM_MOUSEACTIVATE:
+      // The click that brings the window to the front only does that in menus and on the title or
+      // a movie (it would choose an item or skip the movie); in gameplay it takes the mouse.
+      if (LOWORD(lp) == HTCLIENT && GetForegroundWindow() != h && game::input_context() != game::InputContext::Gameplay)
+        return MA_ACTIVATEANDEAT;
+      break;
     case WM_SETCURSOR:
       if (LOWORD(lp) == HTCLIENT) {
         SetCursor(client_cursor());

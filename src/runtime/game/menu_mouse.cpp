@@ -26,6 +26,7 @@
 #include <mutex>
 
 #include "ppu/ppu_recomp.h"
+#include "runtime/config.h"
 #include "runtime/game/frame_policy.h"
 #include "runtime/gpu/window.h"
 #include "runtime/input.h"
