@@ -1,6 +1,6 @@
 #pragma once
-// Personal data kept out of logs: the user's profile folder (with the account name in it) and
-// appear in paths; logs replace them so a player can share a log as it is.
+// Personal data kept out of logs: the user's profile folder and account name appear in paths;
+// logs replace them so a player can share a log as it is.
 #include <string>
 
 namespace acfa {
