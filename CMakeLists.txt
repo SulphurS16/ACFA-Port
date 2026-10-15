@@ -41,6 +41,7 @@ target_compile_options(acfa_zlib PRIVATE -w)
 add_library(acfa_common STATIC
   src/common/bytes.cpp
   src/common/crypto.cpp
+  src/common/known_inputs.cpp
   src/common/file.cpp
   src/common/ini.cpp
   src/common/settings_file.cpp
@@ -115,9 +116,7 @@ endif()
 # ---- preparation tool ----
 add_executable(acfa-prep
   src/prep/main.cpp
-  src/prep/pkg.cpp
-  src/prep/self.cpp
-  src/prep/firmware.cpp
+  src/prep/import.cpp
   src/prep/prx.cpp
   src/prep/sfo.cpp
   src/prep/spu_records.cpp

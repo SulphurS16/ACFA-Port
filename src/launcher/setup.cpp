@@ -10,24 +10,23 @@
 #include <sstream>
 
 #include "common/crypto.h"
+#include "common/known_inputs.h"
 #include "launcher/download.h"
 #include "launcher/inputs.h"
 
 namespace launcher {
 namespace {
 
-// Firmware modules run natively (order defines their load slots; libsre first), as tools\pipeline.ps1.
-const char* const kModules = "libsre,libsail,libpamf,libdmux,libdmuxpamf,libadec,libvpost,libatrac3plus,libatxdec,libat3dec";
+namespace ki = acfa::inputs;
 
 struct StepDef {
   const char* name;
   double weight;  // share of the whole setup's time (rough)
 };
-enum : size_t { kToolchain, kTools, kPrepare, kFirmware, kLle, kRecompile, kSpu, kBuild, kShaders, kStepCount };
+enum : size_t { kToolchain, kTools, kImport, kRecompile, kSpu, kBuild, kShaders, kStepCount };
 const StepDef kSteps[kStepCount] = {
-    {"Download build tools", 12}, {"Build preparation tools", 6}, {"Prepare game files", 3},   {"Extract system software", 4},
-    {"Prepare system modules", 1}, {"Translate game code", 8},    {"Translate SPU code", 5}, {"Build the game", 56},
-    {"Compile shaders", 5},
+    {"Download build tools", 12}, {"Build preparation tools", 6}, {"Import game files", 4}, {"Translate game code", 8},
+    {"Translate SPU code", 5},    {"Build the game", 60},         {"Compile shaders", 5},
 };
 
 struct Tool {
@@ -74,41 +73,31 @@ std::string content_hash(const fs::path& p) {
 }
 
 fs::path prepared(const SetupConfig& c) { return c.data / "game" / "BLUS30187"; }
-// One folder per system software version (firmware241, firmware493), named from the PUP's version.
-fs::path firmware(const SetupConfig& c) {
-  std::string digits;
-  for (char ch : pup_version(c.pup))
-    if (ch >= '0' && ch <= '9') digits += ch;
-  return c.data / "game" / ("firmware" + digits);
-}
+// The one dev_flash file the game reads (flashATRAC.pic), imported from RPCS3's folder.
+fs::path flash(const SetupConfig& c) { return c.data / "game" / "dev_flash"; }
 fs::path build_dir(const SetupConfig& c) { return c.data / "build"; }
 fs::path tools_dir(const SetupConfig& c) { return c.data / "tools"; }
 // Generated code lives inside the build folder: object files then get short relative paths there
 // (sources elsewhere would repeat the whole install path in every object path).
 fs::path gen_dir(const SetupConfig& c) { return build_dir(c) / "gen"; }
 
-std::vector<std::string> module_list() {
-  std::vector<std::string> v;
-  std::string s = kModules;
-  for (size_t p = 0; p <= s.size();) {
-    size_t q = s.find(',', p);
-    if (q == std::string::npos) q = s.size();
-    if (q > p) v.push_back(s.substr(p, q - p));
-    p = q + 1;
-  }
-  return v;
+// The update's game data is imported only when it is the verified 01.35.
+fs::path verified_game_data(const Found& f) {
+  if (f.game_data.empty()) return {};
+  return content_hash(f.game_data / "USRDIR" / ki::kRegulation.name) == ki::kRegulation.sha256 ? f.game_data : fs::path();
 }
 
 // Each step's record: what it was made from. A step is redone when its record differs.
 std::string stamp(const SetupConfig& c, size_t step) {
   switch (step) {
-    case kPrepare:
-      return "eboot " + file_stamp(c.disc / "PS3_GAME" / "USRDIR" / "EBOOT.BIN") + "\nupdate " +
-             (c.update.empty() ? std::string("none") : file_stamp(c.update)) + "\nkeys " + content_hash(c.keys);
-    case kFirmware:
-      return "pup " + file_stamp(c.pup) + "\nkeys " + content_hash(c.keys);
-    case kLle:
-      return "firmware " + content_hash(c.data / "state" / "firmware.txt") + "\nmodules " + kModules;
+    case kImport: {
+      Found f = find_files(c.disc, c.rpcs3);
+      std::string s = "disc " + c.disc.generic_string() + "\neboot " + file_stamp(f.eboot_elf) + "\n";
+      for (int i = 0; i < ki::kModuleCount; ++i) s += std::string(ki::kModules[i]) + " " + file_stamp(f.modules_dir / ki::module(ki::kModules[i])->name) + "\n";
+      fs::path gd = verified_game_data(f);
+      return s + "flash " + file_stamp(f.modules_dir / ki::kFlashAtrac.name) + "\nupdate " +
+             (gd.empty() ? std::string("none") : file_stamp(gd / "USRDIR" / ki::kRegulation.name));
+    }
     case kRecompile:
       return "prepared " + content_hash(prepared(c) / "manifest.txt") + "\nlle " + content_hash(prepared(c) / "lle" / "manifest.txt") +
              "\nhooks " + content_hash(c.src / "src" / "runtime" / "game" / "hooks.txt") + "\nrecompiler " +
@@ -124,9 +113,7 @@ std::string stamp(const SetupConfig& c, size_t step) {
 
 const char* state_name(size_t step) {
   switch (step) {
-    case kPrepare: return "prepare";
-    case kFirmware: return "firmware";
-    case kLle: return "lle";
+    case kImport: return "import";
     case kRecompile: return "recompile";
     case kSpu: return "spu";
     default: return "";
@@ -148,12 +135,11 @@ void write_state(const SetupConfig& c, size_t step, const std::string& s) {
 
 bool outputs_present(const SetupConfig& c, size_t step) {
   switch (step) {
-    case kPrepare: return is_file(prepared(c) / "eboot.elf") && is_file(prepared(c) / "manifest.txt");
-    case kFirmware: return is_dir(firmware(c) / "dev_flash" / "sys" / "external");
-    case kLle:
-      for (const auto& m : module_list())
-        if (!is_file(prepared(c) / "lle" / (m + ".elf"))) return false;
-      return is_file(prepared(c) / "lle" / "manifest.txt");
+    case kImport:
+      for (const char* m : ki::kModules)
+        if (!is_file(prepared(c) / "lle" / (std::string(m) + ".elf"))) return false;
+      return is_file(prepared(c) / "eboot.elf") && is_file(prepared(c) / "manifest.txt") && is_file(prepared(c) / "lle" / "manifest.txt") &&
+             is_file(flash(c) / "sys" / "external" / ki::kFlashAtrac.name);
     case kRecompile: return is_file(gen_dir(c) / "ppu" / "ppu_functab.cpp");
     case kSpu: return is_dir(gen_dir(c) / "spu");
     default: return false;
@@ -206,11 +192,11 @@ Setup::~Setup() {
 }
 
 fs::path Setup::game_exe(const SetupConfig& c) { return build_dir(c) / "acfa.exe"; }
-fs::path Setup::flash_dir(const SetupConfig& c) { return firmware(c) / "dev_flash"; }
+fs::path Setup::flash_dir(const SetupConfig& c) { return flash(c); }
 
 bool Setup::ready(const SetupConfig& c) {
   if (!is_file(game_exe(c))) return false;
-  for (size_t s : {kPrepare, kFirmware, kLle, kRecompile, kSpu})
+  for (size_t s : {kImport, kRecompile, kSpu})
     if (!step_current(c, s)) return false;
   std::ifstream f(c.data / "state" / "built.txt", std::ios::binary);
   std::ostringstream ss;
@@ -226,7 +212,6 @@ unsigned long long Setup::space_needed(const SetupConfig& c) {
   double need = 0;
   if (!is_dir(tools_dir(c) / "cmake-4.4.3-windows-x86_64")) need += 1.2;
   if (!is_file(prepared(c) / "eboot.elf")) need += 0.2;
-  if (!is_dir(firmware(c) / "dev_flash")) need += 0.2;
   if (!is_file(gen_dir(c) / "ppu" / "ppu_functab.cpp")) need += 0.2;
   if (!is_file(game_exe(c))) need += 0.5;
   if (!is_dir(c.data / "hdd1" / "model")) need += 1.3;
@@ -444,26 +429,25 @@ void Setup::run(SetupConfig c) {
       const char* what;
     };
     std::vector<Work> work = {
-        {kPrepare,
+        {kImport,
          [&] {
-           return exec(prep, {L"prepare", L"--game", w(c.disc), L"--out", w(prepared(c)), L"--keys", w(c.keys), L"--update",
-                              c.update.empty() ? std::wstring(L"none") : w(c.update)},
-                       c.data);
+           // The player's decrypted files, verified by SHA-256 (acfa-prep reports any mismatch).
+           Found f = find_files(c.disc, c.rpcs3);
+           std::vector<std::wstring> a = {L"import",       L"--disc",        w(c.disc),
+                                          L"--eboot",      w(f.eboot_elf),   L"--modules-dir",
+                                          w(f.modules_dir), L"--flash-file", w(f.modules_dir / ki::kFlashAtrac.name),
+                                          L"--out",        w(prepared(c)),   L"--flash-out",
+                                          w(flash(c))};
+           fs::path gd = verified_game_data(f);
+           if (!gd.empty()) a.insert(a.end(), {L"--game-data", w(gd)});
+           return exec(prep, a, c.data);
          },
-         "Preparing the game files failed (decryption: check the key file)"},
-        {kFirmware, [&] { return exec(prep, {L"firmware", w(c.pup), w(firmware(c)), L"--keys", w(c.keys)}, c.data); },
-         "Extracting the system software failed"},
-        {kLle,
-         [&] {
-           return exec(prep, {L"lle", L"--firmware", w(firmware(c)), L"--out", w(prepared(c)), L"--modules", widen(kModules), L"--keys", w(c.keys)},
-                       c.data);
-         },
-         "Preparing the system modules failed"},
+         "Importing the game files failed"},
         {kRecompile,
          [&] {
            fs::remove_all(gen_dir(c) / "ppu", ec);
            std::vector<std::wstring> a = {L"emit", w(prepared(c) / "eboot.elf"), w(gen_dir(c) / "ppu")};
-           for (const auto& m : module_list()) a.insert(a.end(), {L"--module", w(prepared(c) / "lle" / widen(m + ".elf"))});
+           for (const char* m : ki::kModules) a.insert(a.end(), {L"--module", w(prepared(c) / "lle" / (widen(m) + L".elf"))});
            a.insert(a.end(), {L"--hooks", w(c.src / "src" / "runtime" / "game" / "hooks.txt")});
            return exec(build_dir(c) / "acfa-recomp.exe", a, c.data);
          },

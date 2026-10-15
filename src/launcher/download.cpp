@@ -27,7 +27,7 @@ struct Request {
   std::string error;
 };
 
-void open_request(Request& r, const std::wstring& url, bool allow_http) {
+void open_request(Request& r, const std::wstring& url) {
   URL_COMPONENTS uc{};
   uc.dwStructSize = sizeof uc;
   wchar_t host[256] = {}, path[2048] = {};
@@ -35,7 +35,7 @@ void open_request(Request& r, const std::wstring& url, bool allow_http) {
   uc.dwHostNameLength = DWORD(std::size(host));
   uc.lpszUrlPath = path;
   uc.dwUrlPathLength = DWORD(std::size(path));
-  if (!WinHttpCrackUrl(url.c_str(), 0, 0, &uc) || !(uc.nScheme == INTERNET_SCHEME_HTTPS || (allow_http && uc.nScheme == INTERNET_SCHEME_HTTP))) {
+  if (!WinHttpCrackUrl(url.c_str(), 0, 0, &uc) || uc.nScheme != INTERNET_SCHEME_HTTPS) {
     r.error = "not an https address: " + narrow(url);
     return;
   }
@@ -49,8 +49,7 @@ void open_request(Request& r, const std::wstring& url, bool allow_http) {
     r.error = "cannot reach " + narrow(host);
     return;
   }
-  r.req.h = WinHttpOpenRequest(r.conn.h, L"GET", path, nullptr, WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES,
-                               uc.nScheme == INTERNET_SCHEME_HTTPS ? WINHTTP_FLAG_SECURE : 0);
+  r.req.h = WinHttpOpenRequest(r.conn.h, L"GET", path, nullptr, WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES, WINHTTP_FLAG_SECURE);
   if (!r.req.h) {
     r.error = "cannot request " + narrow(url);
     return;
@@ -75,10 +74,9 @@ void open_request(Request& r, const std::wstring& url, bool allow_http) {
 }  // namespace
 
 std::string download(const std::wstring& url, const std::filesystem::path& to,
-                     const std::function<void(unsigned long long, unsigned long long)>& progress, const std::atomic<bool>& cancel,
-                     bool allow_http) {
+                     const std::function<void(unsigned long long, unsigned long long)>& progress, const std::atomic<bool>& cancel) {
   Request r;
-  open_request(r, url, allow_http);
+  open_request(r, url);
   if (!r.error.empty()) return r.error;
   std::filesystem::path part = to;
   part += ".part";
@@ -115,22 +113,6 @@ std::string download(const std::wstring& url, const std::filesystem::path& to,
   }
   std::filesystem::rename(part, to, ec);
   if (ec) return "cannot rename " + narrow(part.wstring());
-  return "";
-}
-
-std::string fetch_text(const std::wstring& url, std::string* out, bool allow_http, size_t max_bytes) {
-  Request r;
-  open_request(r, url, allow_http);
-  if (!r.error.empty()) return r.error;
-  out->clear();
-  std::vector<char> buf(1 << 14);
-  for (;;) {
-    DWORD n = 0;
-    if (!WinHttpReadData(r.req.h, buf.data(), DWORD(buf.size()), &n)) return "download interrupted (error " + std::to_string(GetLastError()) + ")";
-    if (!n) break;
-    out->append(buf.data(), n);
-    if (out->size() > max_bytes) return "unexpectedly long answer from " + narrow(url);
-  }
   return "";
 }
 

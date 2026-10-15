@@ -1,8 +1,9 @@
-// The player's own game files, checked before preparation: the BLUS30187 disc folder (disc
-// VERSION 01.01, its EBOOT.BIN), the optional update package (APP_VER 01.35, regulation data),
-// the PS3 system software file (2.41 from the disc's PS3_UPDATE\PS3UPDAT.PUP, or 4.93 from Sony's
-// download) and the key file preparation needs. Known files are recognized by SHA-256; key values
-// are compared by their SHA-256 only (the launcher contains no key material).
+// The player's game files in the keyless setup (docs/INPUTS.md): the disc folder (BLUS30187, disc
+// VERSION 01.01, read in place), files the player decrypted with RPCS3 (Utilities > Decrypt PS3
+// Binaries: EBOOT.elf next to EBOOT.BIN, the 10 system modules of system software 4.93 as .prx next
+// to their .sprx in RPCS3's dev_flash\sys\external) and plain files from RPCS3's folders
+// (flashATRAC.pic; optionally the update 01.35 as RPCS3 installs it). Each file is accepted only
+// with its SHA-256 (common/known_inputs.h); the launcher contains no keys and decrypts nothing.
 #pragma once
 #include <filesystem>
 #include <string>
@@ -14,32 +15,28 @@ namespace fs = std::filesystem;
 enum class Verdict { Empty, Ok, Optional, Bad };
 struct Status {
   Verdict verdict = Verdict::Empty;
-  std::string text;
+  std::string text;     // one line for the window
+  std::string details;  // every problem, for the log
 };
 
-Status check_disc(const fs::path& disc);
-Status check_update(const fs::path& pkg);  // empty: optional
-Status check_pup(const fs::path& pup);
-Status check_keys(const fs::path& keys, const std::string& pup_version);  // 4.93 needs two more keys
-
-// The version a PS3UPDAT.PUP names (its version entry, e.g. "4.93"); "" when it is not a PUP.
-std::string pup_version(const fs::path& pup);
-
-// Sony's download of the supported current system software (4.93): the update list (plain HTTP:
-// Sony's update servers offer no valid HTTPS) and the image it named when this port was tested;
-// the file is accepted only with its pinned SHA-256.
-struct SonySystemSoftware {
-  const char* version;      // "4.93"
-  const char* list_url;     // the US update list
-  const char* list_version; // the list's SystemSoftwareVersion for it
-  const char* image_url;    // the PS3UPDAT.PUP the list named
-  unsigned long long size;
+// Where the files are, found from the disc folder and the RPCS3 folder (or any folder holding the
+// decrypted files). Empty paths: not found.
+struct Found {
+  fs::path eboot_elf;    // EBOOT.elf
+  fs::path modules_dir;  // the folder holding the .prx files and flashATRAC.pic
+  fs::path game_data;    // the installed update (dev_hdd0/game/BLUS30187), when present
+  std::string rpcs3_system_software;  // e.g. "4.89" (dev_flash/vsh/etc/version.txt), when known
 };
-const SonySystemSoftware& sony_system_software();
-bool is_supported_pup(const fs::path& pup);  // hash check (slow: reads the whole file)
+Found find_files(const fs::path& disc, const fs::path& rpcs3);
 
-// The system software and update package where they usually are, next to the disc folder.
-fs::path find_pup(const fs::path& disc);
-fs::path find_update(const fs::path& disc);
+Status check_disc(const fs::path& disc, const Found& f);    // the disc and its decrypted EBOOT.elf
+Status check_modules(const fs::path& rpcs3, const Found& f);  // the 10 modules and flashATRAC.pic
+Status check_update(const fs::path& rpcs3, const Found& f);  // optional
+
+// The steps to decrypt the files with RPCS3, naming the player's own folders where known.
+std::wstring decrypt_help(const fs::path& disc, const fs::path& rpcs3, const Found& f);
+
+// A likely RPCS3 folder (rpcs3.exe in a few usual places), or empty.
+fs::path find_rpcs3();
 
 }  // namespace launcher

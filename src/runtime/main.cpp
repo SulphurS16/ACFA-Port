@@ -107,7 +107,7 @@ int main(int argc, char** argv) {
   c.prepared = (data / "game" / "BLUS30187").string();
   c.hdd0 = (data / "hdd0").string();
   c.hdd1 = (data / "hdd1").string();
-  c.flash = (data / "game" / "firmware241" / "dev_flash").string();
+  c.flash = (data / "game" / "dev_flash").string();  // the dev_flash file(s) imported from the player's RPCS3
   c.spu_cache = (data / "spu_cache").string();
   c.shader_cache = (data / "shader_cache").string();
   c.settings_file = settings_override.empty() ? acfa::settings::file_in(data).string() : settings_override;
