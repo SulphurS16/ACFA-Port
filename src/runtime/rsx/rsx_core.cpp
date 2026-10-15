@@ -305,7 +305,10 @@ struct FlowEvent {
 };
 FlowEvent g_flow[64];
 u32 g_flow_n = 0;
-void flow(char kind, u32 at, u32 to) { g_flow[g_flow_n++ & 63] = {kind, at, to, lv2::system_time_us()}; }
+u32 g_ring_lo = 0, g_ring_hi = 0;  // the default command buffer's fragments (io offsets)
+void flow(char kind, u32 at, u32 to) {
+  g_flow[g_flow_n++ & 63] = {kind, at, to, lv2::system_time_us()};
+}
 
 void flow_report(const char* why, u32 get, u32 put) {
   static bool once = false;
@@ -493,6 +496,11 @@ void wait_get_outside(u32 lo, u32 hi) {
     WaitOnAddress(&g_ring_get, &seen, sizeof seen, 2);
   }
   g_get_waiters.fetch_sub(1, std::memory_order_acq_rel);
+}
+
+void set_ring(u32 io_lo, u32 io_hi) {
+  g_ring_lo = io_lo;
+  g_ring_hi = io_hi;
 }
 
 void start() {

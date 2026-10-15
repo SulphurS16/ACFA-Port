@@ -77,6 +77,7 @@ s32 _cellGcmInitBody(Ptr<be32> context, u32 cmd_size, u32 io_size, u32 io_addres
   g_io_size = io_size;
   g_cmd_begin = io_address;
   g_cmd_fragments = std::max<u32>(1, cmd_size / (32 * 1024));
+  rsx::set_ring(4096, g_cmd_fragments * 32 * 1024);
   if (!g_context_opd) g_context_opd = hle_internal_opd("cellGcmCallback", gcm_callback);
   Ptr<ContextData> c(rsx::kContextAddr);
   c->begin = io_address + 4096;

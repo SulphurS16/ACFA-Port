@@ -48,6 +48,8 @@ u64 vblank_count();
 
 // Starts the RSX command processor and vblank threads (called once by cellGcmInit).
 void start();
+// The default command buffer's fragments (io offsets [lo, hi)), for FIFO diagnostics.
+void set_ring(u32 io_lo, u32 io_hi);
 // Blocks the calling thread until the FIFO's GET offset is outside [lo, hi] (io offsets).
 void wait_get_outside(u32 lo, u32 hi);
 
