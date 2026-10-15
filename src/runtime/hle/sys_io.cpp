@@ -22,6 +22,7 @@
 #include "runtime/hle.h"
 #include "runtime/lv2/lv2.h"
 #include "runtime/bindings.h"
+#include "runtime/game/menu_mouse.h"
 #include "runtime/gpu/input_hooks.h"
 #include "runtime/gpu/window.h"
 #include "runtime/input.h"
@@ -107,6 +108,11 @@ PadState read_port(u32 port) {
     s.ry = u8(255 - axis(g.sThumbRY));
     s.press[10] = g.bLeftTrigger;
     s.press[11] = g.bRightTrigger;
+    // A controller in use hides the menu cursor (a stick past a third of its travel, any button).
+    auto away = [](SHORT v) { return std::abs(int(v)) > 11000; };
+    if (b || g.bLeftTrigger > 30 || g.bRightTrigger > 30 || away(g.sThumbLX) || away(g.sThumbLY) || away(g.sThumbRX) ||
+        away(g.sThumbRY))
+      game::note_pad_input();
   }
   if (port == 0) {
     // Keyboard and mouse bindings (bindings.h; always available on port 0).
@@ -114,6 +120,7 @@ PadState read_port(u32 port) {
     bindings::PadOut k = bindings::sample();
     s.d1 |= k.d1;
     s.d2 |= k.d2;
+    game::menu_pad_bits(&s.d1, &s.d2);  // clicks, right clicks and the wheel in the game's menus
     if (k.lx >= 0) s.lx = u8(k.lx);
     if (k.ly >= 0) s.ly = u8(k.ly);
     if (k.rx >= 0) s.rx = u8(k.rx);

@@ -88,6 +88,24 @@ const char* const kKeyboardDefaults =
     "left = Left\n"
     "right = Right\n";
 
+const char* const kMenuHead =
+    "[menu]\n"
+    "# Keys in the game's menus (where a menu item is highlighted), as in [keyboard]: an input listed\n"
+    "# here drives this control in menus; inputs not listed keep their [keyboard] control there. The\n"
+    "# mouse points and clicks (left: choose, right: back, wheel: up and down). On screens without a\n"
+    "# menu (title, movies) the confirm and back keys press Start.\n";
+
+const char* const kMenuDefaults =
+    "cross = Enter, Space\n"
+    "circle = Escape, Backspace\n"
+    "start = Tab\n"
+    "up = Up, W\n"
+    "down = Down, S\n"
+    "left = Left, A\n"
+    "right = Right, D\n"
+    "l1 = Q\n"
+    "r1 = E\n";
+
 bool truthy(const std::string& v) { return v == "1" || v == "true" || v == "yes" || v == "on"; }
 
 }  // namespace
@@ -95,6 +113,7 @@ bool truthy(const std::string& v) { return v == "1" || v == "true" || v == "yes"
 std::filesystem::path file_in(const std::filesystem::path& data_dir) { return data_dir / "config" / "settings.ini"; }
 
 const char* default_keyboard_text() { return kKeyboardDefaults; }
+const char* default_menu_text() { return kMenuDefaults; }
 
 Ini load_or_create(const std::filesystem::path& file, std::vector<std::string>* notes) {
   auto note = [&](const std::string& s) {
@@ -125,7 +144,8 @@ Ini load_or_create(const std::filesystem::path& file, std::vector<std::string>* 
         note(std::string("settings: input.ini not imported: ") + e.what());
       }
     }
-    Ini fresh = Ini::parse(std::string(kHead) + "\n" + kDisplay + "\n" + kMouse + "\n" + kKeyboardHead + keyboard);
+    Ini fresh = Ini::parse(std::string(kHead) + "\n" + kDisplay + "\n" + kMouse + "\n" + kKeyboardHead + keyboard + "\n" + kMenuHead +
+                           kMenuDefaults);
     for (const auto& [k, v] : mouse) fresh.set("mouse", k, v);
     if (old_layout) {
       if (auto v = ini.get("", "fps")) fresh.set("display", "fps", *v);
@@ -163,6 +183,17 @@ Ini load_or_create(const std::filesystem::path& file, std::vector<std::string>* 
     add_missing("display", kDisplay);
     add_missing("mouse", kMouse);
     add_missing("keyboard", std::string(kKeyboardHead) + kKeyboardDefaults);
+    if (!ini.has_section("menu")) {  // files from before the menu keys: the section with its notes
+      std::string head = kMenuHead;
+      for (size_t a = head.find('\n') + 1; a < head.size();) {
+        size_t b = head.find('\n', a);
+        ini.add_line("menu", head.substr(a, b - a));
+        a = b + 1;
+      }
+      Ini d = Ini::parse(std::string(kMenuHead) + kMenuDefaults);
+      for (const auto& [k, v] : d.entries("menu")) ini.set("menu", k, v);
+      changed = true;
+    }
   }
   if (changed) {
     try {

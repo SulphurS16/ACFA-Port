@@ -4,11 +4,13 @@
 #include <windows.h>
 #include <windowsx.h>
 
+#include <algorithm>
 #include <atomic>
 #include <condition_variable>
 #include <deque>
 #include <mutex>
 
+#include "runtime/game/menu_mouse.h"
 #include "runtime/gpu/d3d11_device.h"
 #include "runtime/gpu/input_hooks.h"
 #include "runtime/input.h"
@@ -24,6 +26,7 @@ std::atomic<bool> g_close{false};
 bool g_alive = false;
 DWORD g_thread = 0;
 std::atomic<bool> g_mouse_captured{false};
+std::atomic<bool> g_fullscreen{false};  // borderless fullscreen (set_fullscreen)
 
 void clip_cursor() {
   RECT r;
@@ -48,9 +51,105 @@ void set_mouse_capture(bool on) {
   input_mouse_capture(on);
 }
 
+// The menu cursor, drawn in the style of the game's interface (pale blue-white arrow, dark blue
+// outline), sized for the window's DPI; made once per DPI.
+HCURSOR make_menu_cursor(UINT dpi) {
+  const int n = MulDiv(32, int(dpi), 96);
+  // The arrow outline in a 32-unit box (tip at the top left), scaled to n pixels.
+  static const float kShape[][2] = {{1, 1}, {1, 23}, {6.5f, 18}, {10.5f, 27}, {14.5f, 25.5f}, {10.5f, 16.5f}, {18, 16.5f}};
+  constexpr int kPoints = int(sizeof kShape / sizeof kShape[0]);
+  auto inside = [&](float x, float y) {  // even-odd rule
+    bool in = false;
+    for (int i = 0, j = kPoints - 1; i < kPoints; j = i++) {
+      float xi = kShape[i][0], yi = kShape[i][1], xj = kShape[j][0], yj = kShape[j][1];
+      if ((yi > y) != (yj > y) && x < (xj - xi) * (y - yi) / (yj - yi) + xi) in = !in;
+    }
+    return in;
+  };
+  BITMAPV5HEADER bh{};
+  bh.bV5Size = sizeof bh;
+  bh.bV5Width = n;
+  bh.bV5Height = -n;
+  bh.bV5Planes = 1;
+  bh.bV5BitCount = 32;
+  bh.bV5Compression = BI_BITFIELDS;
+  bh.bV5RedMask = 0x00FF0000;
+  bh.bV5GreenMask = 0x0000FF00;
+  bh.bV5BlueMask = 0x000000FF;
+  bh.bV5AlphaMask = 0xFF000000;
+  void* bits = nullptr;
+  HDC dc = GetDC(nullptr);
+  HBITMAP color = CreateDIBSection(dc, reinterpret_cast<BITMAPINFO*>(&bh), DIB_RGB_COLORS, &bits, nullptr, 0);
+  ReleaseDC(nullptr, dc);
+  if (!color || !bits) return LoadCursorW(nullptr, IDC_ARROW);
+  u32* px = static_cast<u32*>(bits);
+  const float unit = 32.0f / float(n), edge = 1.6f;  // outline width in box units
+  for (int y = 0; y < n; ++y)
+    for (int x = 0; x < n; ++x) {
+      int fill = 0, line = 0;  // 4x4 samples: fill (inside the arrow shrunk by the outline) and outline
+      for (int sy = 0; sy < 4; ++sy)
+        for (int sx = 0; sx < 4; ++sx) {
+          float fx = (float(x) + (float(sx) + 0.5f) / 4) * unit, fy = (float(y) + (float(sy) + 0.5f) / 4) * unit;
+          if (!inside(fx, fy)) continue;
+          bool core = inside(fx - edge, fy) && inside(fx + edge, fy) && inside(fx, fy - edge) && inside(fx, fy + edge);
+          ++(core ? fill : line);
+        }
+      float a = float(fill + line) / 16.0f;
+      if (a <= 0) {
+        px[y * n + x] = 0;
+        continue;
+      }
+      // fill: pale blue-white, a little darker toward the tail; outline: dark blue
+      float t = std::min(1.0f, float(y) / float(n));
+      float fr = 232 - 30 * t, fg = 240 - 24 * t, fb = 250 - 10 * t;
+      float k = float(fill) / float(fill + line);
+      float r = fr * k + 22 * (1 - k), g = fg * k + 34 * (1 - k), b = fb * k + 52 * (1 - k);
+      u32 A = u32(a * 255 + 0.5f);
+      auto pm = [&](float c) { return u32(c * a + 0.5f); };  // premultiplied
+      px[y * n + x] = (A << 24) | (pm(r) << 16) | (pm(g) << 8) | pm(b);
+    }
+  HBITMAP mask = CreateBitmap(n, n, 1, 1, nullptr);
+  ICONINFO ii{};
+  ii.fIcon = FALSE;
+  ii.xHotspot = DWORD(std::max(0, MulDiv(1, int(dpi), 96)));
+  ii.yHotspot = ii.xHotspot;
+  ii.hbmMask = mask;
+  ii.hbmColor = color;
+  HCURSOR c = HCURSOR(CreateIconIndirect(&ii));
+  DeleteObject(mask);
+  DeleteObject(color);
+  return c ? c : LoadCursorW(nullptr, IDC_ARROW);
+}
+
+// The cursor over the client area: hidden while mouse look has it, the menu cursor in the game's
+// menus, otherwise hidden when the window fills the screen and the arrow in a window.
+HCURSOR client_cursor() {
+  if (g_mouse_captured) return nullptr;
+  if (game::menu_cursor_visible() || ui::is_open()) {
+    static HCURSOR cur = nullptr;
+    static UINT cur_dpi = 0;
+    UINT dpi = GetDpiForWindow(g_hwnd);
+    if (!cur || dpi != cur_dpi) {
+      cur = make_menu_cursor(dpi ? dpi : 96);
+      cur_dpi = dpi;
+    }
+    return cur;
+  }
+  if (game::input_context() == game::InputContext::Menu) return nullptr;  // a controller drives the menu
+  return g_fullscreen ? nullptr : LoadCursorW(nullptr, IDC_ARROW);
+}
+
+void refresh_cursor() {
+  POINT p{};
+  RECT r{};
+  if (!GetCursorPos(&p) || WindowFromPoint(p) != g_hwnd) return;
+  ScreenToClient(g_hwnd, &p);
+  GetClientRect(g_hwnd, &r);
+  if (PtInRect(&r, p)) SetCursor(client_cursor());
+}
+
 // Borderless fullscreen: the window without frame covers its monitor (the swap chain follows the
 // client size); toggled with F11 or Alt+Enter, restored to the previous window placement.
-std::atomic<bool> g_fullscreen{false};
 WINDOWPLACEMENT g_windowed_placement = [] {
   WINDOWPLACEMENT p{};
   p.length = sizeof p;
@@ -192,9 +291,30 @@ LRESULT CALLBACK wndproc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
       }
       break;  // DefWindowProc cleans up the raw input buffer
     }
-    case WM_MOUSEMOVE:
+    case WM_MOUSEMOVE: {
       if (overlay) ui::on_mouse_move(GET_X_LPARAM(lp), GET_Y_LPARAM(lp));
+      static LPARAM last = -1;  // Windows repeats the position on other changes: real moves only
+      if (!overlay && !g_mouse_captured && lp != last && !input_isolated()) {
+        bool shown = game::menu_cursor_visible();
+        game::menu_mouse_moved();
+        if (!shown && game::input_context() == game::InputContext::Menu) SetCursor(client_cursor());
+      }
+      last = lp;
       break;
+    }
+    case WM_SETCURSOR:
+      if (LOWORD(lp) == HTCLIENT) {
+        SetCursor(client_cursor());
+        return TRUE;
+      }
+      break;
+    case WM_APP + 3:  // window_request_mouse_capture
+      if (!input_isolated() && (!wp || GetForegroundWindow() == h)) set_mouse_capture(wp != 0);
+      refresh_cursor();
+      return 0;
+    case WM_APP + 4:  // window_refresh_cursor
+      refresh_cursor();
+      return 0;
     case WM_LBUTTONDOWN:
     case WM_RBUTTONDOWN:
     case WM_MBUTTONDOWN:
@@ -215,15 +335,32 @@ LRESULT CALLBACK wndproc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
         else ReleaseCapture();
         return msg == WM_XBUTTONDOWN || msg == WM_XBUTTONUP ? TRUE : 0;
       }
-      if (msg == WM_LBUTTONDOWN && !g_mouse_captured && !input_isolated()) {  // isolated test runs never take the cursor
-        set_mouse_capture(true);
-        return 0;
+      if (!g_mouse_captured && !input_isolated()) {
+        // In the game's menus and on its other screens the mouse stays free (cursor, clicks);
+        // in gameplay a click takes it for mouse look (isolated test runs never take the cursor).
+        if (game::input_context() != game::InputContext::Gameplay) {
+          if (button <= 1) game::menu_mouse_button(button, down);
+          if (down) SetCursor(client_cursor());
+          return msg == WM_XBUTTONDOWN || msg == WM_XBUTTONUP ? TRUE : 0;
+        }
+        if (msg == WM_LBUTTONDOWN) {
+          set_mouse_capture(true);
+          return 0;
+        }
       }
       break;
     }
     case WM_MOUSEWHEEL:
       if (overlay) {
         ui::on_wheel(GET_WHEEL_DELTA_WPARAM(wp));
+        return 0;
+      }
+      if (!g_mouse_captured && game::input_context() == game::InputContext::Menu) {
+        static int rest = 0;  // high-resolution wheels: notches of 120
+        rest += GET_WHEEL_DELTA_WPARAM(wp);
+        int notches = rest / WHEEL_DELTA;
+        rest -= notches * WHEEL_DELTA;
+        if (notches) game::menu_mouse_wheel(notches);
         return 0;
       }
       break;
@@ -355,6 +492,13 @@ void window_monitor_size(int* w, int* h) {
 std::vector<Monitor> window_monitors() { return list_monitors(); }
 void window_move_to_monitor(const std::string& device) {
   run_on_window_thread([device] { move_to_monitor(device); });
+}
+
+void window_request_mouse_capture(bool on) {
+  if (g_hwnd) PostMessageW(g_hwnd, WM_APP + 3, on ? 1 : 0, 0);
+}
+void window_refresh_cursor() {
+  if (g_hwnd) PostMessageW(g_hwnd, WM_APP + 4, 0, 0);
 }
 
 void window_set_mouse_capture(bool on) {

@@ -1,7 +1,9 @@
-// Keyboard and mouse bindings onto the emulated pad (port 0), kept in the [keyboard] and [mouse]
-// sections of the shared settings file (common/settings_file.h; defaults: the game's SIMPLE key
-// scheme: WASD move, mouse look, left/right click right/left arm weapon, Space boost, Shift quick
-// boost, E overed boost, Escape pause). The PC SETTINGS screen changes them while the game runs.
+// Keyboard and mouse bindings onto the emulated pad (port 0), kept in the [keyboard], [menu] and
+// [mouse] sections of the shared settings file (common/settings_file.h; defaults: the game's
+// SIMPLE key scheme: WASD move, mouse look, left/right click right/left arm weapon, Space boost,
+// Shift quick boost, E overed boost, Escape pause). In the game's menus the [menu] keys come first
+// (Enter choose, Escape back; game/menu_mouse.h decides where the input goes). The PC SETTINGS
+// screen changes them while the game runs.
 #pragma once
 #include <string>
 #include <vector>
@@ -34,9 +36,11 @@ const char* control_name(size_t c);  // as in the settings file: "cross", "lstic
 
 void load(const acfa::Ini& ini);  // [keyboard] and [mouse]; logs what it read
 void store(acfa::Ini& ini);       // the current bindings and mouse settings
-std::vector<u32> get(size_t c);
-void set(size_t c, const std::vector<u32>& codes);
-void reset_defaults();            // bindings only (mouse settings stay)
+// The two layers: gameplay ([keyboard]) and the game's menus ([menu]).
+enum class Layer { Game, Menu };
+std::vector<u32> get(size_t c, Layer l = Layer::Game);
+void set(size_t c, const std::vector<u32>& codes, Layer l = Layer::Game);
+void reset_defaults(Layer l);     // that layer's bindings (mouse settings stay)
 
 u32 key_code(const std::string& name);  // input name as in the file -> code (0 if unknown)
 std::string input_name(u32 code);       // code -> the name used in the file ("" if unknown)

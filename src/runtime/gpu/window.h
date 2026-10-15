@@ -36,6 +36,10 @@ void window_move_to_monitor(const std::string& device);
 // to capture, focus loss releases it).
 void window_set_mouse_capture(bool on);
 bool window_mouse_captured();
+// Any thread, asynchronous: mouse capture for mouse look on or off (the game's menus give the
+// mouse back, gameplay takes it), and the cursor's look brought up to date (the menu cursor).
+void window_request_mouse_capture(bool on);
+void window_refresh_cursor();
 // Runs fn on the window's thread during its next window_pump() and waits for it to finish
 // (directly when called on that thread). Returns false if there is no window.
 bool run_on_window_thread(const std::function<void()>& fn);

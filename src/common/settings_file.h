@@ -20,6 +20,7 @@ Ini load_or_create(const std::filesystem::path& file, std::vector<std::string>* 
 
 // The default [keyboard] lines (the game's SIMPLE layout), shared with the runtime's bindings.
 const char* default_keyboard_text();
+const char* default_menu_text();  // [menu]: keys in the game's menus
 
 enum class Mode { Windowed, Fullscreen, Borderless };
 const char* mode_name(Mode m);  // as in the file: windowed, fullscreen, borderless

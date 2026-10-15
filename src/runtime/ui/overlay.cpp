@@ -43,11 +43,12 @@ struct Row {
   bool enabled = true;
   double value = 0, lo = 0, hi = 1, step = 0.1;  // Slider
   size_t control = 0;                            // Binding
+  bool menu = false;                             // Binding: the [menu] layer (keys in the game's menus)
   std::string slots[2];                          // Binding: input names ("" = none)
 };
 
-const char* const kPages[] = {"DISPLAY", "KEYBOARD / MOUSE"};
-constexpr int kPageCount = 2;
+const char* const kPages[] = {"DISPLAY", "KEYBOARD / MOUSE", "MENU KEYS"};
+constexpr int kPageCount = 3;
 
 // Action names of the pad controls under the game's SIMPLE layout (GAME_NOTES), and the control.
 struct ControlText {
@@ -75,6 +76,20 @@ const ControlText* control_text(size_t c) {
     if (name == t.control) return &t;
   return nullptr;
 }
+// The MENU KEYS page: what the controls do in the game's menus.
+const ControlText kMenuText[] = {
+    {"up", "UP", "D-PAD UP"},           {"down", "DOWN", "D-PAD DOWN"},        {"left", "LEFT", "D-PAD LEFT"},
+    {"right", "RIGHT", "D-PAD RIGHT"},  {"cross", "CHOOSE", "CROSS"},          {"circle", "BACK", "CIRCLE"},
+    {"start", "START / KEY GUIDE", "START"}, {"l1", "PREVIOUS PAGE", "L1"},    {"r1", "NEXT PAGE", "R1"},
+    {"triangle", "TRIANGLE BUTTON", "TRIANGLE"}, {"square", "SQUARE BUTTON", "SQUARE"}, {"select", "SELECT BUTTON", "SELECT"},
+};
+const ControlText* menu_text(size_t c) {
+  std::string name = bindings::control_name(c);
+  for (const auto& t : kMenuText)
+    if (name == t.control) return &t;
+  return nullptr;
+}
+const ControlText* text_for(size_t c, bool menu) { return menu ? menu_text(c) : control_text(c); }
 
 std::string upper(std::string s) {
   for (char& ch : s) ch = char(std::toupper(static_cast<unsigned char>(ch)));
@@ -240,7 +255,7 @@ std::vector<Row> build_rows(int page) {
     rows.push_back(rs);
   } else {
     bindings::MouseSettings ms = bindings::mouse();
-    for (int axis = 0; axis < 2; ++axis) {
+    for (int axis = 0; axis < 2 && page == 1; ++axis) {
       Row s;
       s.kind = Kind::Slider;
       s.id = axis ? kSensitivityY : kSensitivityX;
@@ -252,7 +267,7 @@ std::vector<Row> build_rows(int page) {
       s.value_note = acfa::strprintf("%.2f", s.value);
       rows.push_back(s);
     }
-    for (int axis = 0; axis < 2; ++axis) {
+    for (int axis = 0; axis < 2 && page == 1; ++axis) {
       Row inv;
       inv.kind = Kind::Choice;
       inv.id = axis ? kInvertY : kInvertX;
@@ -261,15 +276,25 @@ std::vector<Row> build_rows(int page) {
       inv.index = (axis ? ms.invert_y : ms.invert_x) ? 1 : 0;
       rows.push_back(inv);
     }
-    for (size_t c = 0; c < bindings::control_count(); ++c) {
-      const ControlText* t = control_text(c);
+    const bool menu = page == 2;
+    std::vector<size_t> order;  // the MENU KEYS page in its own order (directions, choose, back, ...)
+    if (menu) {
+      for (const ControlText& t : kMenuText)
+        for (size_t c = 0; c < bindings::control_count(); ++c)
+          if (t.control == std::string(bindings::control_name(c))) order.push_back(c);
+    } else {
+      for (size_t c = 0; c < bindings::control_count(); ++c) order.push_back(c);
+    }
+    for (size_t c : order) {
+      const ControlText* t = text_for(c, menu);
       Row b;
       b.kind = Kind::Binding;
       b.id = kBind;
       b.control = c;
+      b.menu = menu;
       b.label = t ? t->action : upper(bindings::control_name(c));
       b.tag = t ? t->pad : "";
-      std::vector<u32> codes = bindings::get(c);
+      std::vector<u32> codes = bindings::get(c, menu ? bindings::Layer::Menu : bindings::Layer::Game);
       for (size_t i = 0; i < 2 && i < codes.size(); ++i) b.slots[i] = key_label(codes[i]);
       if (codes.size() > 2) b.slots[1] += acfa::strprintf("  +%zu", codes.size() - 2);
       rows.push_back(b);
@@ -292,7 +317,7 @@ constexpr int kVisibleRows = int((kListBottom - kListTop + kPitch - kRowH) / kPi
 constexpr float kSlotX[2] = {600, 905}, kSlotW = 290, kBindDivider = 466;  // binding rows: wider caption column
 constexpr float kArrowL = 472, kArrowR = 1054, kBarL = 505, kBarR = 1023;
 constexpr float kTabY = 34, kTabH = 30;
-constexpr float kTabX[2] = {806, 966}, kTabW[2] = {150, 238};
+constexpr float kTabX[kPageCount] = {656, 816, 1064}, kTabW[kPageCount] = {150, 238, 140};
 constexpr float kButtonX[2] = {76, 287}, kButtonW = 199;
 
 struct Canvas {
@@ -404,18 +429,19 @@ void apply_slider(Row& r, double v) {
   rebuild();
 }
 
-void set_binding(size_t control, int slot, u32 code) {
-  std::vector<u32> codes = bindings::get(control);
+void set_binding(size_t control, int slot, u32 code, bool menu) {
+  const bindings::Layer layer = menu ? bindings::Layer::Menu : bindings::Layer::Game;
+  std::vector<u32> codes = bindings::get(control, layer);
   if (code) {
-    // An input drives one control: taken from any other control first.
+    // An input drives one control of its layer: taken from any other control there first.
     for (size_t c = 0; c < bindings::control_count(); ++c) {
       if (c == control) continue;
-      std::vector<u32> other = bindings::get(c);
+      std::vector<u32> other = bindings::get(c, layer);
       auto it = std::find(other.begin(), other.end(), code);
       if (it == other.end()) continue;
       other.erase(it);
-      bindings::set(c, other);
-      const ControlText* t = control_text(c);
+      bindings::set(c, other, layer);
+      const ControlText* t = text_for(c, menu);
       toast(key_label(code) + " MOVED FROM " + (t ? t->action : upper(bindings::control_name(c))));
     }
     codes.erase(std::remove(codes.begin(), codes.end(), code), codes.end());
@@ -424,7 +450,7 @@ void set_binding(size_t control, int slot, u32 code) {
   } else if (size_t(slot) < codes.size()) {
     codes.erase(codes.begin() + slot);
   }
-  bindings::set(control, codes);
+  bindings::set(control, codes, layer);
   settings::save_bindings();
   rebuild();
 }
@@ -444,9 +470,12 @@ void defaults() {
     settings::set_fullscreen_mode(0, 0, 0);
     settings::set_window_size(1280, 720);
     settings::set_render_scale(100);
-  } else {
-    bindings::reset_defaults();
+  } else if (g_page == 1) {
+    bindings::reset_defaults(bindings::Layer::Game);
     bindings::set_mouse(bindings::MouseSettings{});
+    settings::save_bindings();
+  } else {
+    bindings::reset_defaults(bindings::Layer::Menu);
     settings::save_bindings();
   }
   rebuild();
@@ -536,7 +565,7 @@ void set_page(int p) {
 void clear_slot() {
   Row& r = g_rows[size_t(g_focus)];
   if (r.kind != Kind::Binding) return;
-  set_binding(r.control, g_slot, 0);
+  set_binding(r.control, g_slot, 0, r.menu);
 }
 
 void capture_input(u32 code) {
@@ -547,7 +576,7 @@ void capture_input(u32 code) {
     toast(key_label(code) + " CANNOT BE BOUND");
     return;
   }
-  set_binding(r.control, g_slot, code);
+  set_binding(r.control, g_slot, code, r.menu);
 }
 
 // ---------------------------------------------------------------------------------------------

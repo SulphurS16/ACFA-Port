@@ -14,6 +14,7 @@
 
 #include "common/ini.h"
 #include "common/settings_file.h"
+#include "runtime/game/menu_mouse.h"
 #include "runtime/input.h"
 #include "runtime/log.h"
 
@@ -68,6 +69,7 @@ const KeyName kKeys[] = {
 
 std::mutex g_mu;  // bindings change on the window thread (PC SETTINGS) while pads are read
 std::vector<u32> g_bind[kControlCount];
+std::vector<u32> g_menu[kControlCount];  // [menu]: in the game's menus first
 std::atomic<double> g_sensitivity_x{1.0}, g_sensitivity_y{1.0};
 std::atomic<bool> g_invert_x{false}, g_invert_y{false};
 std::chrono::steady_clock::time_point g_wheel_up_until, g_wheel_down_until;
@@ -101,18 +103,22 @@ std::vector<u32> parse_list(const std::string& value, const char* control) {
   return out;
 }
 
-void parse_keyboard(const acfa::Ini& ini) {
+void parse_section(const acfa::Ini& ini, const char* section, std::vector<u32>* bind) {
   std::lock_guard lk(g_mu);
-  for (auto& b : g_bind) b.clear();
-  for (const auto& [name, value] : ini.entries("keyboard")) {
+  for (size_t c = 0; c < kControlCount; ++c) bind[c].clear();
+  for (const auto& [name, value] : ini.entries(section)) {
     size_t c = 0;
     while (c < kControlCount && !equal_ci(name, kControls[c].name)) ++c;
     if (c == kControlCount) {
-      LOG_W("input", "settings [keyboard]: unknown pad control '%s'", name.c_str());
+      LOG_W("input", "settings [%s]: unknown pad control '%s'", section, name.c_str());
       continue;
     }
-    g_bind[c] = parse_list(value, kControls[c].name);
+    bind[c] = parse_list(value, kControls[c].name);
   }
+}
+void parse_keyboard(const acfa::Ini& ini) {
+  parse_section(ini, "keyboard", g_bind);
+  parse_section(ini, "menu", g_menu);
 }
 
 }  // namespace
@@ -175,6 +181,9 @@ void store(acfa::Ini& ini) {
     std::string v;
     for (u32 code : g_bind[c]) v += (v.empty() ? "" : ", ") + input_name(code);
     ini.set("keyboard", kControls[c].name, v);
+    std::string m;
+    for (u32 code : g_menu[c]) m += (m.empty() ? "" : ", ") + input_name(code);
+    if (!m.empty() || ini.get("menu", kControls[c].name)) ini.set("menu", kControls[c].name, m);
   }
   ini.remove("mouse", "sensitivity");  // the earlier single setting
   ini.set("mouse", "sensitivity_x", acfa::strprintf("%.2f", g_sensitivity_x.load()));
@@ -183,20 +192,22 @@ void store(acfa::Ini& ini) {
   ini.set("mouse", "invert_y", g_invert_y.load() ? "true" : "false");
 }
 
-std::vector<u32> get(size_t c) {
+std::vector<u32> get(size_t c, Layer l) {
   std::lock_guard lk(g_mu);
-  return c < kControlCount ? g_bind[c] : std::vector<u32>{};
+  return c < kControlCount ? (l == Layer::Menu ? g_menu : g_bind)[c] : std::vector<u32>{};
 }
 
-void set(size_t c, const std::vector<u32>& codes) {
+void set(size_t c, const std::vector<u32>& codes, Layer l) {
   if (c >= kControlCount) return;
   std::lock_guard lk(g_mu);
-  g_bind[c] = codes;
+  (l == Layer::Menu ? g_menu : g_bind)[c] = codes;
 }
 
-void reset_defaults() {
-  acfa::Ini d = acfa::Ini::parse(std::string("[keyboard]\n") + acfa::settings::default_keyboard_text());
-  parse_keyboard(d);
+void reset_defaults(Layer l) {
+  if (l == Layer::Menu)
+    parse_section(acfa::Ini::parse(std::string("[menu]\n") + acfa::settings::default_menu_text()), "menu", g_menu);
+  else
+    parse_section(acfa::Ini::parse(std::string("[keyboard]\n") + acfa::settings::default_keyboard_text()), "keyboard", g_bind);
 }
 
 PadOut sample() {
@@ -213,9 +224,41 @@ PadOut sample() {
   };
   bool neg[4] = {}, pos[4] = {};
   std::lock_guard lk(g_mu);
+  // In the game's menus an input listed in [menu] drives its menu control only; on other screens
+  // than gameplay (title, movies) the menu's confirm and back keys press Start as well. An input
+  // keeps the meaning it had when it went down until it is released: Escape closing the pause menu
+  // (Circle there) does not become Start once gameplay resumes under the still pressed key.
+  const game::InputContext where = game::input_context();
+  static std::vector<std::pair<u32, game::InputContext>> held;  // inputs down, with their context at the press
+  auto context_of = [&](u32 code) {
+    for (auto& [c, at] : held)
+      if (c == code) return at;
+    held.push_back({code, where});
+    return where;
+  };
+  held.erase(std::remove_if(held.begin(), held.end(), [&](const auto& h) { return !down(h.first); }), held.end());
+  auto in_menu_layer = [&](u32 code) {
+    for (const auto& m : g_menu)
+      if (std::find(m.begin(), m.end(), code) != m.end()) return true;
+    return false;
+  };
+  // Whether input `code` (down) drives control c in the context it was pressed in.
+  auto drives = [&](u32 code, size_t c) {
+    game::InputContext at = context_of(code);
+    bool game = std::find(g_bind[c].begin(), g_bind[c].end(), code) != g_bind[c].end();
+    if (at != game::InputContext::Menu) return game;
+    return std::find(g_menu[c].begin(), g_menu[c].end(), code) != g_menu[c].end() || (game && !in_menu_layer(code));
+  };
   for (size_t c = 0; c < kControlCount; ++c) {
-    if (!std::any_of(g_bind[c].begin(), g_bind[c].end(), down)) continue;
     const Control& k = kControls[c];
+    bool on = false;
+    for (u32 code : g_bind[c]) on = on || (down(code) && drives(code, c));
+    for (u32 code : g_menu[c]) on = on || (down(code) && drives(code, c));
+    // Screens without a menu (title, movies): the menu's confirm and back keys press Start.
+    if (k.kind == Kind::D2 && (k.bit == CROSS || k.bit == CIRCLE))
+      for (u32 code : g_menu[c])
+        if (down(code) && context_of(code) == game::InputContext::Screen) o.d1 |= START;
+    if (!on) continue;
     if (k.kind == Kind::D1) o.d1 |= k.bit;
     else if (k.kind == Kind::D2) o.d2 |= k.bit;
     else (k.positive ? pos : neg)[k.axis] = true;
