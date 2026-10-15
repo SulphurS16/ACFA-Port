@@ -113,6 +113,9 @@ if(ACFA_GEN_SRC)
   target_compile_options(acfa_spu_gen PRIVATE -O2 ${ACFA_CPU_FLAGS} -fno-strict-aliasing -w)
 
   add_executable(acfa ${ACFA_RT_SRC} ${ACFA_UTF8_RC})
+  if(NOT ACFA_DEV)  # players' builds open no console window (the run log holds every message)
+    set_target_properties(acfa PROPERTIES WIN32_EXECUTABLE ON)
+  endif()
   target_include_directories(acfa PRIVATE ${CMAKE_SOURCE_DIR}/src)
   target_compile_options(acfa PRIVATE ${ACFA_CPU_FLAGS} -fno-strict-aliasing -Wall -Wextra -Wno-unused-parameter -g)
   # Whole-archive: the function table references everything anyway; keeps HLE registrars alive.

@@ -20,6 +20,9 @@ void menu_mouse_wheel(int notches);              // + up, - down
 bool menu_cursor_visible();
 // A controller was used (sys_io.cpp): the cursor hides until the mouse moves again.
 void note_pad_input();
+// A controller was used after the mouse: gameplay leaves the mouse free until it moves (a player
+// who used only the keyboard so far gets mouse look at once).
+bool controller_used_last();
 
 // Port 0's pad state gets the presses made with the mouse (Cross, Circle, D-pad, Start).
 void menu_pad_bits(u16* d1, u16* d2);

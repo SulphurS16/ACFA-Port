@@ -1,6 +1,6 @@
 // The player's inputs in the keyless setup (docs/INPUTS.md): the disc folder (read in place), files
-// the player decrypted with RPCS3 (Utilities > Decrypt PS3 Binaries) and plain files from RPCS3's
-// folders. Each decrypted or copied file is accepted only with its SHA-256; the port holds no keys
+// the player decrypted (for example with RPCS3's Utilities > Decrypt PS3 Binaries) and the plain
+// files that come with them. Each file is accepted only with its SHA-256; the port holds no keys
 // and decrypts nothing.
 #pragma once
 #include <string>
@@ -38,7 +38,8 @@ std::string module_other_version(const std::string& name, const std::string& sha
 // decoder reads it at run time.
 extern const Known kFlashAtrac;
 
-// The optional update 01.35 (regulation data) as RPCS3 installs it in dev_hdd0/game/BLUS30187.
+// The optional update 01.35 (regulation data): its installed folder (dev_hdd0/game/BLUS30187 of an
+// emulator) or regulation.bin on its own.
 extern const Known kRegulation;      // USRDIR/regulation.bin
 constexpr const char* kUpdateContentId = "UP0001-BLUS30187_00-AC45000004141906";
 constexpr const char* kUpdateFiles[] = {"PARAM.SFO", "ICON0.PNG", "PS3LOGO.DAT"};  // copied when present

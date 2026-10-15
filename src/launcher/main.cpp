@@ -1,9 +1,10 @@
-// ACFA-Launcher: the player's way in. Finds and checks the game files (the disc folder and the
-// files the player decrypted with RPCS3) and the install folder, runs the first-time preparation and build
-// (setup.h), sets the frame rate, display mode, resolution, render scale and monitor (the shared
-// settings file, also changed in game under SYSTEM > PC SETTINGS), backs up and restores saves,
-// and starts the game (optionally in safe mode). Settings and saves are the player's own: they
-// live in Saved Games\ARMORED CORE for Answer, the install folder holds the rest.
+// ACFA-Launcher: the player's way in. Takes the game's folder and the folder with the files the
+// player decrypted (checked by SHA-256; the port decrypts nothing), runs the first-time setup
+// (setup.h), offers the display mode, resolution and frame rate (the shared settings file, also
+// changed in game under SYSTEM > PC SETTINGS) and starts the game. The More menu holds the rest:
+// render scale, monitor, presets, saves (open, back up, restore), safe mode, settings reset, the
+// install folder, rebuild and the log. Settings and saves are the player's own: they live in
+// Saved Games\ARMORED CORE for Answer, the install folder holds the rest.
 // Contains no game data or game-derived code.
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
@@ -38,16 +39,23 @@ using namespace launcher;
 namespace {
 
 constexpr UINT WM_SETUP = WM_APP + 1, WM_CHECKED = WM_APP + 2, WM_GAME_EXIT = WM_APP + 3;
+constexpr const wchar_t* kTitle = L"ARMORED CORE for Answer";
 enum Id {
-  kDiscEdit = 100, kRpcs3Edit,
-  kDiscBrowse = 110, kRpcs3Browse, kHelp,
-  kDiscState = 120, kRpcs3State, kUpdateState,
-  kDataEdit = 130, kDataBrowse, kDataState,
-  kPrepare = 140, kCancel, kOpenLog, kProgress, kStatus, kLog,
-  kFps = 150, kMode, kResolution, kScale, kMonitor, kResetSettings, kSafeMode, kPreset,
-  kSavesPath = 160, kSavesOpen, kSavesBackup, kSavesRestore,
+  kDiscEdit = 100, kFilesEdit,
+  kDiscBrowse = 110, kFilesBrowse, kHelp,
+  kDiscState = 120, kFilesState,
+  kPrepare = 140, kCancel, kProgress = 143, kStatus,
+  kFps = 150, kMode, kResolution,
+  kMore = 160,
   kPlay = 170, kPlayState,
   kLabel = 200,
+  // the More menu
+  kMenuScale = 300,    // + index into g_scale_items
+  kMenuMonitor = 320,  // + index into g_monitor_items
+  kMenuPreset = 340,   // + index into kPresets
+  kMenuSavesOpen = 360, kMenuSavesBackup, kMenuSavesRestore,
+  kMenuSafePlay = 370, kMenuResetSettings,
+  kMenuInstall = 380, kMenuRebuild, kMenuOpenLog,
 };
 
 HINSTANCE g_inst;
@@ -62,11 +70,11 @@ SetupConfig g_cfg;
 Setup g_setup;
 HANDLE g_game = nullptr;
 bool g_ready = false;
+std::wstring g_note;  // a message for the status line (a setup or game error) until the next action
 
 std::mutex g_check_mu;
-constexpr int kChecks = 3;  // disc (+ EBOOT.elf), system modules, update
-Status g_checks[kChecks];
-Found g_found;
+Status g_disc_check, g_files_check, g_update_check;
+bool g_checked = false;
 std::atomic<int> g_check_gen{0};
 
 HWND item(int id) { return GetDlgItem(g_wnd, id); }
@@ -79,13 +87,14 @@ std::wstring get_text(int id) {
   return s;
 }
 void set_text(int id, const std::wstring& s) { SetWindowTextW(item(id), s.c_str()); }
+void show(int id, bool on) { ShowWindow(item(id), on ? SW_SHOWNA : SW_HIDE); }
 
 // ---- launcher.ini: where the player's files and the install folder are ----
 void load_paths() {
   acfa::Ini ini = acfa::Ini::load(g_ini_path);
   auto p = [&](const char* k) { return fs::path(widen(ini.get_or("paths", k, ""))); };
   g_cfg.disc = p("disc");
-  g_cfg.rpcs3 = p("rpcs3");
+  g_cfg.files = p("files");
   g_cfg.data = p("install");
   g_user_override = p("user");  // optional: settings and saves somewhere else than Saved Games
 }
@@ -95,7 +104,7 @@ void save_paths() {
     acfa::Ini ini = acfa::Ini::load(g_ini_path);
     if (ini.empty()) ini = acfa::Ini::parse("# ARMORED CORE for Answer launcher: the locations chosen in the launcher\n");
     ini.set("paths", "disc", narrow(g_cfg.disc.wstring()));
-    ini.set("paths", "rpcs3", narrow(g_cfg.rpcs3.wstring()));
+    ini.set("paths", "files", narrow(g_cfg.files.wstring()));
     ini.set("paths", "install", narrow(g_cfg.data.wstring()));
     std::error_code ec;
     fs::create_directories(g_ini_path.parent_path(), ec);
@@ -151,6 +160,28 @@ fs::path find_sources() {
 // ---- settings (the shared file in the player's folder) ----
 fs::path settings_path() { return user_dir() / "settings.ini"; }
 
+acfa::settings::Display read_display() {
+  try {
+    return acfa::settings::read_display(acfa::settings::load_or_create(settings_path(), nullptr));
+  } catch (const std::exception&) {
+    return {};
+  }
+}
+
+// Changes settings.ini (a message box when it cannot be written).
+template <class F>
+bool edit_settings(F&& change) {
+  try {
+    acfa::Ini ini = acfa::settings::load_or_create(settings_path(), nullptr);
+    change(ini);
+    ini.save(settings_path());
+    return true;
+  } catch (const std::exception& e) {
+    MessageBoxW(g_wnd, widen(std::string("Settings not saved: ") + e.what()).c_str(), kTitle, MB_ICONWARNING);
+    return false;
+  }
+}
+
 // The monitors (Windows' order) and the one the settings choose ("" or unknown: the primary).
 struct MonitorItem {
   std::wstring device;
@@ -168,7 +199,7 @@ std::vector<MonitorItem> monitors() {
   }, reinterpret_cast<LPARAM>(&out));
   return out;
 }
-std::vector<MonitorItem> g_monitor_items;  // the monitor combo's entries
+std::vector<MonitorItem> g_monitor_items;  // the monitor menu's entries
 MonitorItem chosen_monitor(const acfa::settings::Display& d) {
   std::vector<MonitorItem> ms = monitors();
   MonitorItem pick;
@@ -183,7 +214,7 @@ struct ModeItem {
   int w, h, hz;
 };
 std::vector<ModeItem> g_res_items;  // the resolution combo's entries for the current mode
-std::vector<int> g_scale_items;     // the render scale combo's percentages
+std::vector<int> g_scale_items;     // the render scale menu's percentages
 
 void monitor_size(const MonitorItem& mon, int* w, int* h, int* hz) {
   DEVMODEW dm{};
@@ -217,7 +248,6 @@ void fill_resolutions(const acfa::settings::Display& d) {
       sel = int(g_res_items.size());
       add(std::to_wstring(d.width) + L" x " + std::to_wstring(d.height), {d.width, d.height, 0});
     }
-    EnableWindow(cb, TRUE);
   } else if (d.mode == acfa::settings::Mode::Fullscreen) {
     add(L"Desktop (" + std::to_wstring(mw) + L" x " + std::to_wstring(mh) + L", " + std::to_wstring(mhz) + L" Hz)", {0, 0, 0});
     std::set<std::tuple<int, int, int>> seen;
@@ -234,21 +264,15 @@ void fill_resolutions(const acfa::settings::Display& d) {
       if (m.w == d.fs_width && m.h == d.fs_height && (m.hz == d.fs_hz || !d.fs_hz)) sel = int(g_res_items.size());
       add(std::to_wstring(m.w) + L" x " + std::to_wstring(m.h) + L", " + std::to_wstring(m.hz) + L" Hz", m);
     }
-    EnableWindow(cb, TRUE);
   } else {
     add(std::to_wstring(mw) + L" x " + std::to_wstring(mh), {mw, mh, 0});
-    EnableWindow(cb, FALSE);
   }
   SendMessageW(cb, CB_SETCURSEL, WPARAM(sel), 0);
 }
 
 void load_settings_controls() {
   if (g_cfg.data.empty()) return;
-  acfa::settings::Display d;
-  try {
-    d = acfa::settings::read_display(acfa::settings::load_or_create(settings_path(), nullptr));
-  } catch (const std::exception&) {
-  }
+  acfa::settings::Display d = read_display();
   HWND fps = item(kFps);
   SendMessageW(fps, CB_RESETCONTENT, 0, 0);
   int sel = -1;
@@ -269,55 +293,19 @@ void load_settings_controls() {
   for (const wchar_t* m : {L"Windowed", L"Fullscreen", L"Borderless fullscreen"}) SendMessageW(mode, CB_ADDSTRING, 0, LPARAM(m));
   SendMessageW(mode, CB_SETCURSEL, d.mode == acfa::settings::Mode::Fullscreen ? 1 : d.mode == acfa::settings::Mode::Borderless ? 2 : 0, 0);
   fill_resolutions(d);
-  HWND scale = item(kScale);
-  SendMessageW(scale, CB_RESETCONTENT, 0, 0);
-  g_scale_items.clear();
-  for (int pct = acfa::settings::kRenderScaleMin; pct <= acfa::settings::kRenderScaleMax; pct += 25) g_scale_items.push_back(pct);
-  if (std::find(g_scale_items.begin(), g_scale_items.end(), d.render_scale) == g_scale_items.end()) {
-    g_scale_items.push_back(d.render_scale);
-    std::sort(g_scale_items.begin(), g_scale_items.end());
-  }
-  for (int pct : g_scale_items) {
-    std::wstring t = std::to_wstring(pct) + L" %" + (pct == 100 ? L" (the output resolution)" : L"");
-    SendMessageW(scale, CB_ADDSTRING, 0, LPARAM(t.c_str()));
-    if (pct == d.render_scale) SendMessageW(scale, CB_SETCURSEL, WPARAM(SendMessageW(scale, CB_GETCOUNT, 0, 0) - 1), 0);
-  }
-  HWND mon = item(kMonitor);
-  SendMessageW(mon, CB_RESETCONTENT, 0, 0);
-  g_monitor_items = monitors();
-  MonitorItem cur = chosen_monitor(d);
-  for (size_t i = 0; i < g_monitor_items.size(); ++i) {
-    const MonitorItem& m = g_monitor_items[i];
-    std::wstring t = std::to_wstring(i + 1) + L": " + std::to_wstring(m.rect.right - m.rect.left) + L" x " +
-                     std::to_wstring(m.rect.bottom - m.rect.top) + (m.primary ? L" (primary)" : L"");
-    SendMessageW(mon, CB_ADDSTRING, 0, LPARAM(t.c_str()));
-    if (m.device == cur.device) SendMessageW(mon, CB_SETCURSEL, WPARAM(i), 0);
-  }
-  EnableWindow(mon, g_monitor_items.size() > 1 && g_game == nullptr);
 }
 
 void save_setting(int id) {
   if (g_cfg.data.empty()) return;
-  try {
-    acfa::Ini ini = acfa::settings::load_or_create(settings_path(), nullptr);
-    acfa::settings::Display d = acfa::settings::read_display(ini);
-    int sel = int(SendMessageW(item(id), CB_GETCURSEL, 0, 0));
+  int sel = int(SendMessageW(item(id), CB_GETCURSEL, 0, 0));
+  acfa::settings::Display d = read_display();
+  edit_settings([&](acfa::Ini& ini) {
     if (id == kFps) {
       const auto& choices = acfa::settings::fps_choices();
       if (sel >= 0 && sel < int(choices.size())) ini.set("display", "fps", acfa::settings::fps_text(choices[size_t(sel)].fps));
     } else if (id == kMode) {
       d.mode = sel == 1 ? acfa::settings::Mode::Fullscreen : sel == 2 ? acfa::settings::Mode::Borderless : acfa::settings::Mode::Windowed;
       ini.set("display", "mode", acfa::settings::mode_name(d.mode));
-      fill_resolutions(d);
-    } else if (id == kScale && sel >= 0 && sel < int(g_scale_items.size())) {
-      ini.set("display", "render_scale", std::to_string(g_scale_items[size_t(sel)]));
-    } else if (id == kMonitor && sel >= 0 && sel < int(g_monitor_items.size())) {
-      const MonitorItem& m = g_monitor_items[size_t(sel)];
-      d.monitor = m.primary ? "" : narrow(m.device);
-      d.fs_width = d.fs_height = d.fs_hz = 0;  // that monitor's desktop mode
-      ini.set("display", "monitor", d.monitor);
-      ini.set("display", "fullscreen_mode", acfa::settings::fullscreen_text(d));
-      fill_resolutions(d);
     } else if (id == kResolution && sel >= 0 && sel < int(g_res_items.size())) {
       const ModeItem& m = g_res_items[size_t(sel)];
       if (d.mode == acfa::settings::Mode::Windowed) {
@@ -329,13 +317,9 @@ void save_setting(int id) {
         ini.set("display", "fullscreen_mode", acfa::settings::fullscreen_text(d));
       }
     }
-    ini.save(settings_path());
-  } catch (const std::exception& e) {
-    MessageBoxW(g_wnd, widen(std::string("Settings not saved: ") + e.what()).c_str(), L"ARMORED CORE for Answer", MB_ICONWARNING);
-  }
+  });
+  if (id == kMode) fill_resolutions(d);
 }
-
-void add_log_line(const std::string& s);
 
 // Presets for the display settings (the frame rate in missions and the render scale): what a
 // modest PC or a handheld runs well (estimates; docs/STATUS.md lists what was measured).
@@ -345,27 +329,11 @@ struct Preset {
   int render_scale;
 };
 const Preset kPresets[] = {
-    {L"Presets...", nullptr, 0},
     {L"Standard: 60 fps, 100 %", "60", 100},
     {L"Modest PC: 60 fps, 75 %", "60", 75},
     {L"Handheld / low power: 30 fps, 75 %", "30", 75},
     {L"High refresh: 120 fps, 100 %", "120", 100},
 };
-void apply_preset(int i) {
-  if (i <= 0 || i >= int(std::size(kPresets)) || g_cfg.data.empty()) return;
-  const Preset& p = kPresets[i];
-  try {
-    acfa::Ini ini = acfa::settings::load_or_create(settings_path(), nullptr);
-    ini.set("display", "fps", p.fps);
-    ini.set("display", "render_scale", std::to_string(p.render_scale));
-    ini.save(settings_path());
-  } catch (const std::exception& e) {
-    MessageBoxW(g_wnd, widen(std::string("Settings not saved: ") + e.what()).c_str(), L"ARMORED CORE for Answer", MB_ICONWARNING);
-    return;
-  }
-  load_settings_controls();
-  add_log_line("Preset applied: " + narrow(p.name) + ".");
-}
 
 // ---- saves ----
 fs::path saves_dir() { return user_dir() / "savedata"; }
@@ -391,8 +359,6 @@ size_t copy_saves(const fs::path& from, const fs::path& to) {
   return n;
 }
 
-void add_log_line(const std::string& s);
-
 // Earlier versions kept settings and saves in the install folder: copied to the player's folder
 // once (the originals stay where they are).
 void move_to_user_dir() {
@@ -400,16 +366,12 @@ void move_to_user_dir() {
   std::error_code ec;
   fs::create_directories(user_dir(), ec);
   fs::path old_settings = acfa::settings::file_in(g_cfg.data);
-  if (!fs::exists(settings_path(), ec) && fs::exists(old_settings, ec) && fs::copy_file(old_settings, settings_path(), ec))
-    add_log_line("Settings copied from the install folder to " + narrow(settings_path().wstring()) + ".");
+  if (!fs::exists(settings_path(), ec) && fs::exists(old_settings, ec)) fs::copy_file(old_settings, settings_path(), ec);
   fs::path old_saves = g_cfg.data / "hdd0" / "home" / "00000001" / "savedata";
   bool have = false;
   for (const auto& e : fs::directory_iterator(saves_dir(), ec))
     have |= e.is_directory() && e.path().filename().wstring().rfind(L"BLUS30187", 0) == 0;
-  if (!have && fs::exists(old_saves, ec)) {
-    if (size_t n = copy_saves(old_saves, saves_dir()))
-      add_log_line(acfa::strprintf("%zu save(s) copied from the install folder to ", n) + narrow(saves_dir().wstring()) + ".");
-  }
+  if (!have && fs::exists(old_saves, ec)) copy_saves(old_saves, saves_dir());
   fs::path old_backups = g_cfg.data / "backups";
   if (!fs::exists(backups_dir(), ec) && fs::exists(old_backups, ec)) fs::copy(old_backups, backups_dir(), fs::copy_options::recursive, ec);
 }
@@ -419,13 +381,15 @@ void start_checks() {
   int gen = ++g_check_gen;
   SetupConfig c = g_cfg;
   std::thread([c, gen] {
-    Found f = find_files(c.disc, c.rpcs3);
-    Status s[kChecks] = {check_disc(c.disc, f), check_modules(c.rpcs3, f), check_update(c.rpcs3, f)};
+    Found f = find_files(c.disc, c.files);
+    Status d = check_disc(c.disc, f), m = check_modules(c.files, f), u = check_update(f);
     {
       std::lock_guard lk(g_check_mu);
       if (gen != g_check_gen) return;
-      for (int i = 0; i < kChecks; ++i) g_checks[i] = s[i];
-      g_found = f;
+      g_disc_check = d;
+      g_files_check = m;
+      g_update_check = u;
+      g_checked = true;
     }
     PostMessageW(g_wnd, WM_CHECKED, WPARAM(gen), 0);
   }).detach();
@@ -444,73 +408,80 @@ bool inside(const fs::path& child, const fs::path& parent) {
 }
 bool data_ok() {
   if (g_cfg.data.empty()) return false;
-  for (const fs::path& in : {g_cfg.disc, g_cfg.rpcs3})
+  for (const fs::path& in : {g_cfg.disc, g_cfg.files})
     if (inside(g_cfg.data, in)) return false;
   return true;
 }
 
 bool inputs_ok() {
   std::lock_guard lk(g_check_mu);
-  return g_checks[0].verdict == Verdict::Ok && g_checks[1].verdict == Verdict::Ok && g_checks[2].verdict != Verdict::Bad;
+  return g_disc_check.verdict == Verdict::Ok && g_files_check.verdict == Verdict::Ok;
 }
 
-void update_space() {
-  if (g_cfg.data.empty()) {
-    set_text(kDataState, L"Choose where the port keeps its files.");
-    return;
-  }
-  if (!data_ok()) {
-    set_text(kDataState, L"Choose a folder outside the game files' folders.");
-    return;
-  }
+// Decrypted files are missing or wrong (not merely a folder still to choose): the window says how
+// to get them.
+bool files_missing() {
+  std::lock_guard lk(g_check_mu);
+  if (!g_checked) return false;
+  bool eboot = g_disc_check.verdict == Verdict::Bad && g_disc_check.text.find("EBOOT") != std::string::npos;
+  return eboot || g_files_check.verdict == Verdict::Bad;
+}
+
+// What the status line says when setup is not running.
+std::wstring idle_status() {
+  if (!g_note.empty()) return g_note;
+  if (g_ready) return L"Ready to play.";
+  if (!data_ok()) return L"Choose an install folder outside the game's folders (More > Install folder).";
   fs::path p = g_cfg.data;
   std::error_code ec;
   while (!p.empty() && !fs::exists(p, ec)) p = p.parent_path();
   ULARGE_INTEGER avail{};
   GetDiskFreeSpaceExW(p.c_str(), &avail, nullptr, nullptr);
-  unsigned long long need = Setup::space_needed(g_cfg);
-  set_text(kDataState, widen(acfa::strprintf("Needs %.1f GB more; %.0f GB free.", double(need) / (1ull << 30), double(avail.QuadPart) / (1ull << 30))));
+  double need = double(Setup::space_needed(g_cfg)) / (1ull << 30), free = double(avail.QuadPart) / (1ull << 30);
+  std::wstring where = widen(acfa::strprintf("%.1f GB in ", need)) + g_cfg.data.wstring() + widen(acfa::strprintf(" (%.0f GB free)", free));
+  if (free < need) return L"Not enough space: setup needs " + where + L". More > Install folder chooses another place.";
+  if (files_missing()) return L"Decrypt the missing files yourself, for example with RPCS3 (Utilities > Decrypt PS3 Binaries). The port only checks them.";
+  if (!inputs_ok()) return L"Setup starts when the files above are found: about " + where + L".";
+  return L"Set up prepares and builds the game once, a few minutes: " + where + L".";
 }
 
 void update_buttons() {
   bool busy = g_setup.running(), playing = g_game != nullptr;
   g_ready = !g_cfg.data.empty() && Setup::ready(g_cfg);
-  EnableWindow(item(kPrepare), !busy && !playing && inputs_ok() && data_ok());
-  EnableWindow(item(kCancel), busy);
+  bool help = !busy && files_missing();
+  show(kHelp, help);
+  show(kPrepare, !busy && !g_ready && !help);
+  show(kCancel, busy);
+  show(kProgress, busy);
+  EnableWindow(item(kPrepare), !playing && inputs_ok() && data_ok());
   EnableWindow(item(kPlay), !busy && !playing && g_ready && inputs_ok());
-  for (int id : {kDiscBrowse, kRpcs3Browse, kDataBrowse, kDiscEdit, kRpcs3Edit, kDataEdit})
-    EnableWindow(item(id), !busy && !playing);
-  for (int id : {kSavesBackup, kSavesRestore, kFps, kMode, kScale, kResetSettings, kSafeMode, kPreset}) EnableWindow(item(id), !playing && !g_cfg.data.empty());
-  EnableWindow(item(kMonitor), !playing && !g_cfg.data.empty() && g_monitor_items.size() > 1);
-  set_text(kPrepare, g_ready ? L"Rebuild" : L"Prepare and build");
-  set_text(kPlayState, playing ? L"Playing." : busy ? L"" : g_ready ? L"Ready." : L"Prepare and build first.");
+  for (int id : {kDiscBrowse, kFilesBrowse, kDiscEdit, kFilesEdit}) EnableWindow(item(id), !busy && !playing);
+  for (int id : {kFps, kMode, kResolution}) EnableWindow(item(id), !playing && !g_cfg.data.empty());
+  if (acfa::settings::Mode m = read_display().mode; m == acfa::settings::Mode::Borderless) EnableWindow(item(kResolution), FALSE);
+  if (!busy) set_text(kStatus, idle_status());
+  set_text(kPlayState, playing ? L"Playing." : g_ready && inputs_ok() && !busy ? L"Ready." : L"");
 }
 
 void refresh_paths_from_ui() {
   g_cfg.disc = get_text(kDiscEdit);
-  g_cfg.rpcs3 = get_text(kRpcs3Edit);
-  g_cfg.data = get_text(kDataEdit);
+  g_cfg.files = get_text(kFilesEdit);
   save_paths();
-  update_space();
   move_to_user_dir();
-  set_text(kSavesPath, saves_dir().wstring());
+  set_text(kDiscState, L"Checking...");
+  set_text(kFilesState, L"");
   start_checks();
   update_buttons();
 }
 
 // ---- file and folder pickers ----
-fs::path pick(bool folder, const wchar_t* title, const fs::path& start, const wchar_t* filter_name, const wchar_t* filter) {
+fs::path pick_folder(const wchar_t* title, const fs::path& start) {
   IFileOpenDialog* dlg = nullptr;
   fs::path result;
   if (FAILED(CoCreateInstance(CLSID_FileOpenDialog, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&dlg)))) return result;
   DWORD opts = 0;
   dlg->GetOptions(&opts);
-  dlg->SetOptions(opts | FOS_FORCEFILESYSTEM | (folder ? FOS_PICKFOLDERS : FOS_FILEMUSTEXIST));
+  dlg->SetOptions(opts | FOS_FORCEFILESYSTEM | FOS_PICKFOLDERS);
   dlg->SetTitle(title);
-  if (!folder && filter) {
-    COMDLG_FILTERSPEC spec[2] = {{filter_name, filter}, {L"All files", L"*.*"}};
-    dlg->SetFileTypes(2, spec);
-  }
   std::error_code ec;
   fs::path dir = start;
   while (!dir.empty() && !fs::is_directory(dir, ec)) dir = dir.parent_path();
@@ -533,24 +504,23 @@ fs::path pick(bool folder, const wchar_t* title, const fs::path& start, const wc
 }
 
 // ---- the game ----
-void play() {
+void play(bool safe_mode) {
   fs::path exe = Setup::game_exe(g_cfg);
   std::wstring cmd = quote_arg(exe.wstring()) + L" --data " + quote_arg(g_cfg.data.wstring()) + L" --user " + quote_arg(user_dir().wstring()) +
                      L" --disc " + quote_arg(g_cfg.disc.wstring()) + L" --flash " + quote_arg(Setup::flash_dir(g_cfg).wstring()) + L" --keep-runs 10";
-  if (SendMessageW(item(kSafeMode), BM_GETCHECK, 0, 0) == BST_CHECKED) {
-    cmd += L" --safe-mode";
-    SendMessageW(item(kSafeMode), BM_SETCHECK, BST_UNCHECKED, 0);  // for this start only
-  }
+  if (safe_mode) cmd += L" --safe-mode";
   STARTUPINFOW si{};
   si.cb = sizeof si;
   PROCESS_INFORMATION pi{};
-  if (!CreateProcessW(exe.c_str(), cmd.data(), nullptr, nullptr, FALSE, 0, nullptr, g_cfg.data.c_str(), &si, &pi)) {
-    MessageBoxW(g_wnd, L"The game could not be started.", L"ARMORED CORE for Answer", MB_ICONERROR);
+  // Only the game's window: no console (the run log holds every message).
+  if (!CreateProcessW(exe.c_str(), cmd.data(), nullptr, nullptr, FALSE, CREATE_NO_WINDOW, nullptr, g_cfg.data.c_str(), &si, &pi)) {
+    MessageBoxW(g_wnd, L"The game could not be started.", kTitle, MB_ICONERROR);
     return;
   }
   CloseHandle(pi.hThread);
   AllowSetForegroundWindow(pi.dwProcessId);  // the game window takes the focus from the launcher
   g_game = pi.hProcess;
+  g_note.clear();
   update_buttons();
   ShowWindow(g_wnd, SW_MINIMIZE);
   std::thread([h = pi.hProcess] {
@@ -575,33 +545,24 @@ struct Place {
   int x, y, w, h;
 };
 const Place kPlaces[] = {
-    {kDiscEdit, 132, 30, 384, 24},   {kDiscBrowse, 522, 29, 82, 26},   {kDiscState, 132, 56, 472, 18},
-    {kRpcs3Edit, 132, 84, 384, 24},  {kRpcs3Browse, 522, 83, 82, 26},  {kRpcs3State, 132, 110, 472, 18},
-    {kUpdateState, 132, 140, 472, 18}, {kHelp, 132, 176, 190, 28},
-    {kDataEdit, 24, 266, 492, 24},   {kDataBrowse, 522, 265, 82, 26},  {kDataState, 24, 293, 580, 18},
-    {kPrepare, 24, 344, 160, 30},    {kCancel, 192, 344, 90, 30},      {kOpenLog, 290, 344, 90, 30},
-    {kProgress, 24, 384, 580, 16},   {kStatus, 24, 404, 580, 18},      {kLog, 24, 426, 580, 176},
-    {kFps, 748, 30, 190, 300},       {kMode, 748, 64, 190, 300},       {kResolution, 748, 98, 190, 300},
-    {kScale, 748, 132, 190, 300},    {kMonitor, 748, 166, 190, 300},   {kResetSettings, 636, 202, 150, 28},
-    {kPreset, 796, 203, 144, 300},
-    {kSavesPath, 636, 276, 304, 34}, {kSavesOpen, 636, 314, 96, 28},   {kSavesBackup, 740, 314, 96, 28},
-    {kSavesRestore, 844, 314, 96, 28}, {kSafeMode, 632, 466, 316, 22},  {kPlayState, 624, 496, 324, 20},
-    {kPlay, 624, 520, 324, 82},
+    {kDiscEdit, 124, 14, 324, 24},   {kDiscBrowse, 454, 13, 90, 26},   {kDiscState, 124, 41, 420, 18},
+    {kFilesEdit, 124, 68, 324, 24},  {kFilesBrowse, 454, 67, 90, 26},  {kFilesState, 124, 95, 420, 18},
+    {kPrepare, 16, 124, 98, 28},     {kCancel, 16, 124, 98, 28},       {kHelp, 16, 124, 98, 28},
+    {kStatus, 124, 124, 420, 34},    {kProgress, 124, 162, 420, 10},
+    {kMode, 124, 186, 190, 300},     {kResolution, 320, 186, 224, 300}, {kFps, 124, 220, 190, 300},
+    {kMore, 16, 266, 98, 30},        {kPlayState, 124, 272, 200, 20},  {kPlay, 334, 254, 210, 50},
 };
 struct Label {
   int x, y, w, h;
   const wchar_t* text;
-  bool group;
 };
 const Label kLabels[] = {
-    {12, 6, 604, 232, L"Game files", true},    {24, 33, 104, 20, L"Disc folder", false},     {24, 87, 104, 20, L"RPCS3 folder", false},
-    {24, 140, 104, 20, L"Update 01.35", false}, {330, 182, 274, 20, L"Files you decrypt once with RPCS3", false},
-    {12, 244, 604, 76, L"Install folder", true},
-    {12, 324, 604, 286, L"Setup", true},          {624, 6, 324, 238, L"Settings", true},      {636, 33, 108, 20, L"Frame rate", false},
-    {636, 67, 108, 20, L"Display mode", false},   {636, 101, 108, 20, L"Resolution", false}, {624, 252, 324, 100, L"Saves", true},
-    {636, 135, 108, 20, L"Render scale", false},  {636, 169, 108, 20, L"Monitor", false},
+    {16, 17, 104, 20, L"Game folder"},
+    {16, 71, 104, 20, L"Decrypted files"},
+    {16, 189, 104, 20, L"Display"},
+    {16, 223, 104, 20, L"Frame rate"},
 };
-constexpr int kClientW = 960, kClientH = 616;
+constexpr int kClientW = 560, kClientH = 318;
 
 void layout() {
   for (const Place& p : kPlaces) SetWindowPos(item(p.id), nullptr, S(p.x), S(p.y), S(p.w), S(p.h), SWP_NOZORDER | SWP_NOACTIVATE);
@@ -632,65 +593,121 @@ void create_controls() {
   auto make = [](const wchar_t* cls, const wchar_t* text, DWORD style, int id, DWORD ex = 0) {
     CreateWindowExW(ex, cls, text, WS_CHILD | WS_VISIBLE | style, 0, 0, 10, 10, g_wnd, HMENU(INT_PTR(id)), g_inst, nullptr);
   };
-  for (size_t i = 0; i < std::size(kLabels); ++i)
-    make(kLabels[i].group ? L"BUTTON" : L"STATIC", kLabels[i].text, kLabels[i].group ? BS_GROUPBOX : SS_LEFT, kLabel + int(i));
+  for (size_t i = 0; i < std::size(kLabels); ++i) make(L"STATIC", kLabels[i].text, SS_LEFT, kLabel + int(i));
   for (int i = 0; i < 2; ++i) {
     make(L"EDIT", L"", WS_TABSTOP | ES_AUTOHSCROLL, kDiscEdit + i, WS_EX_CLIENTEDGE);
     make(L"BUTTON", L"Browse...", WS_TABSTOP | BS_PUSHBUTTON, kDiscBrowse + i);
+    make(L"STATIC", L"", SS_LEFT | SS_ENDELLIPSIS, kDiscState + i);
   }
-  for (int i = 0; i < kChecks; ++i) make(L"STATIC", L"", SS_LEFT | SS_ENDELLIPSIS, kDiscState + i);
-  make(L"BUTTON", L"How to decrypt...", WS_TABSTOP | BS_PUSHBUTTON, kHelp);
-  make(L"EDIT", L"", WS_TABSTOP | ES_AUTOHSCROLL, kDataEdit, WS_EX_CLIENTEDGE);
-  make(L"BUTTON", L"Browse...", WS_TABSTOP | BS_PUSHBUTTON, kDataBrowse);
-  make(L"STATIC", L"", SS_LEFT, kDataState);
-  make(L"BUTTON", L"Prepare and build", WS_TABSTOP | BS_PUSHBUTTON, kPrepare);
+  make(L"BUTTON", L"Which files?", WS_TABSTOP | BS_PUSHBUTTON, kHelp);
+  make(L"BUTTON", L"Set up", WS_TABSTOP | BS_PUSHBUTTON, kPrepare);
   make(L"BUTTON", L"Cancel", WS_TABSTOP | BS_PUSHBUTTON, kCancel);
-  make(L"BUTTON", L"Open log", WS_TABSTOP | BS_PUSHBUTTON, kOpenLog);
+  make(L"STATIC", L"", SS_LEFT, kStatus);
   make(PROGRESS_CLASSW, L"", PBS_SMOOTH, kProgress);
   SendMessageW(item(kProgress), PBM_SETRANGE32, 0, 1000);
-  make(L"STATIC", L"", SS_LEFT | SS_ENDELLIPSIS, kStatus);
-  make(L"LISTBOX", L"", WS_VSCROLL | LBS_NOINTEGRALHEIGHT | LBS_NOSEL, kLog, WS_EX_CLIENTEDGE);
-  for (int id : {kFps, kMode, kResolution, kScale, kMonitor}) make(L"COMBOBOX", L"", WS_TABSTOP | CBS_DROPDOWNLIST | WS_VSCROLL, id);
-  make(L"BUTTON", L"Reset settings...", WS_TABSTOP | BS_PUSHBUTTON, kResetSettings);
-  make(L"COMBOBOX", L"", WS_TABSTOP | CBS_DROPDOWNLIST | WS_VSCROLL, kPreset);
-  for (const Preset& p : kPresets) SendMessageW(item(kPreset), CB_ADDSTRING, 0, LPARAM(p.name));
-  SendMessageW(item(kPreset), CB_SETCURSEL, 0, 0);
-  make(L"BUTTON", L"Safe mode: default display settings for the next start", WS_TABSTOP | BS_AUTOCHECKBOX, kSafeMode);
-  make(L"STATIC", L"", SS_LEFT | SS_PATHELLIPSIS, kSavesPath);
-  make(L"BUTTON", L"Open", WS_TABSTOP | BS_PUSHBUTTON, kSavesOpen);
-  make(L"BUTTON", L"Back up", WS_TABSTOP | BS_PUSHBUTTON, kSavesBackup);
-  make(L"BUTTON", L"Restore...", WS_TABSTOP | BS_PUSHBUTTON, kSavesRestore);
-  make(L"STATIC", L"", SS_CENTER, kPlayState);
+  for (int id : {kMode, kResolution, kFps}) make(L"COMBOBOX", L"", WS_TABSTOP | CBS_DROPDOWNLIST | WS_VSCROLL, id);
+  make(L"BUTTON", L"More...", WS_TABSTOP | BS_PUSHBUTTON, kMore);
+  make(L"STATIC", L"", SS_RIGHT, kPlayState);
   make(L"BUTTON", L"PLAY", WS_TABSTOP | BS_DEFPUSHBUTTON, kPlay);
+  show(kHelp, false);
+  show(kCancel, false);
+  show(kProgress, false);
 }
 
-void add_log_line(const std::string& s) {
-  HWND lb = item(kLog);
-  SendMessageW(lb, LB_ADDSTRING, 0, LPARAM(widen(s).c_str()));
-  LRESULT n = SendMessageW(lb, LB_GETCOUNT, 0, 0);
-  while (n > 500) n = SendMessageW(lb, LB_DELETESTRING, 0, 0);
-  SendMessageW(lb, LB_SETTOPINDEX, WPARAM(std::max<LRESULT>(0, n - 1)), 0);
+// The More menu: everything beyond the bare necessities.
+void more_menu() {
+  bool playing = g_game != nullptr, busy = g_setup.running(), data = !g_cfg.data.empty();
+  acfa::settings::Display d = read_display();
+  HMENU scale = CreatePopupMenu();
+  g_scale_items.clear();
+  for (int pct = acfa::settings::kRenderScaleMin; pct <= acfa::settings::kRenderScaleMax; pct += 25) g_scale_items.push_back(pct);
+  if (std::find(g_scale_items.begin(), g_scale_items.end(), d.render_scale) == g_scale_items.end()) {
+    g_scale_items.push_back(d.render_scale);
+    std::sort(g_scale_items.begin(), g_scale_items.end());
+  }
+  for (size_t i = 0; i < g_scale_items.size(); ++i) {
+    int pct = g_scale_items[i];
+    std::wstring t = std::to_wstring(pct) + L" %" + (pct == 100 ? L" (the output resolution)" : L"");
+    AppendMenuW(scale, MF_STRING | (pct == d.render_scale ? MF_CHECKED : 0), kMenuScale + i, t.c_str());
+  }
+  HMENU presets = CreatePopupMenu();
+  for (size_t i = 0; i < std::size(kPresets); ++i) AppendMenuW(presets, MF_STRING, kMenuPreset + i, kPresets[i].name);
+  HMENU m = CreatePopupMenu();
+  UINT set_flags = MF_POPUP | (data && !playing ? 0 : MF_GRAYED);
+  AppendMenuW(m, set_flags, UINT_PTR(scale), L"Render scale");
+  g_monitor_items = monitors();
+  if (g_monitor_items.size() > 1) {
+    HMENU mon = CreatePopupMenu();
+    MonitorItem cur = chosen_monitor(d);
+    for (size_t i = 0; i < g_monitor_items.size(); ++i) {
+      const MonitorItem& mi = g_monitor_items[i];
+      std::wstring t = std::to_wstring(i + 1) + L": " + std::to_wstring(mi.rect.right - mi.rect.left) + L" x " +
+                       std::to_wstring(mi.rect.bottom - mi.rect.top) + (mi.primary ? L" (primary)" : L"");
+      AppendMenuW(mon, MF_STRING | (mi.device == cur.device ? MF_CHECKED : 0), kMenuMonitor + i, t.c_str());
+    }
+    AppendMenuW(m, set_flags, UINT_PTR(mon), L"Monitor");
+  }
+  AppendMenuW(m, set_flags, UINT_PTR(presets), L"Presets");
+  AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
+  UINT idle = data && !playing ? 0 : MF_GRAYED;
+  AppendMenuW(m, MF_STRING | (data ? 0 : MF_GRAYED), kMenuSavesOpen, L"Open the saves folder");
+  AppendMenuW(m, MF_STRING | idle, kMenuSavesBackup, L"Back up the saves");
+  AppendMenuW(m, MF_STRING | idle, kMenuSavesRestore, L"Restore saves...");
+  AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
+  AppendMenuW(m, MF_STRING | (!busy && !playing && g_ready && inputs_ok() ? 0 : MF_GRAYED), kMenuSafePlay,
+              L"Play in safe mode (default display settings, this start only)");
+  AppendMenuW(m, MF_STRING | idle, kMenuResetSettings, L"Reset all settings...");
+  AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
+  AppendMenuW(m, MF_STRING | (!busy && !playing ? 0 : MF_GRAYED), kMenuInstall, (L"Install folder: " + g_cfg.data.wstring() + L"...").c_str());
+  AppendMenuW(m, MF_STRING | (!busy && !playing && g_ready && inputs_ok() ? 0 : MF_GRAYED), kMenuRebuild, L"Rebuild the game");
+  AppendMenuW(m, MF_STRING | (data ? 0 : MF_GRAYED), kMenuOpenLog, L"Open the setup log");
+  RECT r{};
+  GetWindowRect(item(kMore), &r);
+  TrackPopupMenu(m, TPM_LEFTALIGN | TPM_BOTTOMALIGN | TPM_RIGHTBUTTON, r.left, r.top, 0, g_wnd, nullptr);
+  DestroyMenu(m);  // its submenus too
+}
+
+void start_setup() {
+  g_note.clear();
+  g_setup.start(g_cfg, [] { PostMessageW(g_wnd, WM_SETUP, 0, 0); });
+  update_buttons();
 }
 
 void on_setup_update() {
   SetupView v = g_setup.view();
-  for (const auto& l : v.lines) add_log_line(l);
   SendMessageW(item(kProgress), PBM_SETPOS, WPARAM(int(v.fraction * 1000)), 0);
-  std::string status = v.status;
   size_t done = 0;
   for (const auto& s : v.steps) done += s.state == StepState::Done || s.state == StepState::Skipped;
-  if (v.running) status = acfa::strprintf("Step %zu of %zu: ", std::min(done + 1, v.steps.size()), v.steps.size()) + status;
-  if (v.finished && !v.ok) status = v.cancelled ? "Cancelled. Prepare and build continues where it stopped." : v.error;
-  if (v.finished && v.ok) status = "Ready to play.";
-  set_text(kStatus, widen(status));
+  if (v.running) set_text(kStatus, widen(acfa::strprintf("Step %zu of %zu: ", std::min(done + 1, v.steps.size()), v.steps.size()) + v.status));
   if (v.finished) {
-    update_space();
+    if (!v.ok) g_note = v.cancelled ? L"Cancelled. Set up continues where it stopped." : widen(v.error) + L" (More > Open the setup log)";
     update_buttons();
     if (v.ok) FlashWindow(g_wnd, TRUE);
   }
 }
 
-Verdict g_verdicts[kChecks];
+// The check results: one line per folder (update_buttons adds how to get missing files).
+void show_checks() {
+  Status d, m, u;
+  {
+    std::lock_guard lk(g_check_mu);
+    d = g_disc_check;
+    m = g_files_check;
+    u = g_update_check;
+  }
+  set_text(kDiscState, widen(d.text));
+  std::string files = m.text;
+  if (m.verdict == Verdict::Ok && u.verdict == Verdict::Ok) files += ", " + u.text;
+  if (m.verdict == Verdict::Ok && !u.text.empty() && u.verdict != Verdict::Ok) files += "; " + u.text;
+  set_text(kFilesState, widen(files));
+  for (int id : {kDiscState, kFilesState}) InvalidateRect(item(id), nullptr, TRUE);
+}
+
+Verdict verdict_of(int id) {
+  std::lock_guard lk(g_check_mu);
+  if (!g_checked) return Verdict::Empty;
+  return id == kDiscState ? g_disc_check.verdict : g_files_check.verdict;
+}
 COLORREF verdict_color(Verdict v) {
   return v == Verdict::Ok ? RGB(0, 120, 40) : v == Verdict::Bad ? RGB(190, 30, 30) : GetSysColor(COLOR_GRAYTEXT);
 }
@@ -699,165 +716,160 @@ LRESULT CALLBACK wndproc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
   switch (msg) {
     case WM_COMMAND: {
       int id = LOWORD(wp), code = HIWORD(wp);
-      if (code == EN_KILLFOCUS && ((id >= kDiscEdit && id <= kRpcs3Edit) || id == kDataEdit)) {
-        refresh_paths_from_ui();
-        if (id == kDataEdit) load_settings_controls();
+      if (code == EN_KILLFOCUS && (id == kDiscEdit || id == kFilesEdit)) {
+        if (get_text(id) != (id == kDiscEdit ? g_cfg.disc : g_cfg.files).wstring()) refresh_paths_from_ui();
         return 0;
       }
-      if (code == CBN_SELCHANGE && id == kPreset) {
-        apply_preset(int(SendMessageW(item(kPreset), CB_GETCURSEL, 0, 0)));
-        SendMessageW(item(kPreset), CB_SETCURSEL, 0, 0);
-        return 0;
-      }
-      if (code == CBN_SELCHANGE && (id == kFps || id == kMode || id == kResolution || id == kScale || id == kMonitor)) {
+      if (code == CBN_SELCHANGE && (id == kFps || id == kMode || id == kResolution)) {
         save_setting(id);
+        update_buttons();
         return 0;
       }
-      if (code != BN_CLICKED) break;
+      if (code != BN_CLICKED && lp != 0) break;  // menu items arrive with lp 0
+      if (id >= kMenuScale && id < kMenuScale + int(g_scale_items.size())) {
+        int pct = g_scale_items[size_t(id - kMenuScale)];
+        edit_settings([&](acfa::Ini& ini) { ini.set("display", "render_scale", std::to_string(pct)); });
+        return 0;
+      }
+      if (id >= kMenuMonitor && id < kMenuMonitor + int(g_monitor_items.size())) {
+        const MonitorItem& mi = g_monitor_items[size_t(id - kMenuMonitor)];
+        acfa::settings::Display d = read_display();
+        d.monitor = mi.primary ? "" : narrow(mi.device);
+        d.fs_width = d.fs_height = d.fs_hz = 0;  // that monitor's desktop mode
+        edit_settings([&](acfa::Ini& ini) {
+          ini.set("display", "monitor", d.monitor);
+          ini.set("display", "fullscreen_mode", acfa::settings::fullscreen_text(d));
+        });
+        fill_resolutions(d);
+        return 0;
+      }
+      if (id >= kMenuPreset && id < kMenuPreset + int(std::size(kPresets))) {
+        const Preset& p = kPresets[id - kMenuPreset];
+        if (edit_settings([&](acfa::Ini& ini) {
+              ini.set("display", "fps", p.fps);
+              ini.set("display", "render_scale", std::to_string(p.render_scale));
+            }))
+          load_settings_controls();
+        return 0;
+      }
       switch (id) {
         case kDiscBrowse: {
-          fs::path p = pick(true, L"Disc folder of ARMORED CORE for Answer (contains PS3_GAME)", g_cfg.disc, nullptr, nullptr);
-          if (p.empty()) break;
-          set_text(kDiscEdit, p.wstring());
-          refresh_paths_from_ui();
+          fs::path p = pick_folder(L"The game's folder (it contains PS3_GAME)", g_cfg.disc);
+          if (!p.empty()) set_text(kDiscEdit, p.wstring()), refresh_paths_from_ui();
           break;
         }
-        case kRpcs3Browse: {
-          fs::path p = pick(true, L"RPCS3's folder (contains rpcs3.exe and dev_flash), or a folder with the decrypted files", g_cfg.rpcs3,
-                            nullptr, nullptr);
-          if (!p.empty()) set_text(kRpcs3Edit, p.wstring()), refresh_paths_from_ui();
+        case kFilesBrowse: {
+          fs::path p = pick_folder(L"The folder with the decrypted files", g_cfg.files.empty() ? g_cfg.disc : g_cfg.files);
+          if (!p.empty()) set_text(kFilesEdit, p.wstring()), refresh_paths_from_ui();
           break;
         }
-        case kHelp: {
-          Found f;
-          {
-            std::lock_guard lk(g_check_mu);
-            f = g_found;
-          }
-          MessageBoxW(g_wnd, decrypt_help(g_cfg.disc, g_cfg.rpcs3, f).c_str(), L"How to decrypt the game files", MB_ICONINFORMATION);
+        case kHelp:
+          MessageBoxW(g_wnd, files_help().c_str(), L"The files the port needs", MB_ICONINFORMATION);
           break;
-        }
-        case kDataBrowse: {
-          fs::path p = pick(true, L"Install folder (tools, prepared files, build, saves)", g_cfg.data, nullptr, nullptr);
-          if (p.empty()) break;
-          if (!writable(p)) {
-            MessageBoxW(g_wnd, L"This folder cannot be written. Choose another one.", L"ARMORED CORE for Answer", MB_ICONWARNING);
-            break;
-          }
-          set_text(kDataEdit, p.wstring());
-          refresh_paths_from_ui();
-          load_settings_controls();
-          break;
-        }
         case kPrepare:
-          refresh_paths_from_ui();
-          SendMessageW(item(kLog), LB_RESETCONTENT, 0, 0);
-          g_setup.start(g_cfg, [] { PostMessageW(g_wnd, WM_SETUP, 0, 0); });
-          update_buttons();
+          if (IsWindowEnabled(item(kPrepare))) start_setup();
           break;
         case kCancel:
           g_setup.cancel();
           break;
-        case kOpenLog: {
+        case kMore:
+          more_menu();
+          break;
+        case kPlay:
+          if (IsWindowEnabled(item(kPlay))) play(false);
+          break;
+        case kMenuSafePlay:
+          play(true);
+          break;
+        case kMenuRebuild:
+          start_setup();
+          break;
+        case kMenuOpenLog: {
           fs::path log = g_cfg.data / "launcher.log";
           if (fs::exists(log)) ShellExecuteW(g_wnd, L"open", log.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
           break;
         }
-        case kResetSettings: {
+        case kMenuInstall: {
+          fs::path p = pick_folder(L"Install folder (tools, prepared files, build)", g_cfg.data);
+          if (p.empty()) break;
+          if (!writable(p)) {
+            MessageBoxW(g_wnd, L"This folder cannot be written. Choose another one.", kTitle, MB_ICONWARNING);
+            break;
+          }
+          g_cfg.data = p;
+          save_paths();
+          move_to_user_dir();
+          load_settings_controls();
+          update_buttons();
+          break;
+        }
+        case kMenuResetSettings: {
           if (MessageBoxW(g_wnd,
                           L"Reset every setting (display, frame rate, mouse, key bindings) to its default?\n"
                           L"The current file is kept as settings.ini.bak.",
-                          L"ARMORED CORE for Answer", MB_YESNO | MB_ICONQUESTION) != IDYES)
+                          kTitle, MB_YESNO | MB_ICONQUESTION) != IDYES)
             break;
           std::error_code ec;
           fs::path bak = settings_path();
           bak += ".bak";
           fs::rename(settings_path(), bak, ec);
           load_settings_controls();  // creates the file with the defaults
-          add_log_line("Settings reset to the defaults (the previous file: " + narrow(bak.wstring()) + ").");
+          update_buttons();
           break;
         }
-        case kSavesOpen: {
+        case kMenuSavesOpen: {
           std::error_code ec;
           fs::create_directories(saves_dir(), ec);
           ShellExecuteW(g_wnd, L"explore", saves_dir().c_str(), nullptr, nullptr, SW_SHOWNORMAL);
           break;
         }
-        case kSavesBackup: {
+        case kMenuSavesBackup: {
           fs::path to = backups_dir() / (L"saves-" + stamp_now());
           size_t n = copy_saves(saves_dir(), to);
           std::wstring msg = n ? L"Saves backed up to\n" + to.wstring() : L"There are no saves yet.";
-          MessageBoxW(g_wnd, msg.c_str(), L"ARMORED CORE for Answer", MB_ICONINFORMATION);
+          MessageBoxW(g_wnd, msg.c_str(), kTitle, MB_ICONINFORMATION);
           break;
         }
-        case kSavesRestore: {
-          fs::path from = pick(true, L"Backup to restore (a saves-... folder)", backups_dir(), nullptr, nullptr);
+        case kMenuSavesRestore: {
+          fs::path from = pick_folder(L"Backup to restore (a saves-... folder)", backups_dir());
           if (from.empty()) break;
           std::error_code ec;
           bool any = false;
           for (const auto& e : fs::directory_iterator(from, ec))
             any |= e.is_directory() && e.path().filename().wstring().rfind(L"BLUS30187", 0) == 0;
           if (!any) {
-            MessageBoxW(g_wnd, L"No saves of this game in that folder.", L"ARMORED CORE for Answer", MB_ICONWARNING);
+            MessageBoxW(g_wnd, L"No saves of this game in that folder.", kTitle, MB_ICONWARNING);
             break;
           }
-          if (MessageBoxW(g_wnd, L"Replace the current saves with this backup?\nThe current saves are backed up first.", L"ARMORED CORE for Answer",
+          if (MessageBoxW(g_wnd, L"Replace the current saves with this backup?\nThe current saves are backed up first.", kTitle,
                           MB_YESNO | MB_ICONQUESTION) != IDYES)
             break;
           copy_saves(saves_dir(), backups_dir() / (L"saves-before-restore-" + stamp_now()));
           for (const auto& e : fs::directory_iterator(saves_dir(), ec))
             if (e.is_directory() && e.path().filename().wstring().rfind(L"BLUS30187", 0) == 0) fs::remove_all(e.path(), ec);
           size_t n = copy_saves(from, saves_dir());
-          MessageBoxW(g_wnd, (std::to_wstring(n) + L" save(s) restored.").c_str(), L"ARMORED CORE for Answer", MB_ICONINFORMATION);
+          MessageBoxW(g_wnd, (std::to_wstring(n) + L" save(s) restored.").c_str(), kTitle, MB_ICONINFORMATION);
           break;
         }
-        case kPlay:
-          if (IsWindowEnabled(item(kPlay))) play();
-          break;
       }
       return 0;
     }
     case WM_SETUP:
       on_setup_update();
       return 0;
-    case WM_CHECKED: {
+    case WM_CHECKED:
       if (int(wp) != g_check_gen) return 0;
-      Status checks[kChecks];
-      {
-        std::lock_guard lk(g_check_mu);
-        std::copy(std::begin(g_checks), std::end(g_checks), checks);
-      }
-      std::string details;
-      for (int i = 0; i < kChecks; ++i) {
-        g_verdicts[i] = checks[i].verdict;
-        set_text(kDiscState + i, widen(checks[i].text));
-        InvalidateRect(item(kDiscState + i), nullptr, TRUE);
-        details += checks[i].details;
-      }
-      // Every problem in full, below the one-line summaries (when no setup output is shown).
-      static std::string shown;
-      if (!g_setup.running() && !details.empty() && details != shown) {
-        add_log_line("Game files:");
-        for (size_t a = 0; a < details.size();) {
-          size_t b = details.find('\n', a);
-          add_log_line("  " + details.substr(a, b == std::string::npos ? std::string::npos : b - a));
-          a = b == std::string::npos ? details.size() : b + 1;
-        }
-      }
-      shown = details;
+      show_checks();
       update_buttons();
       return 0;
-    }
     case WM_GAME_EXIT: {
       if (g_game) CloseHandle(g_game);
       g_game = nullptr;
       ShowWindow(g_wnd, SW_RESTORE);
       load_settings_controls();  // PC SETTINGS may have changed them
-      update_buttons();
       if (wp != 0) {
         // The error as the game logged it (logs carry no personal data: they can be shared).
         fs::path log = newest_run_log();
-        set_text(kStatus, L"The game stopped with an error. Log: " + log.wstring());
         std::ifstream in(log);
         std::string line, error;
         while (std::getline(in, line))
@@ -865,16 +877,16 @@ LRESULT CALLBACK wndproc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
             error = line.substr(line.find("] ") + 2);
             break;
           }
-        add_log_line("The game stopped with an error" + (error.empty() ? std::string(".") : ": " + error));
-        add_log_line("Its log (no personal data in it, it can be shared as it is): " + narrow(log.wstring()));
+        g_note = L"The game stopped with an error" + (error.empty() ? std::wstring(L".") : L": " + widen(error)) + L" Log: " + log.wstring();
       }
+      update_buttons();
       return 0;
     }
     case WM_CTLCOLORSTATIC: {
       int id = GetDlgCtrlID(HWND(lp));
       HDC dc = HDC(wp);
       SetBkMode(dc, TRANSPARENT);
-      if (id >= kDiscState && id <= kUpdateState) SetTextColor(dc, verdict_color(g_verdicts[id - kDiscState]));
+      if (id == kDiscState || id == kFilesState) SetTextColor(dc, verdict_color(verdict_of(id)));
       return LRESULT(GetSysColorBrush(COLOR_WINDOW));
     }
     case WM_DPICHANGED: {
@@ -886,9 +898,7 @@ LRESULT CALLBACK wndproc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
       return 0;
     }
     case WM_CLOSE:
-      if (g_setup.running() &&
-          MessageBoxW(h, L"Setup is running. Stop it and close?", L"ARMORED CORE for Answer", MB_YESNO | MB_ICONQUESTION) != IDYES)
-        return 0;
+      if (g_setup.running() && MessageBoxW(h, L"Setup is running. Stop it and close?", kTitle, MB_YESNO | MB_ICONQUESTION) != IDYES) return 0;
       g_setup.cancel();
       DestroyWindow(h);
       return 0;
@@ -901,7 +911,7 @@ LRESULT CALLBACK wndproc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
 
 }  // namespace
 
-int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int show) {
+int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int show_cmd) {
   g_inst = inst;
   HANDLE single = CreateMutexW(nullptr, TRUE, L"Local\\ACFA-Port-Launcher");
   if (GetLastError() == ERROR_ALREADY_EXISTS) {
@@ -913,8 +923,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int show) {
   InitCommonControlsEx(&icc);
   g_src = find_sources();
   if (g_src.empty()) {
-    MessageBoxW(nullptr, L"Put ACFA-Launcher.exe in the port's folder (the one with CMakeLists.txt, data and src).", L"ARMORED CORE for Answer",
-                MB_ICONERROR);
+    MessageBoxW(nullptr, L"Put ACFA-Launcher.exe in the port's folder (the one with CMakeLists.txt, data and src).", kTitle, MB_ICONERROR);
     return 1;
   }
   // The launcher's own record of the chosen locations: beside it when that folder is writable.
@@ -951,13 +960,12 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int show) {
   create_controls();
   make_fonts();
   layout();
-  if (g_cfg.rpcs3.empty()) g_cfg.rpcs3 = find_rpcs3();
   set_text(kDiscEdit, g_cfg.disc.wstring());
-  set_text(kRpcs3Edit, g_cfg.rpcs3.wstring());
-  set_text(kDataEdit, g_cfg.data.wstring());
+  set_text(kFilesEdit, g_cfg.files.wstring());
   refresh_paths_from_ui();
   load_settings_controls();
-  ShowWindow(g_wnd, show);
+  update_buttons();
+  ShowWindow(g_wnd, show_cmd);
   MSG m;
   while (GetMessageW(&m, nullptr, 0, 0) > 0) {
     if (IsDialogMessageW(g_wnd, &m)) continue;

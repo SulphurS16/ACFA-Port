@@ -1,5 +1,5 @@
-// Keyless preparation, the player path: files the player decrypted with RPCS3 (Utilities > Decrypt
-// PS3 Binaries) and plain files from RPCS3's folders, each verified by SHA-256 against
+// Keyless preparation, the player path: files the player decrypted (for example with RPCS3's
+// Utilities > Decrypt PS3 Binaries) and the plain files that come with them, each verified by SHA-256 against
 // common/known_inputs.h, become the prepared inputs of the recompilers and the runtime:
 // eboot.elf, lle/<module>.elf (relocated to their fixed slots), the dev_flash file the game reads
 // and, when given, the update's game data. Nothing is decrypted here.
@@ -93,7 +93,8 @@ std::string import_inputs(const ImportInputs& in, const fs::path& out, const fs:
   // The update's game data (optional): only the given data is installed.
   fs::remove_all(out / "update", ec);
   if (!in.game_data.empty()) {
-    fs::path reg = in.game_data / "USRDIR" / ki::kRegulation.name;
+    fs::path reg = in.game_data / "USRDIR" / ki::kRegulation.name;  // the update's folder
+    if (!fs::is_regular_file(reg, ec)) reg = in.game_data / ki::kRegulation.name;  // or regulation.bin on its own
     std::string rh = verify(reg, ki::kRegulation, "the update's regulation.bin");
     fs::path dst = out / "update" / ki::kUpdateContentId;
     copy_verified(reg, dst / "USRDIR" / ki::kRegulation.name);

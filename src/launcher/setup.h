@@ -22,7 +22,7 @@ struct SetupConfig {
   fs::path src;   // the port's sources (CMakeLists.txt, data\)
   fs::path data;  // install folder: tools, prepared data, build, saves, settings
   fs::path disc;   // the game's disc folder (read in place; EBOOT.elf next to EBOOT.BIN)
-  fs::path rpcs3;  // RPCS3's folder, or a folder with the decrypted .prx files and flashATRAC.pic
+  fs::path files;  // the folder with the decrypted files (inputs.h: in it or in folders below it)
 };
 
 enum class StepState { Waiting, Running, Done, Skipped, Failed };
@@ -52,7 +52,7 @@ class Setup {
   // Whether everything is built from these inputs (Play possible).
   static bool ready(const SetupConfig& c);
   static fs::path game_exe(const SetupConfig& c);
-  // The dev_flash folder the game reads (the one file it needs, imported from RPCS3's folder).
+  // The dev_flash folder the game reads (the one file it needs, flashATRAC.pic, imported).
   static fs::path flash_dir(const SetupConfig& c);
   // Disk space the setup still needs in the install folder (bytes, estimate).
   static unsigned long long space_needed(const SetupConfig& c);

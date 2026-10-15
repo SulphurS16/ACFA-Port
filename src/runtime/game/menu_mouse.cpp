@@ -324,7 +324,7 @@ void frame(Ctx& ctx) {
     if (c != was) LOG_I("input", "input context %s", c == InputContext::Menu ? "menu" : c == InputContext::Gameplay ? "gameplay" : "screen");
     // Mouse look takes the mouse in gameplay; menus give it back.
     if (c == InputContext::Menu && was == InputContext::Gameplay) gpu::window_request_mouse_capture(false);
-    else if (c == InputContext::Gameplay && mouse && !input_isolated()) gpu::window_request_mouse_capture(true);
+    else if (c == InputContext::Gameplay) gpu::window_request_mouse_capture(true);
     gpu::window_refresh_cursor();
   }
   std::deque<Event> events;
@@ -415,6 +415,8 @@ void menu_mouse_wheel(int notches) {
 }
 
 bool menu_cursor_visible() { return g_cursor.load(std::memory_order_relaxed); }
+
+bool controller_used_last() { return g_pad_at.load() > g_mouse_at.load(); }
 
 void note_pad_input() {
   s64 t = now_ms();

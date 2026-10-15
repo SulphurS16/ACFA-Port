@@ -39,8 +39,13 @@ float f32_of_bits(u32 bits) {
 // stack (vtable 0x1226c30); AI-driven units do not use that class. The operator code differs by
 // state: the reference saw the calls from 0x6eee98 (return sites 0x6ef030 turn, 0x6ef110 /
 // 0x6ef77c pitch); with this project's saves (Line Ark, Mimir) they come from 0x6e2198 (turn
-// 0x6e22ec) and 0x6edef4 (pitch). The view class identifies the player in every variant.
+// 0x6e22ec) and 0x6edef4 (pitch). The view class identifies the player in every variant. The
+// tutorial uses a second view class (vtable 0x1226b70, run 20261015-120215): its turn setter
+// (slot 6, 0x70ed88) and pitch setter (slot 8, 0x70ebd0) are the mission ones plus a flag for the
+// tutorial's steps. These two are the only classes with the view's pitch thunk (slot 9) in the
+// executable.
 constexpr u32 kPlayerViewVtable = 0x01226c30;
+constexpr u32 kTutorialViewVtable = 0x01226b70;
 constexpr u32 kPlayerTurnSetSite = 0x006ef030;
 // Sensitivity 1.0: 1000 counts per second turn the AC at its full rate (value 1.0), i.e. one count
 // turns 1/1000 of the AC's full rate times one second (0.075 deg for an AC turning 75 deg/s).
@@ -69,6 +74,11 @@ std::atomic<u32> g_turn_input{0};    // last player turn input seen (diagnostics
 std::atomic<u32> g_player_state{0};  // the player's virtual pad state (written through the view)
 std::atomic<u32> g_look{0};          // the player AC's look control object (diagnostics)
 LARGE_INTEGER g_last_turn{};       // time of the last mouse look computation
+
+bool is_player_view(u32 view) {
+  u32 vt = view ? r32(view) : 0;
+  return vt == kPlayerViewVtable || vt == kTutorialViewVtable;
+}
 
 bool is_player_input(u32 input) {
   u32 state = g_player_state.load(std::memory_order_relaxed);
@@ -123,11 +133,11 @@ void mouse_look_frame() {
 
 }  // namespace
 
-// Turn command setter (0x70eb30: r3 input object, f1 value). For the player's input object the
-// mouse turn of this frame is added to the stick's value.
+// Turn command setters (0x70eb30, the tutorial's 0x70ed88: r3 view, f1 value). For the player's
+// view the mouse turn of this frame is added to the stick's value.
 void hook_input_turn_set(Ctx& ctx, void (*orig)(Ctx&)) {
   u32 input = u32(ctx.r[3]);
-  if (u32(ctx.lr) == kPlayerTurnSetSite || (input && r32(input) == kPlayerViewVtable)) {
+  if (u32(ctx.lr) == kPlayerTurnSetSite || is_player_view(input)) {
     static int logged = 0;
     if (g_turn_input.exchange(input) != input && logged++ < 4)
       LOG_I("input", "mouse look: player turn command set through 0x%08x (vtable %08x), pad state 0x%08x", input,
@@ -145,8 +155,7 @@ void hook_input_turn_set(Ctx& ctx, void (*orig)(Ctx&)) {
 void hook_input_pitch_set(Ctx& ctx, void (*orig)(Ctx&)) {
   u32 lr = u32(ctx.lr);
   u32 view = u32(ctx.r[3]);
-  if (lr == kPlayerPitchSetSites[0] || lr == kPlayerPitchSetSites[1] ||
-      (view && r32(view) == kPlayerViewVtable)) {
+  if (lr == kPlayerPitchSetSites[0] || lr == kPlayerPitchSetSites[1] || is_player_view(view)) {
     float stick = float(ctx.f[1]);
     if (g_mouse_pitch.value != 0) ctx.f[1] = double(std::clamp(stick + g_mouse_pitch.value, -1.0f, 1.0f));
   }
@@ -160,7 +169,7 @@ void hook_look_update(Ctx& ctx, void (*orig)(Ctx&)) {
   u32 look = u32(ctx.r[3]), input = u32(ctx.r[4]);
   if (is_player_input(input) && g_look.exchange(look) != look) {
     static int logged = 0;
-    if (logged++ < 4) LOG_I("input", "player look control 0x%08x (input 0x%08x), pitch state at 0x%08x", look, input, look + 48);
+    if (logged++ < 400) LOG_I("input", "player look control 0x%08x (input 0x%08x), pitch state at 0x%08x", look, input, look + 48);
   }
   orig(ctx);
 }

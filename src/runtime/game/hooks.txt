@@ -7,7 +7,8 @@
 0x00ef9ff0 ms_bank_remove          # sound bank removal
 0x0070b548 input_pitch_set         # look (pitch) command setter thunk (view slot 9 -> 0x70e960)
 0x007a2fb8 look_update             # an AC's look control: turn (0x7a2940), then pitch (0x7a22d0)
-0x0070eb30 input_turn_set          # turn command setter (r3 input, f1 value)
+0x0070eb30 input_turn_set          # turn command setter (view slot 6; r3 view, f1 value)
+0x0070ed88 input_turn_set          # the tutorial view's turn setter (0x70eb30 plus its step flag)
 0x0008ad48 menu_frame              # every frame: pads to key messages (menu mouse: probe, hover; menu_mouse.cpp)
 0x002d9248 menu_dispatch           # dialog manager: a key message to its top dialog (stops the menu mouse probe)
 0x002d9008 menu_dispatch_sys       # the system dialog manager's (same)

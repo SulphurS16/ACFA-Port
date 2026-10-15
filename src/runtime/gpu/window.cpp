@@ -27,19 +27,25 @@ bool g_alive = false;
 DWORD g_thread = 0;
 std::atomic<bool> g_mouse_captured{false};
 std::atomic<bool> g_fullscreen{false};  // borderless fullscreen (set_fullscreen)
+// F1 gave the mouse back in gameplay: mouse look waits for a click into the game, F1 again or the
+// next stretch of gameplay (window thread).
+bool g_user_released = false;
 
 void clip_cursor() {
+  if (input_isolated()) return;  // test runs leave the real cursor alone
   RECT r;
   GetClientRect(g_hwnd, &r);
   MapWindowPoints(g_hwnd, nullptr, reinterpret_cast<POINT*>(&r), 2);
   ClipCursor(&r);
 }
 
-// Mouse capture for mouse look: the cursor is hidden and confined to the client area.
+// Mouse capture for mouse look: the cursor is hidden and confined to the client area (isolated
+// test runs keep only the state: the real cursor stays as it is).
 void set_mouse_capture(bool on) {
   if (on == g_mouse_captured) return;
   g_mouse_captured = on;
-  if (on) {
+  if (input_isolated()) {
+  } else if (on) {
     clip_cursor();
     while (ShowCursor(FALSE) >= 0) {
     }
@@ -124,7 +130,7 @@ HCURSOR make_menu_cursor(UINT dpi) {
 // The cursor over the client area: hidden while mouse look has it, the menu cursor in the game's
 // menus, otherwise hidden when the window fills the screen and the arrow in a window.
 HCURSOR client_cursor() {
-  if (g_mouse_captured) return nullptr;
+  if (g_mouse_captured && !input_isolated()) return nullptr;
   if (game::menu_cursor_visible() || ui::is_open()) {
     static HCURSOR cur = nullptr;
     static UINT cur_dpi = 0;
@@ -264,6 +270,28 @@ void set_client_size(int w, int h) {
   if (g_mouse_captured) clip_cursor();
 }
 
+// Mouse look takes the mouse in gameplay while the window is in front, unless F1 gave it back or
+// a controller was used after the mouse (window thread).
+void capture_for_gameplay() {
+  if (g_mouse_captured || g_user_released || ui::is_open() || game::input_context() != game::InputContext::Gameplay ||
+      game::controller_used_last())
+    return;
+  if (input_isolated() || GetForegroundWindow() == g_hwnd) set_mouse_capture(true);
+}
+
+// Focus changes (Alt+Tab, a click into another window): losing the focus gives the mouse back,
+// getting it again in gameplay takes it for mouse look without a click.
+void on_focus(bool focused) {
+  LOG_I("input", "window focus %s", focused ? "back" : "lost");
+  if (focused) {
+    input_focus(true);
+    capture_for_gameplay();
+  } else {
+    set_mouse_capture(false);
+    input_focus(false);
+  }
+}
+
 struct Call {
   const std::function<void()>* fn;
   bool done = false;
@@ -298,6 +326,7 @@ LRESULT CALLBACK wndproc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
         bool shown = game::menu_cursor_visible();
         game::menu_mouse_moved();
         if (!shown && game::input_context() == game::InputContext::Menu) SetCursor(client_cursor());
+        capture_for_gameplay();  // the mouse moved in gameplay after a controller: mouse look takes it
       }
       last = lp;
       break;
@@ -315,7 +344,12 @@ LRESULT CALLBACK wndproc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
       }
       break;
     case WM_APP + 3:  // window_request_mouse_capture
-      if (!input_isolated() && (!wp || GetForegroundWindow() == h)) set_mouse_capture(wp != 0);
+      if (wp) {
+        g_user_released = false;  // a new stretch of gameplay (a mission starts, the pause menu closes)
+        capture_for_gameplay();
+      } else {
+        set_mouse_capture(false);
+      }
       refresh_cursor();
       return 0;
     case WM_APP + 4:  // window_refresh_cursor
@@ -350,6 +384,7 @@ LRESULT CALLBACK wndproc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
           return msg == WM_XBUTTONDOWN || msg == WM_XBUTTONUP ? TRUE : 0;
         }
         if (msg == WM_LBUTTONDOWN) {
+          g_user_released = false;
           set_mouse_capture(true);
           return 0;
         }
@@ -392,7 +427,10 @@ LRESULT CALLBACK wndproc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
         return 0;  // not passed to the game's key bindings
       }
       if (wp == VK_F1 && !input_isolated()) {  // releases (or takes) the mouse
-        if (!repeat && !overlay) set_mouse_capture(!g_mouse_captured);
+        if (!repeat && !overlay) {
+          g_user_released = g_mouse_captured;  // given back until a click, F1 again or the next gameplay
+          set_mouse_capture(!g_mouse_captured);
+        }
         return 0;
       }
       if (overlay) {
@@ -412,11 +450,8 @@ LRESULT CALLBACK wndproc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
     case WM_SYSCHAR:
       return 0;  // no menu beep for Alt+key
     case WM_KILLFOCUS:
-      set_mouse_capture(false);
-      input_focus(false);
-      return 0;
     case WM_SETFOCUS:
-      input_focus(true);
+      if (!input_isolated()) on_focus(msg == WM_SETFOCUS);  // test runs: only the control file's "focus" lines
       return 0;
   }
   return DefWindowProcW(h, msg, wp, lp);

@@ -74,7 +74,7 @@ std::string content_hash(const fs::path& p) {
 }
 
 fs::path prepared(const SetupConfig& c) { return c.data / "game" / "BLUS30187"; }
-// The one dev_flash file the game reads (flashATRAC.pic), imported from RPCS3's folder.
+// The one dev_flash file the game reads (flashATRAC.pic), imported from the player's files.
 fs::path flash(const SetupConfig& c) { return c.data / "game" / "dev_flash"; }
 fs::path build_dir(const SetupConfig& c) { return c.data / "build"; }
 fs::path tools_dir(const SetupConfig& c) { return c.data / "tools"; }
@@ -82,22 +82,26 @@ fs::path tools_dir(const SetupConfig& c) { return c.data / "tools"; }
 // (sources elsewhere would repeat the whole install path in every object path).
 fs::path gen_dir(const SetupConfig& c) { return build_dir(c) / "gen"; }
 
-// The update's game data is imported only when it is the verified 01.35.
+// The update's game data is imported only when it is the verified 01.35: the folder of its
+// regulation.bin, or the update's folder when that is its USRDIR (acfa-prep import --game-data).
 fs::path verified_game_data(const Found& f) {
-  if (f.game_data.empty()) return {};
-  return content_hash(f.game_data / "USRDIR" / ki::kRegulation.name) == ki::kRegulation.sha256 ? f.game_data : fs::path();
+  if (f.regulation.empty() || content_hash(f.regulation) != ki::kRegulation.sha256) return {};
+  fs::path dir = f.regulation.parent_path();
+  std::wstring name = dir.filename().wstring();
+  for (auto& ch : name) ch = wchar_t(towupper(ch));
+  return name == L"USRDIR" ? dir.parent_path() : dir;
 }
 
 // Each step's record: what it was made from. A step is redone when its record differs.
 std::string stamp(const SetupConfig& c, size_t step) {
   switch (step) {
     case kImport: {
-      Found f = find_files(c.disc, c.rpcs3);
+      Found f = find_files(c.disc, c.files);
       std::string s = "disc " + c.disc.generic_string() + "\neboot " + file_stamp(f.eboot_elf) + "\n";
       for (int i = 0; i < ki::kModuleCount; ++i) s += std::string(ki::kModules[i]) + " " + file_stamp(f.modules_dir / ki::module(ki::kModules[i])->name) + "\n";
       fs::path gd = verified_game_data(f);
       return s + "flash " + file_stamp(f.modules_dir / ki::kFlashAtrac.name) + "\nupdate " +
-             (gd.empty() ? std::string("none") : file_stamp(gd / "USRDIR" / ki::kRegulation.name));
+             (gd.empty() ? std::string("none") : file_stamp(f.regulation));
     }
     case kRecompile:
       return "prepared " + content_hash(prepared(c) / "manifest.txt") + "\nlle " + content_hash(prepared(c) / "lle" / "manifest.txt") +
@@ -433,7 +437,7 @@ void Setup::run(SetupConfig c) {
         {kImport,
          [&] {
            // The player's decrypted files, verified by SHA-256 (acfa-prep reports any mismatch).
-           Found f = find_files(c.disc, c.rpcs3);
+           Found f = find_files(c.disc, c.files);
            std::vector<std::wstring> a = {L"import",       L"--disc",        w(c.disc),
                                           L"--eboot",      w(f.eboot_elf),   L"--modules-dir",
                                           w(f.modules_dir), L"--flash-file", w(f.modules_dir / ki::kFlashAtrac.name),
