@@ -36,6 +36,7 @@ std::atomic<int> g_excl_request{-1};  // -1 none, 0 leave, 1 enter
 std::atomic<u32> g_excl_w{0}, g_excl_h{0}, g_excl_hz{0};
 std::atomic<bool> g_exclusive{false};
 bool g_excl_wanted = false;  // presenting thread: the mode is fullscreen (re-entered after Alt+Tab)
+bool g_excl_need_back = false;  // presenting thread: lost while in front; entered again only after the window was in the back
 std::chrono::steady_clock::time_point g_excl_retry;
 
 const char* kBlitHlsl = R"(
@@ -279,16 +280,27 @@ void update_exclusive() {
     PostMessageW(g_hwnd, WM_APP + 1, 0, 0);  // the window applies its own mode (window.cpp)
   } else if (req == 1) {
     g_excl_wanted = true;
+    g_excl_need_back = false;
     if (g_exclusive) leave_exclusive();  // another display mode
     enter_exclusive();
   } else if (g_excl_wanted) {
     BOOL fs = FALSE;
-    if (g_exclusive && SUCCEEDED(g_dev.swap->GetFullscreenState(&fs, nullptr)) && !fs) {  // DXGI left it (Alt+Tab)
+    bool front = GetForegroundWindow() == g_hwnd;
+    if (g_exclusive && SUCCEEDED(g_dev.swap->GetFullscreenState(&fs, nullptr)) && !fs) {  // DXGI left it
       g_exclusive = false;
       display::set_exclusive(false);
-      LOG_I("gpu", "exclusive fullscreen lost; entered again when the window is in front");
+      // Alt+Tab: the window is in the back now and enters again when it returns to the front.
+      // Lost while still in front, the display itself went away (run 20261016-040327: the
+      // monitor dropped off 0.3 s after the switch and the output fell back to 1024x768; entering
+      // again every half second switched that output's mode 138 times): entered again only after
+      // the window has been in the back and returns, or when the player chooses the mode again.
+      g_excl_need_back = front;
+      LOG_I("gpu", "exclusive fullscreen lost%s", front ? " while the window was in front (the display changed): entered again after the window "
+                                                         "was in the back and returns, or when the mode is chosen again"
+                                                       : "; entered again when the window is in front");
     }
-    if (!g_exclusive && GetForegroundWindow() == g_hwnd && std::chrono::steady_clock::now() >= g_excl_retry) enter_exclusive();
+    if (!front) g_excl_need_back = false;
+    if (!g_exclusive && front && !g_excl_need_back && std::chrono::steady_clock::now() >= g_excl_retry) enter_exclusive();
   }
 }
 
@@ -360,7 +372,7 @@ void present_texture(ID3D11ShaderResourceView* srv, u32 src_w, u32 src_h) {
     const float black[4] = {0, 0, 0, 1};
     c->ClearRenderTargetView(g_dev.backbuffer_rtv, black);
     draw_to(g_dev.backbuffer_rtv, g_dev.width, g_dev.height, &fit);
-    if (ui::is_open()) {  // PC SETTINGS over the game's frame, at the window's resolution
+    if (ui::screen_up()) {  // PC SETTINGS or a system dialog over the game's frame, at the window's resolution
       ID3D11Texture2D* bb = nullptr;
       g_dev.swap->GetBuffer(0, __uuidof(ID3D11Texture2D), reinterpret_cast<void**>(&bb));
       if (bb) {
@@ -396,7 +408,7 @@ std::vector<PendingCapture> g_captures;
 
 void begin_capture(u32 index) {
   // While PC SETTINGS is open the capture shows the window as composed (the screen included).
-  ID3D11Texture2D* src = ui::is_open() && g_ui_copy ? g_ui_copy : g_last;
+  ID3D11Texture2D* src = ui::screen_up() && g_ui_copy ? g_ui_copy : g_last;
   if (!src || g_captures.size() >= 8) return;
   D3D11_TEXTURE2D_DESC td{};
   src->GetDesc(&td);

@@ -28,10 +28,12 @@
 #include "ppu/ppu_recomp.h"
 #include "runtime/config.h"
 #include "runtime/game/frame_policy.h"
+#include "runtime/gpu/display.h"
 #include "runtime/gpu/window.h"
 #include "runtime/input.h"
 #include "runtime/log.h"
 #include "runtime/memory.h"
+#include "runtime/sysdialog.h"
 #include "runtime/ui/overlay.h"
 
 void f_003e71a0(ppu::Ctx&);  // menu object: tell its parent dialog (r3 object, r4 code)
@@ -50,6 +52,11 @@ constexpr u32 kMgrStack = 4, kMgrDepth = 132, kMgrTable = 268, kMgrTableCount = 
 constexpr u32 kDlgBusy = 72;      // dialog vtable: nonzero while it takes no input
 constexpr u32 kDlgSetFocus = 48;  // dialog vtable: SetFocus(dialog, object)
 constexpr u32 kDlgChildren = 24, kDlgChildCount = 28, kDlgFocus = 128;
+// The dialog's rect {left, top, right, bottom} in the 1280x720 picture (floats; SetRect 0x3dd0b0,
+// MoveTo 0x3de918). Its objects' rects are relative to its top left: full-screen dialogs sit at
+// 0, 0; message boxes (vtable 0x1211410: "Restarting this tutorial.", "Enter pilot name.") are
+// centred (run 20261016-025405).
+constexpr u32 kDlgRect = 136;
 constexpr u32 kObjId = 4;          // -1: an unnamed part
 constexpr u32 kObjRect = 52;       // object vtable: rect (left, top, right, bottom) by hidden pointer
 constexpr u32 kObjFocusable = 56;  // object vtable: focusable
@@ -72,6 +79,7 @@ s64 now_ms() {
 
 std::atomic<int> g_context{int(InputContext::Screen)};
 std::atomic<s64> g_mouse_at{0}, g_pad_at{0};  // last use of each (ms)
+std::atomic<s64> g_key_at{0};                 // last key pressed in a menu (hides the cursor, not mouse look)
 std::atomic<bool> g_cursor{false};             // menu cursor shown (window thread reads)
 
 // Mouse events from the window thread, handled on the game's main thread at its next frame.
@@ -85,6 +93,7 @@ std::deque<Event> g_events;
 struct Press {
   u16 d1, d2;
   s64 at;
+  bool screen_only;  // dropped when due unless the screen still has no menu and is not gameplay
 };
 std::deque<Press> g_presses;
 std::atomic<u16> g_hold{0};  // a direction held for a slider far from the cursor's value
@@ -93,6 +102,14 @@ std::atomic<u16> g_hold{0};  // a direction held for a slider far from the curso
 bool g_probing = false;
 u32 g_probe_dialog = 0;
 u32 g_last_dialog = 0;
+// A menu that takes no keys for a moment stays a menu: CLIENT SELECT routes keys to no dialog for
+// two quick frames (about 7 ms) after each focus change (run 20261016-035810), which hid the
+// cursor for that moment. For kMenuGraceMs after a menu last took keys the context stays a menu
+// (the cursor stays, capture unchanged) and clicks wait for the menu; when no menu comes back
+// they are dropped (not turned into START presses as on screens without a menu).
+constexpr s64 kMenuGraceMs = 150;
+s64 g_menu_seen = 0;
+std::deque<Event> g_waiting;
 int g_last_x = -1, g_last_y = -1;
 struct Drag {
   u32 slider = 0;  // dragged slider (0: none)
@@ -191,6 +208,16 @@ Rect rect_of(Ctx& ctx, u32 obj) {
   call(ctx, vfunc(obj, kObjRect), out, obj);
   return {float(ppu::rf32(out)), float(ppu::rf32(out + 4)), float(ppu::rf32(out + 8)), float(ppu::rf32(out + 12))};
 }
+// The top left of `dialog` in the picture (0, 0 when it is not a sane rect).
+void dialog_origin(u32 dialog, float* x, float* y) {
+  *x = *y = 0;
+  if (!valid(dialog + kDlgRect, 16)) return;
+  float l = ppu::rf32(dialog + kDlgRect), t = ppu::rf32(dialog + kDlgRect + 4);
+  float r = ppu::rf32(dialog + kDlgRect + 8), b = ppu::rf32(dialog + kDlgRect + 12);
+  if (!(l >= 0 && t >= 0 && r > l && b > t && r <= 1281 && b <= 721)) return;
+  *x = l;
+  *y = t;
+}
 bool is_slider(u32 obj) { return valid(obj + kSliderBar + 16) && ppu::r32(obj) == kSliderVtable; }
 Rect slider_bar(u32 s) {
   Rect r{float(ppu::rf32(s + kSliderBar)), float(ppu::rf32(s + kSliderBar + 4)), float(ppu::rf32(s + kSliderBar + 8)),
@@ -263,9 +290,9 @@ bool list_select(Ctx& ctx, u32 list, s32 target) {
   return s32(ppu::r32(list + kListTop)) != top;
 }
 
-void press(u16 d1, u16 d2, s64 at) {
+void press(u16 d1, u16 d2, s64 at, bool screen_only = false) {
   std::lock_guard lk(g_mu);
-  g_presses.push_back({d1, d2, at});
+  g_presses.push_back({d1, d2, at, screen_only});
 }
 
 // The dragged slider follows the cursor: the D-pad held toward the target while it is ten steps
@@ -303,7 +330,7 @@ void drive_slider(float gx) {
 // One frame of the menu mouse on the game's main thread (before the pads become key messages).
 void frame(Ctx& ctx) {
   u32 framework = u32(ctx.r[3]);
-  if (ui::is_open() || !valid(framework)) return;
+  if (ui::is_open() || sysdlg::shown() || !valid(framework)) return;
   // Probe: which dialog takes keys now.
   u32 msg = (u32(ctx.r[1]) - 0x80) & ~15u;
   ppu::w32(msg, kKeyMessage);
@@ -314,17 +341,21 @@ void frame(Ctx& ctx) {
   g_probing = false;
   u32 dialog = g_probe_dialog;
   bool menu = dialog && valid(dialog + kDlgFocus) && ppu::r32(dialog + kDlgFocus) != 0;
-  InputContext c = menu ? InputContext::Menu : mission_running() ? InputContext::Gameplay : InputContext::Screen;
+  s64 now = now_ms();
+  if (menu) g_menu_seen = now;
+  bool grace = !menu && InputContext(g_context.load()) == InputContext::Menu && now - g_menu_seen < kMenuGraceMs;
+  InputContext c = menu || grace ? InputContext::Menu : mission_running() ? InputContext::Gameplay : InputContext::Screen;
   InputContext was = InputContext(g_context.exchange(int(c)));
-  bool mouse = g_mouse_at.load() > g_pad_at.load();
+  bool mouse = g_mouse_at.load() > std::max(g_pad_at.load(), g_key_at.load());
   bool focus = input_has_focus();
   bool show = c == InputContext::Menu && mouse && focus;
-  if (c != was || show != g_cursor.load()) {
+  if (bool before = g_cursor.load(); c != was || show != before) {
     g_cursor = show;
     if (c != was) LOG_I("input", "input context %s", c == InputContext::Menu ? "menu" : c == InputContext::Gameplay ? "gameplay" : "screen");
-    // Mouse look takes the mouse in gameplay; menus give it back.
-    if (c == InputContext::Menu && was == InputContext::Gameplay) gpu::window_request_mouse_capture(false);
-    else if (c == InputContext::Gameplay) gpu::window_request_mouse_capture(true);
+    // Mouse look takes the mouse in gameplay; everything else gives it back (menus, the mission's
+    // report, movies, loading).
+    if (c == InputContext::Gameplay && was != InputContext::Gameplay) gpu::window_request_mouse_capture(true);
+    else if (c != InputContext::Gameplay && was == InputContext::Gameplay) gpu::window_request_mouse_capture(false);
     gpu::window_refresh_cursor();
   }
   std::deque<Event> events;
@@ -332,13 +363,26 @@ void frame(Ctx& ctx) {
     std::lock_guard lk(g_mu);
     events.swap(g_events);
   }
+  if (grace) {  // no menu takes keys this moment: its clicks wait for it
+    g_waiting.insert(g_waiting.end(), events.begin(), events.end());
+    return;
+  }
+  if (c == InputContext::Menu) events.insert(events.begin(), g_waiting.begin(), g_waiting.end());
+  g_waiting.clear();
   if (c != InputContext::Menu || dialog != g_last_dialog) {  // the dragged slider left with its dialog
     g_drag = {};
     g_hold = 0;
   }
-  if (c == InputContext::Screen) {  // title, movies: a click is Start
+  if (c == InputContext::Screen) {  // title, movies, the mission report: a click is Start, then Cross
     for (const Event& e : events)
-      if (e.kind == Event::LeftDown) press(kStart, 0, now_ms());
+      if (e.kind == Event::LeftDown) {
+        s64 t = now_ms();
+        press(kStart, 0, t);
+        // The mission report waits for Cross (Start does nothing there, run 20261016-041503):
+        // Cross 0.2 s after Start, unless a menu or gameplay has the input by then (the title's
+        // Start opens a menu) or a movie plays (Start skips one).
+        if (!gpu::display::movie_playing()) press(0, kCross, t + 200, true);
+      }
     g_last_dialog = dialog;
     return;
   }
@@ -356,21 +400,26 @@ void frame(Ctx& ctx) {
   g_last_x = p.x;
   g_last_y = p.y;
   g_last_dialog = dialog;
+  float ox = 0, oy = 0;  // the cursor in the dialog's own coordinates (its objects' rects)
+  dialog_origin(dialog, &ox, &oy);
+  float lx = gx - ox, ly = gy - oy;
   bool down = std::any_of(events.begin(), events.end(), [](const Event& e) { return e.kind == Event::LeftDown; });
   u32 hit = 0, slider = 0;
   s32 row = -1;  // a list's row under the cursor
   bool row_safe = false;
+  bool refocused = false;  // this frame's hover moved the focus
   if (show && (moved || down) && !(g_drag.slider && g_drag.button)) {
-    hit = object_at(ctx, dialog, gx, gy, &slider);
+    hit = object_at(ctx, dialog, lx, ly, &slider);
     if (hit && hit != ppu::r32(dialog + kDlgFocus)) {
       call(ctx, vfunc(dialog, kDlgSetFocus), dialog, hit);
+      refocused = true;
     }
     if (hit && is_list(hit)) {
-      row = list_row_at(hit, rect_of(ctx, hit), gy, &row_safe);
+      row = list_row_at(hit, rect_of(ctx, hit), ly, &row_safe);
       // Hover selects rows that do not scroll the list; after a scroll the cursor has to move a
       // row's height before hover selects again (no runaway scrolling under a resting cursor).
       static float scrolled_y = -1e9f;
-      if (row >= 0 && row_safe && !down && std::fabs(gy - scrolled_y) > 40 && list_select(ctx, hit, row)) scrolled_y = gy;
+      if (row >= 0 && row_safe && !down && std::fabs(ly - scrolled_y) > 40 && list_select(ctx, hit, row)) scrolled_y = ly;
     }
   }
   s64 t = now_ms();
@@ -380,7 +429,10 @@ void frame(Ctx& ctx) {
         g_drag = {slider, true, 0, 0};
       } else if (hit) {
         if (row >= 0) list_select(ctx, hit, row);  // a list's row: selected, then chosen
-        press(0, kCross, t + (row >= 0 ? 50 : 0));  // a click on an item chooses it; elsewhere nothing
+        // A click on an item chooses it; elsewhere nothing. When the click also moved the focus,
+        // the choice waits until the dialog has taken it (CLIENT SELECT lost a press made in the
+        // frame of its focus change, run 20261016-035308; 150 ms later it was taken, -035810).
+        press(0, kCross, t + (refocused ? 150 : row >= 0 ? 50 : 0));
       }
     } else if (e.kind == Event::LeftUp) {
       g_drag.button = false;
@@ -390,14 +442,17 @@ void frame(Ctx& ctx) {
       for (int i = 0; i < std::abs(e.value); ++i, t += 90) press(e.value > 0 ? kUp : kDown, 0, t);
     }
   }
-  if (g_drag.slider) drive_slider(gx);
+  if (g_drag.slider) drive_slider(lx);
 }
 
 }  // namespace
 
 InputContext input_context() { return InputContext(g_context.load(std::memory_order_relaxed)); }
 
-void menu_mouse_moved() { g_mouse_at = now_ms(); }
+void menu_mouse_moved() {
+  g_mouse_at = now_ms();
+  if (input_context() == InputContext::Menu && input_has_focus()) g_cursor = true;  // at once; frame() agrees
+}
 
 void menu_mouse_button(int button, bool down) {
   g_mouse_at = now_ms();
@@ -426,11 +481,19 @@ void note_pad_input() {
   }
 }
 
+void note_menu_key() {
+  g_key_at = now_ms();
+  if (g_cursor.exchange(false)) gpu::window_refresh_cursor();  // the keys took over until the mouse moves
+}
+
 void menu_pad_bits(u16* d1, u16* d2) {
   s64 t = now_ms();
   *d1 |= g_hold.load(std::memory_order_relaxed);
+  bool screen = input_context() == InputContext::Screen;
   std::lock_guard lk(g_mu);
-  while (!g_presses.empty() && g_presses.front().at + 70 <= t) g_presses.pop_front();
+  g_presses.erase(std::remove_if(g_presses.begin(), g_presses.end(),
+                                 [&](const Press& p) { return p.at + 70 <= t || (p.screen_only && !screen && p.at <= t); }),
+                  g_presses.end());
   for (const Press& p : g_presses) {
     if (p.at > t) continue;
     *d1 |= p.d1;

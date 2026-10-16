@@ -234,6 +234,7 @@ PadOut sample() {
     for (auto& [c, at] : held)
       if (c == code) return at;
     held.push_back({code, where});
+    if (where == game::InputContext::Menu && code < kMouse) game::note_menu_key();  // keys, not the mouse's buttons
     return where;
   };
   held.erase(std::remove_if(held.begin(), held.end(), [&](const auto& h) { return !down(h.first); }), held.end());

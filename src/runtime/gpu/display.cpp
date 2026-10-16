@@ -158,6 +158,7 @@ void movie_started() {
 void movie_stopped() {
   if (g_movies.fetch_sub(1) == 1 && cfg().fps != 60) LOG_I("display", "video playback ended");
 }
+bool movie_playing() { return g_movies.load(std::memory_order_relaxed) > 0; }
 void gameplay_started() {
   if (g_gameplay.fetch_add(1) == 0 && cfg().fps != 60)
     LOG_I("display", "mission started: frame rate target %s", cfg().fps < 0 ? "uncapped" : acfa::strprintf("%.0f", target_fps()).c_str());
@@ -166,9 +167,17 @@ void gameplay_stopped() {
   if (g_gameplay.fetch_sub(1) == 1 && cfg().fps != 60) LOG_I("display", "mission ended: 60 Hz outside missions");
 }
 
+// The display's vblank paces only when its waits really wait: with no monitor attached the output
+// keeps a fallback mode whose WaitForVBlank returns at once (run 20261016-041112: the menus ran at
+// about 1000 frames per second and held D-pad presses repeated). Consecutive display vblanks are at
+// least one refresh apart, so an emulated vblank that comes less than half its interval after the
+// previous one did not come from the display: the clock paces that one.
+double g_last_vblank_us = 0;  // the previous emulated vblank (display or clock)
+int g_early = 0;              // consecutive early display vblanks
+
 void wait_next_vblank() {
   IDXGIOutput* out = nullptr;
-  u32 div = 0;
+  u32 div = 0, hz = 0;
   double fps = target_fps();  // before the lock (it may take it)
   {
     std::lock_guard lk(g_mu);
@@ -180,20 +189,28 @@ void wait_next_vblank() {
       out = g_output;
       out->AddRef();
       div = g_divisor;
+      hz = g_refresh;
     }
   }
   if (out) {
     bool ok = true;
     for (u32 i = 0; i < div && ok; ++i) ok = SUCCEEDED(out->WaitForVBlank());
     out->Release();
-    if (ok) {
+    double now = double(lv2::system_time_us());
+    bool early = ok && hz && g_last_vblank_us > 0 && now - g_last_vblank_us < 0.5e6 * div / hz;
+    if (ok && !early) {
+      if (g_early >= 3) LOG_I("display", "the display's vblank waits again: display-locked pacing");
+      g_early = 0;
       g_locked = true;
       g_next_tick_us = 0;
+      g_last_vblank_us = now;
       return;
     }
+    if (early && ++g_early == 3) LOG_W("display", "the display's vblank wait returns at once (no monitor attached?): the clock paces the game");
   }
   g_locked = false;
   wait_clock();
+  g_last_vblank_us = double(lv2::system_time_us());
 }
 
 u32 present_flags() {

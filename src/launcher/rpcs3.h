@@ -5,7 +5,10 @@
 // and installs the game's update package when one lies beside the game or the update file
 // (--installpkg). The results go to the launcher's own folder of decrypted files; the work folder
 // is deleted. The player's RPCS3 is not changed, and the port itself contains no keys and decrypts
-// nothing: RPCS3 does.
+// nothing: RPCS3 does. RPCS3's questions are the player's to answer (user decision 2026-10-16,
+// from the Armored Core 4 port's playtest): the launcher brings them to the front, says what RPCS3
+// asks and waits; No, or closing the question, stops Prepare files with nothing left behind (for
+// the optional update: Prepare files goes on without it).
 #pragma once
 #include <atomic>
 #include <cstdio>
@@ -44,6 +47,7 @@ class Rpcs3Prep {
   bool running() const { return running_.load(); }
   struct View {
     std::string status;
+    void* ask = nullptr;  // an RPCS3 window waiting for the player (HWND): the UI brings it to the front
     bool finished = false, ok = false;
     std::string error, note;  // note: what was left out (the optional update)
   };
@@ -52,6 +56,7 @@ class Rpcs3Prep {
  private:
   void run(Rpcs3Job job);
   void set_status(const std::string& s);
+  void set_ask(void* window, const std::string& s);  // a question for the player (window null: none)
   void log(const std::string& s);  // <install>\prepare-files.log (no personal data)
   std::mutex mu_;
   View view_;
