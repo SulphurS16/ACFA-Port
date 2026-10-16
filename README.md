@@ -1,31 +1,53 @@
 # ARMORED CORE for Answer: unofficial PC port
 
-A native Windows version of ARMORED CORE for Answer (PS3, USA, BLUS30187), built on your PC from your own copy of the game. This project contains no game data, no game code and no keys, and it decrypts nothing.
+A native Windows version of ARMORED CORE for Answer (PS3, USA, BLUS30187). The game's own PS3 code is translated into a real Windows program, built on your PC from your own copy of the game. This project contains no game data, no game code and no keys, and it decrypts nothing.
 
 Not affiliated with, endorsed or sponsored by FromSoftware, Ubisoft, Sony Interactive Entertainment or any other rights holder. ARMORED CORE is a trademark of its owners.
 
-## What you need
+## Highlights
 
-- Windows 10 (1903 or later) or Windows 11, 64-bit.
-- A CPU from Intel Haswell (2013), AMD Excavator or Ryzen onward (AVX2; the launcher checks), and a Direct3D 11 graphics card.
-- About 4 GB of free disk space, and an internet connection once for the build tools (about 250 MB).
-- Your own copy of the game: the disc's files (the folder with `PS3_GAME`; BLUS30187, disc version 01.01).
-- Once, for setup: RPCS3 (rpcs3.net) and the PS3 system software 4.93 file `PS3UPDAT.PUP` (playstation.com).
-- Optional: the game's update 01.35 (`UP0001-BLUS30187_00-AC45000004141906-A0135-V0100-PE.pkg`), placed in the game folder or beside `PS3UPDAT.PUP`.
+- Native, not emulated. The whole game runs as a 64-bit Windows program.
+- Resolution options. The game draws at your screen's own resolution, in borderless, windowed or fullscreen.
+- Render scale from 50% to 200%.
+- High frame rates. 30, 60, 120, 144, your monitor's refresh rate or uncapped and the same game speed at every frame rate.. Menus and movies stay at 60.
+- Full mouse support. The mouse moves the camera with raw input. Your AC turns after it at its own speed, as with the stick.
+- PC SETTINGS inside the game. An entry in the game's own SYSTEM menu, where HDD INSTALL was on the PS3: display, frame rate, mouse and keys settings all ingame.
+
+## How it works
+
+Static recompilation. A recompiler reads the game's ~4.5 million PowerPC instructions and turns them into C++: about 71.000 functions, with every indirect jump resolved. Your PC's compiler then builds a native 64-bit Windows program.
+
+SPU programs are translated ahead of time too, with an interpreter as a safety net. The RSX command stream becomes Direct3D 11, and the game's shaders become HLSL, drawn at your resolution. Graphics, audio, input, files and saves are reimplemented in C++. a few complex firmware parts run as recompiled code from your own system files, so they behave exactly as on the console: the SPU task system and the movie and audio decoders.
+
+It shares this runtime with the Armored Core 4 port. The two games share an engine family and middleware.
+
+Nothing from the game is in this repository. Everything game-derived is generated on your PC from your own copy. Setup downloads a compiler toolchain (about 250 MB) once and takes a few minutes.
 
 ## Install
 
-1. Download `ACFA-Port-<version>.zip` from the release page, right-click it, choose **Extract All...** and start `ACFA-Launcher.exe`. If Windows says "Windows protected your PC" (the launcher is not code-signed), click **More info**, then **Run anyway**.
-2. **Game folder:** choose the folder with `PS3_GAME`.
-3. **Prepare files:** choose your `rpcs3.exe` and `PS3UPDAT.PUP`. RPCS3 asks "Install firmware: ...?" (click **Yes**) and, if you have the update, "Do you want to install this package?" (click **Install**). It takes about a minute and does not change your RPCS3.
-4. **Set up** (once): downloads the build tools and builds the game, about 4 minutes on a fast PC. If it stops, start it again; finished steps are kept.
-5. Choose your shortcuts, then click **PLAY**.
+### What you need
 
-The game data goes into the `local` folder beside the launcher; **Change...** picks another place.
+- Your own copy of ARMORED CORE for Answer (US disc, BLUS30187). You need the disc's files, meaning the folder that contains 'PS3_GAME'.
+- RPCS3, used once during setup to decrypt a few of your game files.
+- The PS3 system software 4.93 file 'PS3UPDAT.PUP' from [Sony's PS3 system software page](https://www.playstation.com/en-us/support/hardware/ps3/system-software/).
+- Optional: the game's update 01.35 package, placed in the game folder or next to 'PS3UPDAT.PUP'.
+- About 4 GB of free disk space and an internet connection.
 
-Already decrypted the files yourself? Choose their folder under **Decrypted files** (**More... > Which files does the port need?** lists them).
+### Steps
 
-Optional: check the download against the SHA-256 on the release page (PowerShell: `Get-FileHash ACFA-Port-<version>.zip`).
+1. Download `ACFA-Port-<version>.zip` from [Releases](https://github.com/SulphurS16/AC4-Port/releases).
+2. Right click the zip, choose **Extract All...**, and pick a folder with enough space, for example 'C:\Games\ACFA-Port'.
+3. Open that folder and start 'ACFA-Launcher.exe'.
+4. Under **Game folder**, choose the folder that contains 'PS3_GAME'.
+5. Click **Prepare files** and choose your 'rpcs3.exe' and 'PS3UPDAT.PUP'. The launcher uses your RPCS3 to decrypt the files the port needs. When RPCS3 asks "Install firmware?", click **Yes**; if you have the update, click **Install** when it asks about the package. This takes about a minute and doesn't change your RPCS3.
+6. Click **Set up**. It downloads the build tools and builds the game. This takes a few minutes and is only needed once.
+7. Choose whether you want a desktop shortcut and a Start menu entry.
+8. Click **PLAY**.
+
+From now on, you can start the game from the shortcut.
+
+> [!NOTE]
+> Already decrypted the files yourself? Skip step 5 and choose their folder under **Decrypted files** instead. **More... > Which files does the port need?** lists them.
 
 ## Update
 
@@ -43,6 +65,8 @@ Controllers work like the PS3 pad and can be connected at any time:
 
 With several controllers connected, the first one plays (Xbox-style controllers first).
 
+# Mouse and keyboard support
+
 Keyboard and mouse in missions (defaults, for the game's SIMPLE control layout):
 
 | Action | Keys |
@@ -51,37 +75,34 @@ Keyboard and mouse in missions (defaults, for the game's SIMPLE control layout):
 | Camera | Mouse |
 | Left / right arm weapon | Left / right click |
 | Shoulder weapon | E |
-| Switch right / left arm weapon | C / Ctrl |
+| Switch right / left weapon | C / Ctrl |
 | Boost (hold to rise) / quick boost / overed boost | Space / Shift / Q |
 | Reset view | V |
 | L3 | Middle click |
-| D-pad | Arrow keys |
-| Pause / SELECT | Tab or Escape / Enter |
+| Pause | Tab or Escape |
+| SELECT / D-pad | Enter / arrow keys |
 | Release the mouse | F1 |
 | Fullscreen | F11 or Alt+Enter |
 
-The mouse moves the camera directly (raw input), and the AC turns to where the camera points at its own speed.
+The mouse moves the camera directly (raw input), and the AC turns after it at its own speed.
 
 In menus:
 - **Mouse:** point and click; right-click goes back; the wheel scrolls; drag sliders.
-- **Keys:** arrows or W A S D move, Enter or Space choose, Escape or Backspace go back, Tab = START, Q / E = L1 / R1.
-
-Saving, loading and text entry appear inside the game's window. The whole tutorial works with keyboard and mouse.
+- **Keys:** arrows or W A S D move, Enter or Space choose, Escape or Backspace go back.
+- **PS3 buttons:** the game shows these. Tab = START, Q / E = L1 / R1.
 
 All keys can be changed in game under **SYSTEM > PC SETTINGS**.
 
 ## Settings and saves
 
 - Display mode, resolution, render scale (50–200 %) and frame rate (30, 60, 120, 144, your display's rate or uncapped) are set in the launcher or in game under **SYSTEM > PC SETTINGS**. Game speed is the same at every frame rate.
-- The launcher has presets for modest PCs and handhelds under **More...**. With a graphics card of 4 GB or less, keep the render scale at or below 100 % at 4K.
+- The launcher has presets for modest PCs and handhelds under **More...**.
 - Settings and saves are in `Saved Games\ARMORED CORE for Answer`. **More...** in the launcher backs up and restores saves. Saves don't work on a PS3.
+- PS3 saves work once you have decrypted them. Copy each save folder (named 'BLUS30187...') into the savedata folder above.
+- RPCS3 saves should work as they are. Copy the same 'BLUS30187...' folders from RPCS3's savedata folder.
 
-## Known limitations
+Only saves from the US version (BLUS30187) are found.
 
-- No online features (multiplayer, rankings, regulation downloads).
-- Emblem and paint editing results may not display correctly.
-- On-screen prompts show PS3 buttons.
+## Community
 
-## License
-
-MIT (`LICENSE`). Third-party notices: `THIRD_PARTY.md` and `licenses`. Version: the launcher's title bar; changes: `CHANGELOG.md`. To build the launcher from this repository: `powershell -ExecutionPolicy Bypass -File tools\build-launcher.ps1`.
+For more ports, questions, discussion and help join the [Discord](https://discord.gg/Z7pbJ2unX).
