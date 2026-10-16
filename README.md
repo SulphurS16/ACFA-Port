@@ -11,7 +11,7 @@ Not affiliated with, endorsed or sponsored by FromSoftware, Ubisoft, Sony Intera
 - Native, not emulated. The whole game runs as a 64-bit Windows program.
 - Resolution options. The game draws at your screen's own resolution, in borderless, windowed or fullscreen.
 - Render scale from 50% to 200%.
-- High frame rates. 30, 60, 120, 144, your monitor's refresh rate or uncapped and the same game speed at every frame rate.. Menus and movies stay at 60.
+- High frame rates. 30, 60, 120, 144, your monitor's refresh rate or uncapped and the same game speed at every frame rate. Menus and movies stay at 60.
 - Full mouse support. The mouse moves the camera with raw input. Your AC turns after it at its own speed, as with the stick.
 - PC SETTINGS inside the game. An entry in the game's own SYSTEM menu, where HDD INSTALL was on the PS3: display, frame rate, mouse and keys settings all ingame.
 
@@ -40,7 +40,7 @@ Nothing from the game is in this repository. Everything game-derived is generate
 
 ### Steps
 
-1. Download `ACFA-Port-<version>.zip` from [Releases](https://github.com/SulphurS16/AC4-Port/releases).
+1. Download `ACFA-Port-<version>.zip` from [Releases](https://github.com/SulphurS16/ACFA-Port/releases/latest).
 2. Right click the zip, choose **Extract All...**, and pick a folder with enough space, for example 'C:\Games\ACFA-Port'.
 3. Open that folder and start 'ACFA-Launcher.exe'.
 4. Under **Game folder**, choose the folder that contains 'PS3_GAME'.
