@@ -142,7 +142,21 @@ add_executable(acfa-launcher WIN32
   src/launcher/process.cpp
   src/launcher/rpcs3.cpp
   src/launcher/download.cpp
+  src/launcher/source.cpp
   src/launcher/launcher.rc)
+# The launcher's file version (its properties): the numbers of VERSION, for its resource file only.
+string(REGEX MATCH "^([0-9]+)\\.([0-9]+)\\.([0-9]+)" acfa_version_numbers "${ACFA_VERSION}")
+set_source_files_properties(src/launcher/launcher.rc PROPERTIES COMPILE_DEFINITIONS
+  "ACFA_VERSION_MAJOR=${CMAKE_MATCH_1};ACFA_VERSION_MINOR=${CMAKE_MATCH_2};ACFA_VERSION_PATCH=${CMAKE_MATCH_3}")
+# A release launcher carries the port's sources (a zip of the exported tree, made by
+# tools/release/export.py) and unpacks them into its install folder (src/launcher/source.h).
+set(ACFA_SOURCE_ZIP "" CACHE FILEPATH "Zip of the port's sources to embed in the launcher (releases)")
+if(ACFA_SOURCE_ZIP)
+  file(TO_CMAKE_PATH "${ACFA_SOURCE_ZIP}" acfa_source_zip)
+  file(WRITE ${CMAKE_BINARY_DIR}/launcher_source.rc "2 RCDATA \"${acfa_source_zip}\"\n")
+  target_sources(acfa-launcher PRIVATE ${CMAKE_BINARY_DIR}/launcher_source.rc)
+  set_source_files_properties(${CMAKE_BINARY_DIR}/launcher_source.rc PROPERTIES OBJECT_DEPENDS "${acfa_source_zip}")
+endif()
 target_include_directories(acfa-launcher PRIVATE ${CMAKE_SOURCE_DIR}/src)
 target_link_libraries(acfa-launcher PRIVATE acfa_common comctl32 winhttp shell32 ole32 uuid)
 target_link_options(acfa-launcher PRIVATE -municode)
