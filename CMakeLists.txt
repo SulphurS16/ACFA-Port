@@ -143,6 +143,7 @@ add_executable(acfa-launcher WIN32
   src/launcher/rpcs3.cpp
   src/launcher/download.cpp
   src/launcher/source.cpp
+  src/launcher/install.cpp
   src/launcher/launcher.rc)
 # The launcher's file version (its properties): the numbers of VERSION, for its resource file only.
 string(REGEX MATCH "^([0-9]+)\\.([0-9]+)\\.([0-9]+)" acfa_version_numbers "${ACFA_VERSION}")
@@ -158,7 +159,7 @@ if(ACFA_SOURCE_ZIP)
   set_source_files_properties(${CMAKE_BINARY_DIR}/launcher_source.rc PROPERTIES OBJECT_DEPENDS "${acfa_source_zip}")
 endif()
 target_include_directories(acfa-launcher PRIVATE ${CMAKE_SOURCE_DIR}/src)
-target_link_libraries(acfa-launcher PRIVATE acfa_common comctl32 winhttp shell32 ole32 uuid)
+target_link_libraries(acfa-launcher PRIVATE acfa_common comctl32 winhttp shell32 ole32 uuid advapi32)
 target_link_options(acfa-launcher PRIVATE -municode)
 target_compile_options(acfa-launcher PRIVATE -Wall -Wextra -Wno-missing-field-initializers)
 set_target_properties(acfa-launcher PROPERTIES OUTPUT_NAME ACFA-Launcher)
