@@ -120,7 +120,7 @@ if(ACFA_GEN_SRC)
   target_compile_options(acfa PRIVATE ${ACFA_CPU_FLAGS} -fno-strict-aliasing -Wall -Wextra -Wno-unused-parameter -g)
   # Whole-archive: the function table references everything anyway; keeps HLE registrars alive.
   target_link_libraries(acfa PRIVATE acfa_ppu_gen acfa_spu_gen acfa_spu acfa_ppu acfa_common d3d11 dxgi d3dcompiler d2d1 dwrite ole32 psapi
-                        synchronization)
+                        synchronization hid setupapi)
 endif()
 
 # ---- preparation tool ----
