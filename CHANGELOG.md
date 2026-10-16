@@ -1,0 +1,179 @@
+# Changelog
+
+## 0.7.0 (2026-10-16)
+
+PlayStation controllers without extra programs, and a launcher that says only what helps.
+
+Updating from 0.6.0: unzip the new release (into a new folder or over the old one) and start its
+launcher; in a new folder it finds your install (**Use it**). Then click **Set up**: it rebuilds
+what changed.
+
+Controllers
+- PlayStation controllers work directly: DUALSHOCK 4, DualSense and DualSense Edge, over USB or
+  Bluetooth, also when connected while the game runs (before, only Xbox and other XInput
+  controllers were read, so a PlayStation controller needed DS4Windows or Steam). Buttons as on
+  the PS3 controller; Share / Create or the touchpad click is SELECT. No vibration on them yet.
+
+Launcher
+- The window says only what helps: the next step, or what is wrong. No more "Ready." or
+  "Ready to play." (PLAY becomes clickable when the game is ready), no repeated size and folder
+  under the Game data row, no notes after the shortcuts change.
+
+## 0.6.0 (2026-10-16)
+
+One flow from the download to playing, updating and removing the game.
+
+Updating from 0.5.0: unzip the new release into a new folder or over the old one and start its
+launcher. In a new folder it finds your 0.5.0 install (beside it, in Downloads or under Local
+AppData) and offers to use it; then click **Set up** (it rebuilds what changed; tools, files,
+settings and saves stay).
+
+Launcher
+- A first start is guided step by step: the game folder, the decrypted files (Prepare files, or
+  your own), the game data (a new row: where it goes, the space it needs, **Change...**) and Set up.
+- Before anything goes into your Downloads folder (Windows' cleanup can delete old files there) or
+  a folder OneDrive syncs (gigabytes to upload; files can become online-only), the launcher proposes
+  your Local AppData folder or one you choose, showing the space needed.
+- A new release unzipped into a new folder finds your earlier install and offers to use it, or to
+  move its game data beside the new launcher (same drive): no Prepare files and no download of the
+  build tools again.
+- An update rebuilds only what changed (before, Set up rebuilt the whole game after each update).
+- After the first Set up, the launcher offers a desktop shortcut and a Start menu entry
+  (**More...** adds or removes them later); a newer launcher started from another folder makes
+  them open itself.
+- **More... > Remove game data...** deletes what the launcher and the game put on the disk, listed
+  with sizes; your saves and settings only when you tick that box, and they are then kept as a
+  backup. **More... > Install folder** became the Game data row's **Change...**.
+
+Release
+- The README explains Windows SmartScreen's warning (the launcher is not code-signed) and how to
+  check the download against the SHA-256 on the release page.
+
+## 0.5.0 (2026-10-16)
+
+The mouse moves the camera, new default keys, and the port's icon.
+
+Updating from 0.4.0: unzip over the old release (replace `ACFA-Launcher.exe`), start the launcher
+and click **Set up** (it rebuilds what changed; tools, files, settings and saves stay).
+
+Mouse and keyboard
+- Mouse camera: the mouse moves the camera at once, at any speed, by exactly the angle the mouse
+  moved (0.09 degrees per count at sensitivity 1.0; no smoothing, acceleration or dead zone), and
+  the AC turns to where the camera points with its own turning and stops there. The game still
+  places the camera (distance, height, the ground) and still smooths the AC's own movement; the
+  camera's half-second swing after a turn of the view is gone while the mouse has the camera.
+  Once the AC points where the camera does and the mouse rests, the camera rides with the AC
+  again. A controller used after the mouse gives the camera back to the game.
+- New default keys for missions: the mouse moves the camera, W A S D move, left click Square
+  (left arm weapon), right click Cross (right arm weapon), middle click L3, Q L1 (overed boost),
+  E R1 (shoulder weapon), Space L2 (boost), Shift R2 (quick boost), C Circle, Ctrl Triangle, V R3
+  (reset view), the arrow keys the D-pad, Tab START (Escape too), Enter SELECT. A settings file
+  that still has 0.4.0's default keys gets the new ones; keys you changed are kept.
+- After the system's save or load list, its questions or its text entry, the game gets the
+  controller's full state again as soon as the dialog closes (from the Armored Core 4 port, whose
+  menus moved by themselves without it).
+
+Release
+- The launcher and the game have the port's icon.
+
+## 0.4.0 (2026-10-16)
+
+Fixes from play-testing 0.3.0, and a smaller download.
+
+Release
+- The release zip holds two files: `ACFA-Launcher.exe` and `README.txt`. The launcher carries the
+  port's sources and unpacks them into its install folder (`local\source`) when it needs them;
+  the launcher's file properties and title bar show its version. Updating: unzip over the old
+  release, start the launcher, click **Set up** (it rebuilds what changed; tools, files,
+  settings and saves stay). 0.3.0's source files beside the launcher are no longer used
+  (README: Setup).
+
+Game files
+- **Prepare files**: you answer RPCS3's own questions. When RPCS3 asks "Install firmware:
+  ...PS3UPDAT.PUP?" (click **Yes**) or, for the game's update, "Do you want to install this
+  package?" (click **Install**), the launcher brings the question to the front, says what it asks
+  and what to click, and waits for you. **No**, or closing the question, stops Prepare files with
+  nothing left half-done; **Cancel** on the update's question goes on without the update (the
+  disc's balance data is used). Other RPCS3 windows are handled the same way. Decrypting the files
+  yourself and choosing their folder works as before.
+
+Mouse and keyboard
+- Mouse look: the AC turns and the view pitches by exactly the angle the mouse moved (0.09
+  degrees per count at sensitivity 1.0), with no smoothing, acceleration or dead zone. A movement
+  faster than the AC can turn is not cut short: the AC turns at its full turning speed until it
+  points where the mouse points. The same at every frame rate.
+- Tutorial: every step can be done with keyboard and mouse; turning and looking up and down with
+  the mouse count like the stick held for as long.
+- Menu cursor: in every menu it comes back as soon as the mouse moves (after PC SETTINGS, a
+  mission's end, the pause menu, the tutorial and movies); keys or a controller hide it.
+  Cutscenes, movies, the intro and other scenes without a menu show no cursor, even when the
+  mouse moves. Outside missions the game no longer holds the mouse.
+- Fixed: clicks on the game's small message boxes ("Enter pilot name.", the tutorial's restart
+  notice, the client choice's notes and confirmation) did nothing.
+- Fixed: the cursor blinked when it moved onto another client in CLIENT SELECT, and a click made
+  just as it got there was lost.
+- A click continues the mission report (it waits for the confirm button, which a click did not
+  press).
+
+Display
+- Saving, loading, questions and text entry (the pilot name) appear inside the game's picture
+  (they were Windows dialogs): the window keeps its mode, size and position during and after
+  them, in borderless and windowed (exclusive fullscreen still to be checked). Point and click,
+  or use the keyboard (type, Enter, Escape, arrows).
+- Fixed: when the display went away in exclusive fullscreen while the game was in front (a
+  monitor switched off or dropping out), the game switched the display mode again and again; it
+  now enters exclusive fullscreen again when you come back to it (Alt+Tab) or choose the mode.
+- Fixed: with no monitor attached, or a display that does not wait for its refresh, the game ran
+  far too fast; its own clock paces it then.
+
+## 0.3.0 (2026-10-15)
+
+Game files
+- No keys any more: `EBOOT.BIN` and 10 system modules of PS3 system software 4.93 are decrypted
+  by your RPCS3. **Prepare files** in the launcher does it in one step with your `rpcs3.exe` and
+  the update file `PS3UPDAT.PUP` (a private copy of RPCS3; your RPCS3 is not changed), or you
+  choose a folder with files you decrypted yourself. Each file is checked by its SHA-256; the
+  port decrypts nothing and downloads no system software.
+
+Display
+- The game renders at your window's or screen's resolution (text and interface sharp at 1440p
+  and 4K), with a render scale from 50 % to 200 %; sun glare stays as on the PS3 at any
+  resolution.
+- Borderless fullscreen at your display's own resolution is the default; monitor choice;
+  windowed, borderless and exclusive fullscreen as before.
+- Frame rates: 30, 60, 120, 144, your display's refresh rate and uncapped, each checked in a
+  mission (same movement and turning as at 60).
+
+Mouse and keyboard
+- Menus with the mouse: a cursor in the game's style, items highlighted under it, click to
+  choose, right click to go back, wheel to move, sliders follow a click or drag, list rows.
+- Menus with the keyboard: arrows or W A S D, Enter or Space, Escape or Backspace, Tab (START),
+  Q / E (pages); Enter, Escape or a click on the title screen and in movies.
+- Separate X and Y mouse sensitivity and inversion; a MENU KEYS page in PC SETTINGS to change the
+  keys for menus.
+- Mouse look also in the tutorial; the game takes the mouse as soon as a mission, the tutorial,
+  AC TEST or an order match starts (also after menus used with the keyboard) and again when you
+  come back with Alt+Tab.
+
+Launcher, settings, saves
+- A simpler launcher: the game folder, the decrypted files (**Prepare files**), **Set up**,
+  display mode, resolution, frame rate and **PLAY**; the rest under **More...**.
+- The game opens only its window (no console window).
+- Settings and saves in `Saved Games\ARMORED CORE for Answer` (copied once from the install
+  folder); presets for modest PCs and handhelds; **Reset all settings...**; **Play in safe mode**.
+- When the game stops with an error, the launcher shows it; logs contain no personal data.
+
+## 0.2.0 (2026-10-13)
+
+- PS3 system software 4.93 as an alternative to the disc's 2.41 (key-file based; replaced by
+  0.3.0's decrypted files).
+- Fixed: a recompiler error that let some instructions overwrite a condition the game then
+  tested (eleven places in the game's code).
+- Fixed: a cause of a rare crash between the title and the hub (the graphics command buffer could
+  be overrun by one command).
+
+## 0.1.0 (2026-10-13)
+
+- First release: the launcher (game file checks, setup with progress, settings, saves, Play),
+  PC SETTINGS in the game's SYSTEM menu, keyboard and mouse bindings, frame rates above 60 in
+  missions.

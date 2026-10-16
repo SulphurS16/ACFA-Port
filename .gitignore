@@ -1,0 +1,32 @@
+# Players' own game files, keys, prepared data, builds, saves and settings never belong here.
+/local/
+/launcher.ini
+/ACFA-Launcher.exe
+*.exe
+*.dll
+*.pkg
+*.PUP
+*.pup
+*.elf
+*.self
+*.sprx
+*.prx
+*.SFO
+*.SFB
+*.BIN
+*.pam
+*.bnd
+*.bdt
+*.bhd
+*.tpf
+*.rap
+*.edat
+*keys*.txt
+*.zip
+
+# Editor / OS noise
+.vs/
+.vscode/
+.idea/
+Thumbs.db
+.DS_Store
