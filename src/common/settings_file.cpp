@@ -1,9 +1,11 @@
 #include "common/settings_file.h"
 
 #include <algorithm>
+#include <cctype>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <map>
 #include <system_error>
 
 #include "common/bytes.h"
@@ -56,37 +58,48 @@ const char* const kKeyboardHead =
     "#   Alt, Up, Down, Left, Right, Home, End, PageUp, PageDown, Insert, Delete, CapsLock, Mouse1\n"
     "#   (left), Mouse2 (right), Mouse3 (middle), Mouse4, Mouse5, WheelUp, WheelDown\n"
     "# Mouse buttons and the wheel count while the game window has the mouse (click into it). The\n"
-    "# defaults follow the game's SIMPLE control layout; the mouse turns and looks.\n";
+    "# defaults follow the game's SIMPLE control layout; the mouse moves the camera.\n";
 
+// The default keys (user's layout, 2026-10-16): the mouse moves the camera, so the right stick has
+// no keys of its own.
 const char* const kKeyboardDefaults =
-    "# Movement (left stick) and view (right stick)\n"
+    "# Movement (left stick); the mouse moves the camera (right stick: no keys by default)\n"
     "lstick_up = W\n"
     "lstick_down = S\n"
     "lstick_left = A\n"
     "lstick_right = D\n"
-    "rstick_up = Num8\n"
-    "rstick_down = Num5, Num2\n"
-    "rstick_left = Num4\n"
-    "rstick_right = Num6\n"
-    "# Weapons: right arm, left arm, shoulder; switch right / left arm weapon\n"
-    "cross = Mouse1, Enter\n"
-    "square = Mouse2\n"
-    "r1 = F, Mouse3\n"
-    "circle = R, Backspace\n"
-    "triangle = Q\n"
-    "# Boosts: boost (hold to rise), quick boost, overed boost\n"
+    "rstick_up =\n"
+    "rstick_down =\n"
+    "rstick_left =\n"
+    "rstick_right =\n"
+    "# Weapons (SIMPLE layout): Cross right arm, Square left arm, R1 shoulder; Circle / Triangle switch\n"
+    "# the right / left arm weapon\n"
+    "cross = Mouse2\n"
+    "square = Mouse1\n"
+    "r1 = E\n"
+    "circle = C\n"
+    "triangle = Ctrl\n"
+    "# Boosts: L2 boost (hold to rise), R2 quick boost, L1 overed boost\n"
     "l2 = Space\n"
     "r2 = Shift\n"
-    "l1 = E\n"
-    "# View reset, pause, menus\n"
-    "r3 = C\n"
-    "l3 = Z\n"
-    "start = Escape\n"
-    "select = Tab\n"
+    "l1 = Q\n"
+    "# R3 view reset, L3, START (pause), SELECT, the D-pad\n"
+    "r3 = V\n"
+    "l3 = Mouse3\n"
+    "start = Tab, Escape\n"
+    "select = Enter\n"
     "up = Up\n"
     "down = Down\n"
     "left = Left\n"
     "right = Right\n";
+
+// The defaults of 0.4.0 and earlier: a [keyboard] section that still holds exactly these is moved
+// to the current defaults (a player who changed any key keeps all of them).
+const char* const kKeyboardDefaults040 =
+    "lstick_up = W\nlstick_down = S\nlstick_left = A\nlstick_right = D\nrstick_up = Num8\nrstick_down = Num5, Num2\n"
+    "rstick_left = Num4\nrstick_right = Num6\ncross = Mouse1, Enter\nsquare = Mouse2\nr1 = F, Mouse3\ncircle = R, Backspace\n"
+    "triangle = Q\nl2 = Space\nr2 = Shift\nl1 = E\nr3 = C\nl3 = Z\nstart = Escape\nselect = Tab\nup = Up\ndown = Down\n"
+    "left = Left\nright = Right\n";
 
 const char* const kMenuHead =
     "[menu]\n"
@@ -183,15 +196,28 @@ Ini load_or_create(const std::filesystem::path& file, std::vector<std::string>* 
     add_missing("display", kDisplay);
     add_missing("mouse", kMouse);
     add_missing("keyboard", std::string(kKeyboardHead) + kKeyboardDefaults);
-    if (!ini.has_section("menu")) {  // files from before the menu keys: the section with its notes
-      std::string head = kMenuHead;
-      for (size_t a = head.find('\n') + 1; a < head.size();) {
-        size_t b = head.find('\n', a);
-        ini.add_line("menu", head.substr(a, b - a));
-        a = b + 1;
-      }
-      Ini d = Ini::parse(std::string(kMenuHead) + kMenuDefaults);
-      for (const auto& [k, v] : d.entries("menu")) ini.set("menu", k, v);
+    // The keys of 0.4.0 and earlier, never changed: the current default layout's keys (the file's
+    // notes stay as they were).
+    auto squeeze = [](const std::string& v) {
+      std::string s;
+      for (char ch : v)
+        if (ch != ' ' && ch != '\t') s += char(std::tolower(static_cast<unsigned char>(ch)));
+      return s;
+    };
+    auto map_of = [&](const std::vector<std::pair<std::string, std::string>>& e) {
+      std::map<std::string, std::string> m;
+      for (const auto& [k, v] : e) m[squeeze(k)] = squeeze(v);
+      return m;
+    };
+    if (map_of(ini.entries("keyboard")) == map_of(Ini::parse(std::string("[keyboard]\n") + kKeyboardDefaults040).entries("keyboard"))) {
+      for (const auto& [k, v] : Ini::parse(std::string("[keyboard]\n") + kKeyboardDefaults).entries("keyboard")) ini.set("keyboard", k, v);
+      note("settings: the keyboard's default keys of 0.4.0 replaced by the new default layout (no key had been changed)");
+      changed = true;
+    }
+    if (!ini.has_section("menu")) {  // files from before the menu keys: the section with its notes, as in a new file
+      std::string text = ini.text();
+      bool blank_end = text.empty() || (text.size() >= 4 && text.compare(text.size() - 4, 4, "\r\n\r\n") == 0);
+      ini = Ini::parse(text + (blank_end ? "" : "\r\n") + kMenuHead + kMenuDefaults);
       changed = true;
     }
   }

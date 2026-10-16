@@ -112,7 +112,7 @@ if(ACFA_GEN_SRC)
   target_include_directories(acfa_spu_gen PRIVATE ${CMAKE_SOURCE_DIR}/src)
   target_compile_options(acfa_spu_gen PRIVATE -O2 ${ACFA_CPU_FLAGS} -fno-strict-aliasing -w)
 
-  add_executable(acfa ${ACFA_RT_SRC} ${ACFA_UTF8_RC})
+  add_executable(acfa ${ACFA_RT_SRC} ${ACFA_UTF8_RC} src/runtime/game.rc)
   if(NOT ACFA_DEV)  # players' builds open no console window (the run log holds every message)
     set_target_properties(acfa PROPERTIES WIN32_EXECUTABLE ON)
   endif()

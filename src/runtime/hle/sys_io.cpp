@@ -75,6 +75,8 @@ u32 g_max = 0;
 u32 g_press_mode[kPorts] = {}, g_sensor_mode[kPorts] = {};
 u16 g_last[kPorts][24];
 bool g_have_last[kPorts] = {};
+bool g_was_held[kPorts] = {};     // the previous read found the controller held (system dialog, PC SETTINGS)
+u32 g_seen_release[kPorts] = {};  // sysdlg::released_count() at the previous read
 
 u8 axis(SHORT v) { return u8(std::clamp((int(v) + 32768) >> 8, 0, 255)); }
 
@@ -178,7 +180,8 @@ s32 cellPadGetData(u32 port, Ptr<PadData> data) {
   PadState s = read_port(port);
   if (!s.connected) return PAD_ERR_NO_DEVICE;
   ui::PadMode ui_mode = ui::pad_mode();
-  if (sysdlg::active() || ui_mode != ui::PadMode::Normal) {  // a system dialog or PC SETTINGS holds the controller: the game sees it at rest
+  const bool held = sysdlg::active() || ui_mode != ui::PadMode::Normal;
+  if (held) {  // a system dialog or PC SETTINGS holds the controller: the game sees it at rest
     PadState idle;
     idle.connected = true;
     if (ui_mode == ui::PadMode::Cancel && !sysdlg::active() && port == 0) {  // PC SETTINGS closed: the install question gets CANCEL
@@ -187,6 +190,14 @@ s32 cellPadGetData(u32 port, Ptr<PadData> data) {
     }
     s = idle;
   }
+  // When the controller comes back, the next data is reported in full, changed or not: while the
+  // system holds it the game clears its own copy (sticks at 0: fully up and left), and "no change"
+  // would leave that copy in place until something was pressed (the Armored Core 4 port saw its hub's
+  // highlight run on after the load list; on a PS3 the analog sticks' noise refreshes it).
+  u32 released = sysdlg::released_count();
+  if ((g_was_held[port] && !held) || g_seen_release[port] != released) g_have_last[port] = false;
+  g_was_held[port] = held;
+  g_seen_release[port] = released;
   u16 b[24] = {};
   b[2] = s.d1;
   b[3] = s.d2;
