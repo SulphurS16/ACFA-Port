@@ -2,6 +2,8 @@
 
 A native Windows version of ARMORED CORE for Answer (PS3, USA, BLUS30187). The game's own PS3 code is translated into a real Windows program, built on your PC from your own copy of the game. This project contains no game data, no game code and no keys, and it decrypts nothing.
 
+<img width="2560" height="1440" alt="acfa_9pvp7D5lZs" src="https://github.com/user-attachments/assets/c287c4dc-409d-46a1-a9f4-388cf41ccd64" />
+
 Not affiliated with, endorsed or sponsored by FromSoftware, Ubisoft, Sony Interactive Entertainment or any other rights holder. ARMORED CORE is a trademark of its owners.
 
 ## Highlights
@@ -12,6 +14,9 @@ Not affiliated with, endorsed or sponsored by FromSoftware, Ubisoft, Sony Intera
 - High frame rates. 30, 60, 120, 144, your monitor's refresh rate or uncapped and the same game speed at every frame rate.. Menus and movies stay at 60.
 - Full mouse support. The mouse moves the camera with raw input. Your AC turns after it at its own speed, as with the stick.
 - PC SETTINGS inside the game. An entry in the game's own SYSTEM menu, where HDD INSTALL was on the PS3: display, frame rate, mouse and keys settings all ingame.
+
+<img width="2560" height="1440" alt="acfa_J345U43DN5" src="https://github.com/user-attachments/assets/9dbfee69-26c8-446a-929c-e58336b61894" />
+
 
 ## How it works
 
