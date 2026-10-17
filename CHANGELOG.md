@@ -1,5 +1,20 @@
 # Changelog
 
+## 0.7.1 (2026-10-17)
+
+A fix for the sky on some graphics cards, and license notices and published sources in order.
+
+Updating from 0.7.0: unzip the new release (into a new folder or over the old one) and start its
+launcher, then click **Set up**: it rebuilds what changed.
+
+- Fixed: on some graphics cards (reported on an AMD Radeon RX 6600), parts of the sky showed as
+  large darker triangles that flickered from frame to frame.
+- The zip's README.txt ends with the license notices of the mingw-w64 runtime that the launcher
+  contains (also in `licenses/` in the repository).
+- `LICENSE` is the plain MIT license; the credit and the note on what it covers are in
+  `THIRD_PARTY.md`.
+- The repository holds exactly the sources the launcher carries.
+
 ## 0.7.0 (2026-10-16)
 
 PlayStation controllers without extra programs, and a launcher that says only what helps.
@@ -129,8 +144,7 @@ Display
 ## 0.3.0 (2026-10-15)
 
 Game files
-- No keys any more: `EBOOT.BIN` and 10 system modules of PS3 system software 4.93 are decrypted
-  by your RPCS3. **Prepare files** in the launcher does it in one step with your `rpcs3.exe` and
+- `EBOOT.BIN` and 10 system modules of PS3 system software 4.93 are decrypted by your RPCS3. **Prepare files** in the launcher does it in one step with your `rpcs3.exe` and
   the update file `PS3UPDAT.PUP` (a private copy of RPCS3; your RPCS3 is not changed), or you
   choose a folder with files you decrypted yourself. Each file is checked by its SHA-256; the
   port decrypts nothing and downloads no system software.
@@ -165,8 +179,8 @@ Launcher, settings, saves
 
 ## 0.2.0 (2026-10-13)
 
-- PS3 system software 4.93 as an alternative to the disc's 2.41 (key-file based; replaced by
-  0.3.0's decrypted files).
+- PS3 system software 4.93 as an alternative to the disc's 2.41 (replaced by 0.3.0's decrypted
+  files).
 - Fixed: a recompiler error that let some instructions overwrite a condition the game then
   tested (eleven places in the game's code).
 - Fixed: a cause of a rare crash between the title and the hub (the graphics command buffer could

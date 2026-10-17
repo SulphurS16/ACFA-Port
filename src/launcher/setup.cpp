@@ -14,6 +14,7 @@
 #include "common/privacy.h"
 #include "launcher/download.h"
 #include "launcher/inputs.h"
+#include "launcher/source.h"
 
 namespace launcher {
 namespace {
@@ -153,10 +154,12 @@ bool outputs_present(const SetupConfig& c, size_t step) {
 
 bool step_current(const SetupConfig& c, size_t step) { return outputs_present(c, step) && read_state(c, step) == stamp(c, step); }
 
-// What the game was built from beyond the generated code: also the release's sources (SOURCE.txt
-// names their commit; a development tree has none), so a newer release builds the game again.
+// What the game was built from beyond the generated code: also the release's sources (the id of
+// the sources the launcher unpacked; a development tree has none), so a newer release builds the
+// game again.
 std::string built_stamp(const SetupConfig& c) {
-  return stamp(c, kRecompile) + "\n" + stamp(c, kSpu) + "\nsource " + content_hash(c.src / "SOURCE.txt");
+  std::string id = source_id(c.src);
+  return stamp(c, kRecompile) + "\n" + stamp(c, kSpu) + "\nsource " + (id.empty() ? std::string("none") : id);
 }
 
 std::wstring tool_path_prefix(const SetupConfig& c) {

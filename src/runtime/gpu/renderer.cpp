@@ -119,6 +119,7 @@ struct Shadow {
   ID3D11DepthStencilState* depth;
   u32 stencil_ref;
   ID3D11RasterizerState* raster;
+  float vp_zmin, vp_zmax;  // the viewport's depth range (0..1, or one value for constant-depth draws)
   D3D11_RECT scissor;
   ID3D11VertexShader* vs;
   ID3D11PixelShader* ps;
@@ -408,6 +409,8 @@ Targets bind_targets(bool want_depth) {
   gpu::rec().OMSetRenderTargets(t.count, rtvs, dsv);
   D3D11_VIEWPORT vp{0, 0, float(sw), float(shh), 0, 1};
   gpu::rec().RSSetViewports(1, &vp);
+  g_sh.vp_zmin = 0;
+  g_sh.vp_zmax = 1;
   std::memcpy(g_sh.rtv, rtvs, sizeof rtvs);
   g_sh.dsv = dsv;
   g_sh.rt_count = t.count;
@@ -1544,6 +1547,8 @@ bool depth_changed(const Targets& t) {
          writes(m::SET_BACK_STENCIL_OP_FAIL, m::SET_BACK_STENCIL_OP_ZFAIL, m::SET_BACK_STENCIL_OP_ZPASS);
 }
 
+bool g_zconst = true;  // "gpu zconst on|off" (A/B: off clips constant-depth draws by depth, as up to 0.7.1)
+
 void set_pipeline_state(const Targets& t) {
   auto* c = &gpu::rec();
   // Blend.
@@ -1613,7 +1618,18 @@ void set_pipeline_state(const Targets& t) {
     rd.CullMode = cf == 0x0404 ? D3D11_CULL_FRONT : cf == 0x0405 ? D3D11_CULL_BACK : D3D11_CULL_NONE;
   }
   rd.FrontCounterClockwise = reg(m::SET_FRONT_FACE) == 0x0901;
-  rd.DepthClipEnable = (reg(m::SET_ZMIN_MAX_CONTROL) & 0xf) != 0;
+  // A draw whose window depth is constant (viewport z scale 0, as ACFA's sky dome and clouds at
+  // the far plane) and inside the clip range is never clipped by depth on the RSX. Its clip-space z
+  // here is window z * w, which puts the near clip plane (z >= 0) on the camera plane (w = 0):
+  // triangles crossing it (a dome around the camera) are clipped differently per GPU (GitHub
+  // issue #1: sky triangles flickering on AMD; WARP shows them too). Such draws skip depth clipping
+  // (clipping to w > 0 stays) and take their depth from the viewport's depth range, exactly. A
+  // constant outside the clip range shows nothing on the RSX: those stay clipped as before.
+  const float zoff = f32_of(reg(m::SET_VIEWPORT_OFFSET + 8));
+  const float clo = std::clamp(f32_of(reg(m::SET_CLIP_MIN)), 0.0f, 1.0f), chi = std::clamp(f32_of(reg(m::SET_CLIP_MAX)), 0.0f, 1.0f);
+  const bool zconst = g_zconst && f32_of(reg(m::SET_VIEWPORT_SCALE + 8)) == 0.0f && zoff >= std::min(clo, chi) &&
+                      zoff <= std::max(clo, chi);
+  rd.DepthClipEnable = (reg(m::SET_ZMIN_MAX_CONTROL) & 0xf) != 0 && !zconst;
   rd.ScissorEnable = TRUE;
   if (reg(m::SET_POLY_OFFSET_FILL_ENABLE)) {
     rd.DepthBias = INT(f32_of(reg(m::SET_POLYGON_OFFSET_BIAS)));
@@ -1626,6 +1642,14 @@ void set_pipeline_state(const Targets& t) {
   if (rs != g_sh.raster) {
     c->RSSetState(rs);
     g_sh.raster = rs;
+  }
+  float zmin = 0, zmax = 1;
+  if (zconst) zmin = zmax = zoff;  // the constant window z (inside the clip range, so within 0..1)
+  if (zmin != g_sh.vp_zmin || zmax != g_sh.vp_zmax) {
+    D3D11_VIEWPORT vp{0, 0, float(g_sh.vp_w), float(g_sh.vp_h), zmin, zmax};
+    c->RSSetViewports(1, &vp);
+    g_sh.vp_zmin = zmin;
+    g_sh.vp_zmax = zmax;
   }
   D3D11_RECT sr = scissor_rect(t, false);
   if (std::memcmp(&sr, &g_sh.scissor, sizeof sr)) {

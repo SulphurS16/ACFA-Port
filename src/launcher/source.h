@@ -18,5 +18,8 @@ bool source_current(const fs::path& dir);
 // Unpacks the launcher's sources into dir unless they are current there (an older copy is
 // replaced as a whole). Returns "" or what went wrong.
 std::string unpack_source(const fs::path& dir);
+// Which release's sources the launcher unpacked into dir (the SHA-256 of the zip they came from);
+// "" for a source tree the launcher did not unpack (development, a copy of the repository).
+std::string source_id(const fs::path& dir);
 
 }  // namespace launcher

@@ -136,4 +136,6 @@ std::string unpack_source(const fs::path& dir) {
   return "";
 }
 
+std::string source_id(const fs::path& dir) { return read_line(dir / kStamp); }
+
 }  // namespace launcher
