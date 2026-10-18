@@ -3,6 +3,8 @@
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 
+#include <algorithm>
+#include <atomic>
 #include <map>
 #include <mutex>
 #include <vector>
@@ -65,6 +67,26 @@ const char* area_name(int i) {
   return n[i];
 }
 
+// Committed guest pages (4 KiB), one bit each, kept by commit() and decommit(), through which all
+// guest memory is committed and released: committed() is a lookup. It asked VirtualQuery per
+// region, which the game hooks' pointer checks did thousands of times per frame (more than half
+// of main_thread's time in m540, run 20261018-112844).
+constexpr u64 kPages = 1ull << 20;  // 4 GiB
+std::atomic<u64> g_page_bits[kPages / 64];
+
+// Sets or clears the bits of pages [first, end).
+void mark_pages(u64 first, u64 end, bool on) {
+  for (u64 p = first; p < end;) {
+    u64 b = p & 63, n = std::min<u64>(64 - b, end - p);
+    u64 mask = (n == 64 ? ~0ull : (1ull << n) - 1) << b;
+    if (on)
+      g_page_bits[p >> 6].fetch_or(mask, std::memory_order_release);
+    else
+      g_page_bits[p >> 6].fetch_and(~mask, std::memory_order_release);
+    p += n;
+  }
+}
+
 }  // namespace
 
 u8* base() { return reinterpret_cast<u8*>(PPU_MEM_BASE); }
@@ -105,21 +127,25 @@ void commit(u32 addr, u32 size) {
   u64 a = addr & ~0xfffull, e = (u64(addr) + size + 0xfff) & ~0xfffull;
   if (!VirtualAlloc(base() + a, size_t(e - a), MEM_COMMIT, PAGE_READWRITE))
     fatal(acfa::strprintf("guest commit failed at 0x%08x size 0x%x (error %lu)", addr, size, GetLastError()));
+  mark_pages(a >> 12, e >> 12, true);
 }
 
 void decommit(u32 addr, u32 size) {
   if (!size) return;
   u64 a = (u64(addr) + 0xfff) & ~0xfffull, e = (u64(addr) + size) & ~0xfffull;
-  if (e > a) VirtualFree(base() + a, size_t(e - a), MEM_DECOMMIT);
+  if (e <= a) return;
+  mark_pages(a >> 12, e >> 12, false);  // before the pages go: a check never finds them committed
+  VirtualFree(base() + a, size_t(e - a), MEM_DECOMMIT);
 }
 
 bool committed(u32 addr, u32 size) {
-  u64 a = addr, e = u64(addr) + (size ? size : 1);
-  while (a < e) {
-    MEMORY_BASIC_INFORMATION mbi{};
-    if (!VirtualQuery(base() + a, &mbi, sizeof mbi) || mbi.State != MEM_COMMIT) return false;
-    u64 region_end = u64(reinterpret_cast<u8*>(mbi.BaseAddress) - base()) + mbi.RegionSize;
-    a = region_end;
+  u64 first = addr >> 12, last = (u64(addr) + (size ? size : 1) - 1) >> 12;
+  if (last >= kPages) return false;
+  for (u64 p = first; p <= last;) {
+    u64 b = p & 63, n = std::min<u64>(64 - b, last + 1 - p);
+    u64 mask = (n == 64 ? ~0ull : (1ull << n) - 1) << b;
+    if ((g_page_bits[p >> 6].load(std::memory_order_acquire) & mask) != mask) return false;
+    p += n;
   }
   return true;
 }

@@ -1,5 +1,21 @@
 # Changelog
 
+## 0.7.2 (2026-10-18)
+
+Faster: much higher frame rates, smoother mission starts, less CPU time for movies.
+
+Updating from 0.7.1: unzip the new release (into a new folder or over the old one) and start its
+launcher, then click **Set up**: it rebuilds what changed.
+
+- Higher frame rates: with the frame rate uncapped, the heaviest mission runs at about 190
+  instead of 84 frames per second on the test PC (Ryzen 9 5900X, RTX 4090), the first mission at
+  about 250. The game's main thread needs about a fifth of the CPU time per frame it did, which
+  helps slower PCs at 60 fps too.
+- Smoother mission starts: the first frame of a mission no longer stops for about a fifth of a
+  second, and the frames of the sortie loading screen are shorter.
+- Compressed textures stay compressed on the graphics card (less video memory), and movie frames
+  need about a quarter of the CPU time they did to reach it.
+
 ## 0.7.1 (2026-10-17)
 
 A fix for the sky on some graphics cards, and license notices and published sources in order.

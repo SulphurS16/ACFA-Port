@@ -1,14 +1,20 @@
 // RSX texture decoding. Layout and format facts: rsx_facts.md §5.3-§5.4.
 //
-// 8-bit and packed formats (and DXT, decompressed here) are converted to RGBA8 with the CONTROL1
-// remap applied; float formats keep float precision (remap is not allowed for them on hardware).
+// 8-bit and packed formats are converted to RGBA8 with the CONTROL1 remap applied; DXT keeps its
+// blocks (BC1/BC2/BC3) with the identity remap and is decompressed here otherwise; float formats
+// keep float precision (remap is not allowed for them on hardware).
 #include "runtime/gpu/rsx_texture.h"
+
+#include <immintrin.h>
 
 #include <algorithm>
 #include <cstring>
 
 namespace rt::gpu {
 namespace {
+
+// CONTROL1 remap that leaves every channel in place (A, R, G, B from themselves).
+constexpr u32 kIdentityRemap = 0xaae4;
 
 u32 rd16(const u8* p) { return (u32(p[0]) << 8) | p[1]; }
 u32 rd32(const u8* p) { return (u32(p[0]) << 24) | (u32(p[1]) << 16) | (u32(p[2]) << 8) | p[3]; }
@@ -243,6 +249,64 @@ bool convert_texture(const TexDesc& t, const u8* src, TexData* out) {
   u32 out_bpp = fl ? (t.format == 0x9A ? 8 : 16) : 4;
   out->format = !fl ? DXGI_FORMAT_R8G8B8A8_UNORM
                     : t.format == 0x9A ? DXGI_FORMAT_R16G16B16A16_FLOAT : DXGI_FORMAT_R32G32B32A32_FLOAT;
+  // DXT with the identity remap: the blocks as they are (BC1/BC2/BC3; the RSX keeps the PC block
+  // layout, as decode_dxt_block reads it). No decoding on the FIFO thread and a quarter to an
+  // eighth of the host memory (first-use textures at a mission start took ~195 ms to decode).
+  // D3D11 wants whole blocks at the top level; other cases are decoded below.
+  if (dxt && (t.remap & 0xffff) == kIdentityRemap && t.dim == 2 && t.width % 4 == 0 && t.height % 4 == 0) {
+    out->format = t.format == 0x86 ? DXGI_FORMAT_BC1_UNORM : t.format == 0x87 ? DXGI_FORMAT_BC2_UNORM : DXGI_FORMAT_BC3_UNORM;
+    for (const LevelLayout& L : levels) {
+      TexData::Level o;
+      u32 bh = (L.h + 3) / 4;
+      o.row_pitch = (L.w + 3) / 4 * bpu;
+      o.slice_pitch = o.row_pitch * bh;
+      o.data.resize(size_t(o.slice_pitch) * L.d);
+      for (u32 z = 0; z < L.d; ++z)
+        for (u32 by = 0; by < bh; ++by)
+          std::memcpy(o.data.data() + size_t(z) * o.slice_pitch + size_t(by) * o.row_pitch,
+                      src + L.offset + (size_t(z) * bh + by) * L.row_pitch, o.row_pitch);
+      out->levels.push_back(std::move(o));
+    }
+    return true;
+  }
+  // A8R8G8B8 in rows with any remap: one byte shuffle per four texels instead of a fetch and a
+  // remap per texel (the movie player's 1280x720 frames took 4.6 ms each).
+  if (t.format == 0x85 && !swz) {
+    // RGBA byte k comes from the remap's channel kOut[k] (remap channels in A, R, G, B order):
+    // an input byte (A, R, G, B in memory) or a constant 0 / 255 (remap ops 0 / 1).
+    static const u32 kOut[4] = {1, 2, 3, 0};
+    alignas(16) u8 shuf[16], ones[16];
+    for (u32 k = 0; k < 4; ++k) {
+      u32 c = kOut[k], sel = (t.remap >> (2 * c)) & 3, op = (t.remap >> (8 + 2 * c)) & 3;
+      for (u32 px = 0; px < 4; ++px) {
+        shuf[4 * px + k] = op >= 2 ? u8(4 * px + sel) : 0x80;
+        ones[4 * px + k] = op == 1 ? 0xff : 0;
+      }
+    }
+    const __m128i mshuf = _mm_load_si128(reinterpret_cast<const __m128i*>(shuf));
+    const __m128i mones = _mm_load_si128(reinterpret_cast<const __m128i*>(ones));
+    for (const LevelLayout& L : levels) {
+      TexData::Level o;
+      o.row_pitch = L.w * 4;
+      o.slice_pitch = o.row_pitch * L.h;
+      o.data.resize(size_t(o.slice_pitch) * L.d);
+      const u8* base = src + L.offset;
+      for (u32 z = 0; z < L.d; ++z)
+        for (u32 y = 0; y < L.h; ++y) {
+          const u8* in = base + size_t(z) * L.row_pitch * (L.h + 2 * border) + size_t(y + border) * L.row_pitch + size_t(border) * 4;
+          u8* dst = o.data.data() + size_t(z) * o.slice_pitch + size_t(y) * o.row_pitch;
+          u32 x = 0;
+          for (; x + 4 <= L.w; x += 4) {
+            __m128i v = _mm_loadu_si128(reinterpret_cast<const __m128i*>(in + 4 * x));
+            _mm_storeu_si128(reinterpret_cast<__m128i*>(dst + 4 * x), _mm_or_si128(_mm_shuffle_epi8(v, mshuf), mones));
+          }
+          for (; x < L.w; ++x)
+            for (u32 k = 0; k < 4; ++k) dst[4 * x + k] = (shuf[k] & 0x80) ? ones[k] : in[4 * x + shuf[k]];
+        }
+      out->levels.push_back(std::move(o));
+    }
+    return true;
+  }
   for (const LevelLayout& L : levels) {
     TexData::Level o;
     o.row_pitch = L.w * out_bpp;
