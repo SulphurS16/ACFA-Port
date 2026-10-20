@@ -6,7 +6,7 @@
 // Registers use the PPU VMX host layout (byte-reversed): host u32x[3] is the preferred slot.
 // Control transfers, channels and stop are handled by the interpreter/emitter directly.
 #pragma once
-#include <immintrin.h>
+#include "common/simd.h"
 
 #include <cmath>
 #include <cstring>

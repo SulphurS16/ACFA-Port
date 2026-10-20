@@ -1,4 +1,5 @@
 #include "runtime/game/pc_settings_entry.h"
+#include "common/known_inputs.h"
 
 #include <algorithm>
 #include <atomic>
@@ -64,6 +65,9 @@ void write(u32 ea, const std::string& bytes) { std::memcpy(::ppu::mem() + ea, by
 
 // Replaces the SYSTEM menu's HDD INSTALL label and help text (once found, only checked again).
 void patch_text() {
+#if ACFA_GAME_JP
+  return;  // Preserve existing Japanese/Chinese UI resources; US English pattern patch is inapplicable.
+#endif
   std::lock_guard lk(g_mu);
   std::string label_new = utf16be(kLabelNew, true), help_new = utf16be(kHelpNew, true);
   if (!holds(g_label_ea, label_new)) {

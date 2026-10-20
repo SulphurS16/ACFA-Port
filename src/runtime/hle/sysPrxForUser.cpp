@@ -1,6 +1,11 @@
+#include "common/known_inputs.h"
 // HLE: sysPrxForUser (liblv2 user-space helpers).
+#ifdef _WIN32
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
+#elif defined(__APPLE__)
+#include "platform/macos/host_thread.h"
+#endif
 
 #include <set>
 
@@ -322,8 +327,15 @@ s32 sys_spinlock_lock(Ptr<be32> lock) {
   for (u32 spins = 0;; ++spins) {
     u32 expected = 0;
     if (p->compare_exchange_weak(expected, me)) return CELL_OK;
-    if (spins > 64) SwitchToThread();
-    else _mm_pause();
+    if (spins > 64) {
+#ifdef __APPLE__
+      acfa::host::yield();
+#else
+      SwitchToThread();
+#endif
+    } else {
+      _mm_pause();
+    }
   }
 }
 s32 sys_spinlock_trylock(Ptr<be32> lock) {
@@ -422,7 +434,7 @@ s32 sys_spu_image_close(u32 img) { return spu::image_close(img); }
 // ---- process / module queries ----
 s32 sys_process_get_paramsfo(u32 buf) {
   std::memset(ppu::mem() + buf, 0, 0x40);
-  std::memcpy(ppu::mem() + buf + 1, "BLUS30187", 9);
+  std::memcpy(ppu::mem() + buf + 1, acfa::inputs::kTitleId, 9);
   return CELL_OK;
 }
 s32 sys_prx_get_module_id_by_name(u32 name, u64 flags, u32 opt) {

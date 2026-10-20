@@ -1,7 +1,9 @@
 #include "common/ini.h"
 
+#if defined(_WIN32)
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
+#endif
 
 #include <algorithm>
 #include <cctype>
@@ -82,12 +84,22 @@ void Ini::save(const std::filesystem::path& path) const {
   std::filesystem::path tmp = path;
   tmp += ".tmp";
   write_text(tmp, text());
+#if defined(_WIN32)
   if (!MoveFileExW(tmp.wstring().c_str(), path.wstring().c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
     DWORD err = GetLastError();
     std::error_code ec;
     std::filesystem::remove(tmp, ec);
     throw std::runtime_error(strprintf("cannot replace %s (error %lu)", path.string().c_str(), err));
   }
+#else
+  std::error_code ec;
+  std::filesystem::rename(tmp, path, ec);
+  if (ec) {
+    std::error_code ignored;
+    std::filesystem::remove(tmp, ignored);
+    throw std::runtime_error("cannot replace " + path.string() + ": " + ec.message());
+  }
+#endif
 }
 
 bool Ini::has_section(const std::string& section) const {

@@ -1,7 +1,11 @@
 #include "runtime/gpu/submit.h"
 
+#ifdef _WIN32
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
+#elif defined(__APPLE__)
+#include "platform/macos/host_thread.h"
+#endif
 
 #include <atomic>
 #include <condition_variable>
@@ -89,7 +93,7 @@ u64 g_chunks_sent = 0;         // FIFO thread
 u64 g_frames_sent = 0;         // FIFO thread
 std::atomic<u64> g_chunks_done{0}, g_frames_done{0};
 std::atomic<bool> g_idle{true};
-std::atomic<u64> g_busy_ticks{0};
+std::atomic<u64> g_busy_ticks{0};  // Win: QPC ticks; Apple: monotonic nanoseconds
 size_t g_queued_bytes = 0;  // recorded bytes waiting for the submission thread (under g_mu)
 // Backpressure: the recording thread waits while more than this is queued (between frame ends it
 // could otherwise run ahead without bound, e.g. through loading sequences), and spare chunks
@@ -98,7 +102,11 @@ constexpr size_t kMaxQueuedBytes = size_t(32) << 20;
 constexpr size_t kMaxQueuedChunks = 64;
 constexpr size_t kMaxFreeChunks = 64;
 constexpr size_t kMaxKeptCapacity = size_t(1) << 20;
+#ifdef _WIN32
 std::atomic<HANDLE> g_thread{nullptr};  // the submission thread (cycle counts)
+#else
+std::atomic<u64> g_thread_cpu_ns{0};  // true pthread CPU time, sampled after each submitted chunk
+#endif
 // Draws recorded since the last handover, and how many make a batch for an idle submission thread
 // (handing over every draw cost a wake-up per draw on both threads: ~1400 per frame in heavy
 // missions, about 1-2 ms of the FIFO thread and 5-6 ms of the submission thread per frame).
@@ -212,6 +220,11 @@ void update_constants(ID3D11DeviceContext* x, ID3D11Buffer* b, u32 offset, const
 }
 
 void execute(Chunk& c, ID3D11DeviceContext* x) {
+#ifdef __APPLE__
+  // Each submission chunk drains its own Objective-C temporaries. A pool on the
+  // main/window thread cannot release objects created by this worker pthread.
+  @autoreleasepool {
+#endif
   for (size_t pos = 0; pos < c.size;) {
     auto* h = reinterpret_cast<Hdr*>(c.data + pos);
     void* a = h + 1;
@@ -328,13 +341,21 @@ void execute(Chunk& c, ID3D11DeviceContext* x) {
     }
     pos += h->size;
   }
+#ifdef __APPLE__
+  }
+#endif
 }
 
 void submit_thread() {
+#ifdef __APPLE__
+  acfa::host::set_current_thread_name("rsx-submit");
+  g_thread_cpu_ns = acfa::host::current_thread_cpu_time_ns();
+#else
   SetThreadDescription(GetCurrentThread(), L"rsx-submit");
   g_thread = OpenThread(THREAD_QUERY_LIMITED_INFORMATION, FALSE, GetCurrentThreadId());
   prof::register_thread("rsx-submit", OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT | THREAD_QUERY_INFORMATION, FALSE,
                                                    GetCurrentThreadId()));
+#endif
   for (;;) {
     std::unique_ptr<Chunk> c;
     {
@@ -347,11 +368,18 @@ void submit_thread() {
       g_idle = false;
     }
     g_cv_done.notify_all();  // room in the queue
+#ifdef __APPLE__
+    const u64 t0 = acfa::host::monotonic_time_ns();
+    execute(*c, ctx());
+    g_busy_ticks.fetch_add(acfa::host::monotonic_time_ns() - t0, std::memory_order_relaxed);
+    g_thread_cpu_ns.store(acfa::host::current_thread_cpu_time_ns(), std::memory_order_relaxed);
+#else
     LARGE_INTEGER t0, t1;
     QueryPerformanceCounter(&t0);
     execute(*c, ctx());
     QueryPerformanceCounter(&t1);
     g_busy_ticks.fetch_add(u64(t1.QuadPart - t0.QuadPart), std::memory_order_relaxed);
+#endif
     u32 frames = c->frames;
     c->clear();
     {
@@ -683,13 +711,20 @@ std::string submit_memory() {
   return acfa::strprintf("%u chunks, %.0f MiB, %zu queued", g_chunks_made.load() + 1, cap / 1048576.0, queued);
 }
 
+// The second counter is OS CPU cycles on Windows and real CPU nanoseconds on Apple.
+// pacing_frame() uses the matching platform conversion, never interprets ns as x86 cycles.
 void submit_stats(double* busy_ms, u64* cpu_cycles) {
+#ifdef __APPLE__
+  *busy_ms = double(g_busy_ticks.load(std::memory_order_relaxed)) / 1000000.0;
+  *cpu_cycles = g_thread_cpu_ns.load(std::memory_order_relaxed);
+#else
   LARGE_INTEGER f;
   QueryPerformanceFrequency(&f);
   *busy_ms = double(g_busy_ticks.load(std::memory_order_relaxed)) * 1000.0 / double(f.QuadPart);
   ULONG64 cycles = 0;
   if (HANDLE t = g_thread.load()) QueryThreadCycleTime(t, &cycles);
   *cpu_cycles = cycles;
+#endif
 }
 
 }  // namespace rt::gpu

@@ -53,6 +53,15 @@ int main(int argc, char** argv) {
       return 0;
     }
     if (cmd == "cpu") {  // the generated code and runtime are built for x86-64-v3 (CMakeLists ACFA_CPU_FLAGS)
+#if defined(__aarch64__) || defined(_M_ARM64)
+#if defined(__APPLE__)
+      std::puts("Apple ARM64 host; the native Mac runtime requires explicit experimental build opt-in");
+      return 0;
+#else
+      std::puts("ARM64 host tools are native; this platform's runtime is not supported");
+      return 3;
+#endif
+#elif defined(__x86_64__) || defined(_M_X64)
       __builtin_cpu_init();
       const char* need[] = {"avx", "avx2", "fma", "bmi", "bmi2", "sse4.2", "popcnt"};
       std::string missing;
@@ -74,6 +83,10 @@ int main(int argc, char** argv) {
       }
       std::printf("CPU supports x86-64-v3 (AVX2, FMA3, BMI1/2)\n");
       return 0;
+#else
+      std::puts("unsupported runtime CPU");
+      return 3;
+#endif
     }
     if (cmd == "spu-records" && !manifest.empty() && !out.empty() && pos.size() == 1) {
       SpuRecordStats st = rebuild_spu_records(manifest, pos[0], out);

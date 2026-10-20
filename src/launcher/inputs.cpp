@@ -113,8 +113,8 @@ Status check_disc(const fs::path& disc, const Found& f) {
   } catch (const std::exception& e) {
     return {Verdict::Bad, std::string("PARAM.SFO unreadable: ") + e.what(), ""};
   }
-  if (id != ki::kTitleId) return {Verdict::Bad, "This is " + id + ", not ARMORED CORE for Answer (USA, BLUS30187).", ""};
-  if (version != ki::kDiscVersion) return {Verdict::Bad, "BLUS30187 disc " + version + ": the port supports disc 01.01.", ""};
+  if (id != ki::kTitleId) return {Verdict::Bad, "This is " + id + ", expected " + ki::kTitleId + ".", ""};
+  if (version != ki::kDiscVersion) return {Verdict::Bad, std::string(ki::kTitleId) + " disc " + version + ": expected " + ki::kDiscVersion + ".", ""};
   if (f.eboot_elf.empty())
     return {Verdict::Bad, "EBOOT.elf not found: decrypt PS3_GAME\\USRDIR\\EBOOT.BIN.",
             "EBOOT.elf found neither in " + narrow((disc / "PS3_GAME" / "USRDIR").wstring()) + " nor in the decrypted files' folder"};
@@ -122,7 +122,7 @@ Status check_disc(const fs::path& disc, const Found& f) {
   if (h != ki::kEbootElf.sha256)
     return {Verdict::Bad, "EBOOT.elf is not the decrypted executable of disc 01.01 (decrypt EBOOT.BIN again).",
             narrow(f.eboot_elf.wstring()) + ": sha256 " + h + ", expected " + ki::kEbootElf.sha256};
-  return {Verdict::Ok, "ARMORED CORE for Answer (BLUS30187, disc " + version + "), EBOOT.elf", ""};
+  return {Verdict::Ok, "ARMORED CORE for Answer (" + std::string(ki::kTitleId) + ", disc " + version + "), EBOOT.elf", ""};
 }
 
 Status check_modules(const fs::path& files, const Found& f) {

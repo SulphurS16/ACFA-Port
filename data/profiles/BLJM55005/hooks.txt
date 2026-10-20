@@ -1,0 +1,11 @@
+# BLJM55005 disc 01.02, exact ELF SHA ee03439ea2cbda0de31b32848bc8b686c60dc0761b54db25be7281afbe20d5d2.
+# Audio compatibility hooks: static mapping/field review complete; game runtime still untested.
+# Keyboard/mouse/camera/menu probing hooks intentionally absent.
+0x00ef97c8 ms_stream_dtor
+0x00ef95f8 ms_stream_dtor_delete
+0x00efad28 snd_bank_find
+0x00efa740 ms_bank_remove
+
+# Direct CPU reads by the original DXT compressor (JP executable above).
+0x003fdfa0 texture_compress
+0x00d60f30 compression_texture_lock

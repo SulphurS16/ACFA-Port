@@ -49,9 +49,9 @@ std::string import_inputs(const ImportInputs& in, const fs::path& out, const fs:
     return it != sfo.end() && std::holds_alternative<std::string>(it->second) ? std::get<std::string>(it->second) : std::string();
   };
   if (str("TITLE_ID") != ki::kTitleId)
-    throw std::runtime_error("the disc folder holds " + str("TITLE_ID") + ", not ARMORED CORE for Answer (USA, BLUS30187)");
+    throw std::runtime_error("the disc folder holds " + str("TITLE_ID") + ", expected " + ki::kTitleId);
   if (str("VERSION") != ki::kDiscVersion)
-    throw std::runtime_error("the disc folder is disc version " + str("VERSION") + "; the port supports disc version 01.01");
+    throw std::runtime_error("the disc folder is disc version " + str("VERSION") + "; expected " + ki::kDiscVersion);
   m += "[disc PARAM.SFO]\n" + sfo_to_text(sfo);
 
   // The executable.

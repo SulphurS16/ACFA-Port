@@ -76,6 +76,9 @@ void buffer_copy() {
     LOG_E("rsx", "NV0039 copy ignored (src 0x%x dst 0x%x strides %u/%u)", src, dst, in_stride, out_stride);
     return;
   }
+  const u32 source_begin = in_pitch < 0 && lines > 1 ? src + u32(s32(lines-1)*in_pitch) : src;
+  const u64 source_span = u64(lines-1)*u32(std::abs(s64(in_pitch))) + u64(line_len)*in_stride;
+  if(source_span<=UINT32_MAX) renderer_memory_read(source_begin,u32(source_span));
   if (lines == 1 && in_stride == 1 && out_stride == 1) {
     std::memmove(gptr(dst), gptr(src), line_len);
   } else {
@@ -88,7 +91,7 @@ void buffer_copy() {
     }
   }
   u32 span = lines == 1 ? line_len * out_stride : u32(std::abs(out_pitch)) * (lines - 1) + line_len * out_stride;
-  renderer_memory_written(out_pitch < 0 && lines > 1 ? dst + u32(s32(lines - 1) * out_pitch) : dst, span);
+  renderer_memory_written(out_pitch < 0 && lines > 1 ? dst + u32(s32(lines - 1) * out_pitch) : dst, span, true);
   bump(g.transfers);
 }
 
@@ -158,6 +161,8 @@ void scaled_image() {
     LOG_E("rsx", "NV3089 blit ignored (src 0x%x, in %ux%u, dsdx %f dtdy %f)", src, in_w, in_h, dsdx, dtdy);
     return;
   }
+  const u64 source_span=u64(in_h-1)*in_pitch+u64(in_w)*in_bpp;
+  if(source_span<=UINT32_MAX) renderer_memory_read(src,u32(source_span));
   bool swizzled = reg(m::NV3089_SET_CONTEXT_SURFACE) == 0x31337A73;
   u32 dst_fmt, dst_pitch = 0, dst_base, dst_loc, lw = 0, lh = 0;
   if (swizzled) {
@@ -202,7 +207,7 @@ void scaled_image() {
       hi = std::max(hi, off + out_bpp);
     }
   }
-  if (hi > lo) renderer_memory_written(dst + lo, hi - lo);
+  if (hi > lo) renderer_memory_written(dst + lo, hi - lo, true);
   bump(g.transfers);
 }
 

@@ -11,6 +11,9 @@
 #include <stdexcept>
 
 #include "common/file.h"
+#include "common/input_policy.h"
+#include "common/known_inputs.h"
+#include "common/crypto.h"
 #include "recomp/analysis.h"
 #include "recomp/emit.h"
 
@@ -84,6 +87,8 @@ int main(int argc, char** argv) {
         std::string a = argv[i];
         if (a == "--comments") opt.comments = true;
         else if (a == "--hooks" && i + 1 < argc) {  // lines "0xADDR name [# comment]"
+          if (acfa::crypto::sha256_file_hex(argv[2]) != acfa::inputs::kEbootElf.sha256)
+            throw std::runtime_error("hook map requires the exact executable of the configured game profile");
           std::vector<u8> raw = acfa::read_file(argv[++i]);
           std::istringstream in(std::string(raw.begin(), raw.end()));
           std::string line;
@@ -92,7 +97,12 @@ int main(int argc, char** argv) {
             std::istringstream ls(line);
             std::string addr, name;
             if (!(ls >> addr >> name)) continue;
-            opt.hooks[u32(std::stoul(addr, nullptr, 0))] = name;
+            if (acfa::input_policy::allow_hook(name)) {
+              auto address = u32(std::stoul(addr, nullptr, 0));
+              if (!acfa::inputs::valid_hook(address, name))
+                throw std::runtime_error("hook address/name does not belong to the selected profile: " + name);
+              opt.hooks[address] = name;
+            }
           }
           std::printf("%zu hook(s)\n", opt.hooks.size());
         }

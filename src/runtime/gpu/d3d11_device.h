@@ -1,7 +1,13 @@
 // Direct3D 11 device, swap chain and presentation (owned by the RSX FIFO thread).
 #pragma once
-#include <d3d11.h>
-#include <dxgi1_2.h>
+// Public control/presentation calls need no D3D SDK. Concrete backends include it.
+struct ID3D11Device;
+struct ID3D11DeviceContext;
+struct IDXGISwapChain1;
+struct ID3D11RenderTargetView;
+struct ID3D11ShaderResourceView;
+struct ID3D11Texture2D;
+struct ID3DBlob;
 
 #include <functional>
 #include <string>

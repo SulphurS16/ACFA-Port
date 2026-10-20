@@ -1,6 +1,10 @@
 // HLE: cellRtc. Ticks are microseconds since 0001-01-01 00:00:00 (proleptic Gregorian).
+#ifdef _WIN32
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
+#elif defined(__APPLE__)
+#include "platform/macos/host_calendar.h"
+#endif
 
 #include "runtime/hle.h"
 
@@ -65,16 +69,25 @@ void set_from_tick(DateTime& t, u64 tick) {
   t.microsecond = u32(rem % 1000000ull);
 }
 s64 tz_offset_us() {
+#ifdef __APPLE__
+  return s64(acfa::host::system_timezone_now().current_seconds) * 1000000ll;
+#else
   TIME_ZONE_INFORMATION tzi{};
   DWORD r = GetTimeZoneInformation(&tzi);
   s64 bias = tzi.Bias + (r == TIME_ZONE_ID_DAYLIGHT ? tzi.DaylightBias : 0);
   return -bias * 60ll * 1000000ll;
+#endif
 }
 u64 utc_now_tick() {
+#ifdef __APPLE__
+  // Guest epoch remains 0001-01-01; host wall time is microseconds since 1970.
+  return u64(s64(days_from_civil(1970, 1, 1) * kUsPerDay) + acfa::host::unix_wall_time_us());
+#else
   FILETIME ft;
   GetSystemTimePreciseAsFileTime(&ft);
   u64 t = (u64(ft.dwHighDateTime) << 32) | ft.dwLowDateTime;  // 100 ns since 1601-01-01
   return t / 10 + days_from_civil(1601, 1, 1) * kUsPerDay;
+#endif
 }
 
 s32 cellRtcGetCurrentClockLocalTime(Ptr<DateTime> dt) {

@@ -1,9 +1,13 @@
 // HLE: cellAudio. Ports are ring buffers of 256-sample blocks (big-endian float) in guest
 // memory; every period (256 samples at 48 kHz) the mixer consumes one block per started port,
 // advances the port read index, and sends CELL_AUDIO_EVENT_MIX to registered event queues.
-// The period clock follows the host device's consumption (WASAPI), so guest audio stays in sync.
+// The period clock is trimmed toward the host output queue, so guest audio stays in sync.
+#ifdef _WIN32
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
+#elif defined(__APPLE__)
+#include "platform/macos/host_thread.h"
+#endif
 
 #include <algorithm>
 #include <atomic>
@@ -172,11 +176,15 @@ u64 g_total_periods = 0, g_total_underruns = 0;
 // period length is trimmed by up to 0.5% toward a target queue level so the two clocks cannot
 // drift apart, and the queue's cushion is refilled with silence after an underrun.
 void audio_thread() {
+#ifdef _WIN32
   SetThreadDescription(GetCurrentThread(), L"cellAudio");
+#elif defined(__APPLE__)
+  acfa::host::set_current_thread_name("cellAudio");
+#endif
   bool dev = audio::out_init();
   std::vector<float> out(kSamples * 2), silence(kSamples * 2, 0.0f);
   const double period_us = double(kSamples) * 1e6 / 48000.0;
-  const u32 target = 1728;   // ~36 ms queued in the device: 3.6 WASAPI engine periods of 10 ms
+  const u32 target = 1728;   // ~36 ms queued in the host output (WASAPI or CoreAudio FIFO)
   const u32 low = target / 2;  // below this the cushion is rebuilt with silence
   double next = double(lv2::system_time_us());
   FILE* capture = nullptr;

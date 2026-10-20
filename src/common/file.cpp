@@ -11,22 +11,33 @@ namespace {
 
 std::mutex g_mu;
 
-std::wstring norm(const fs::path& p) {
+fs::path norm(const fs::path& p) {
   std::error_code ec;
-  fs::path abs = fs::weakly_canonical(fs::absolute(p, ec), ec);
-  std::wstring s = (ec ? fs::absolute(p) : abs).wstring();
-  for (auto& c : s) {
-    c = (wchar_t)std::towlower(c);
-    if (c == L'/') c = L'\\';
+  fs::path abs = fs::weakly_canonical(fs::absolute(p), ec);
+  if (ec) throw std::runtime_error("cannot resolve protected path: " + p.string());
+#if defined(_WIN32)
+  auto s = abs.wstring();
+  for (auto& c : s) c = static_cast<wchar_t>(std::towlower(c));
+  return fs::path(s).lexically_normal();
+#else
+  return abs.lexically_normal();
+#endif
+}
+
+bool within(fs::path p, const fs::path& root) {
+  for (;;) {
+    std::error_code ec;
+    if (p == root || fs::equivalent(p, root, ec)) return true;
+    auto parent = p.parent_path();
+    if (parent.empty() || parent == p) return false;
+    p = std::move(parent);
   }
-  while (s.size() > 3 && s.back() == L'\\') s.pop_back();
-  return s;
 }
 
 // Built-in protected roots: the game folder inside the project root (tools run from the root)
 // and, on the development PC, the read/copy-only reference projects and the Manager's records.
 // Each tool also adds the game folders it is given at runtime.
-std::vector<std::wstring> g_protected = {
+std::vector<fs::path> g_protected = {
     norm(fs::current_path() / "Armored Core - For Answer (USA)"),
 };
 
@@ -38,10 +49,10 @@ void add_protected_root(const fs::path& p) {
 }
 
 void guard_write(const fs::path& p) {
-  std::wstring n = norm(p);
+  fs::path n = norm(p);
   std::lock_guard lk(g_mu);
   for (const auto& r : g_protected) {
-    if (n == r || (n.size() > r.size() && n.compare(0, r.size(), r) == 0 && n[r.size()] == L'\\'))
+    if (within(n, r))
       throw std::runtime_error("refusing to write inside protected read-only tree: " + p.string());
   }
 }

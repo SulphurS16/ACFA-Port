@@ -1,16 +1,26 @@
+#ifdef __APPLE__
+#include "platform/macos/render_scale.h"
+#endif
 #include "runtime/ui/overlay.h"
 
+#if defined(__APPLE__)
+#include "platform/macos/metal_compat.h"
+#include <CoreGraphics/CoreGraphics.h>
+#include <CoreText/CoreText.h>
+#else
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 #include <xinput.h>
 #include <d3d11_1.h>
 #include <d2d1_1.h>
 #include <dwrite.h>
+#endif
 
 #include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cmath>
+#include <cstdio>
 #include <mutex>
 #include <string>
 #include <vector>
@@ -49,8 +59,12 @@ struct Row {
   std::string slots[2];                          // Binding: input names ("" = none)
 };
 
+#if defined(__APPLE__)
+constexpr int kPageCount = 1;
+#else
 const char* const kPages[] = {"DISPLAY", "KEYBOARD / MOUSE", "MENU KEYS"};
 constexpr int kPageCount = 3;
+#endif
 
 // Action names of the pad controls under the game's SIMPLE layout (GAME_NOTES), and the control.
 struct ControlText {
@@ -142,6 +156,10 @@ std::vector<Row> build_rows(int page) {
   std::vector<Row> rows;
   if (page == 0) {
     acfa::settings::Display d = settings::display();
+#if defined(__APPLE__)
+    // A legacy exclusive setting maps to the supported borderless window mode.
+    if (d.mode == acfa::settings::Mode::Fullscreen) d.mode = acfa::settings::Mode::Borderless;
+#endif
     double fps = cfg().fps.load();
     Row r;
     r.kind = Kind::Choice;
@@ -162,8 +180,13 @@ std::vector<Row> build_rows(int page) {
     m.kind = Kind::Choice;
     m.id = kMode;
     m.label = "DISPLAY MODE";
+#if defined(__APPLE__)
+    m.options = {"WINDOWED", "BORDERLESS FULLSCREEN"};
+    m.index = d.mode == Mode::Windowed ? 0 : 1;
+#else
     m.options = {"WINDOWED", "FULLSCREEN", "BORDERLESS FULLSCREEN"};
     m.index = d.mode == Mode::Fullscreen ? 1 : d.mode == Mode::Borderless ? 2 : 0;
+#endif
     rows.push_back(m);
     std::vector<gpu::Monitor> monitors = gpu::window_monitors();
     if (monitors.size() > 1) {  // which monitor the game uses
@@ -250,7 +273,11 @@ std::vector<Row> build_rows(int page) {
     {
       int cw = 0, ch = 0;
       gpu::window_client_size(&cw, &ch);
+#ifdef __APPLE__
+      double fit_h = 720.0 * acfa::metal::scene_scale(cw, ch, d.render_scale);
+#else
       double fit_h = std::min(double(ch), double(cw) * 9.0 / 16.0) * d.render_scale / 100.0;
+#endif
       long rh = std::lround(std::clamp(fit_h, 360.0, 2880.0)), rw = std::lround(double(rh) * 16.0 / 9.0);
       rs.value_note = acfa::strprintf("%d %%   %ld x %ld", d.render_scale, rw, rh);
     }
@@ -316,10 +343,14 @@ constexpr float kListTop = 128, kRowH = 37, kPitch = 46, kListBottom = 580;
 constexpr float kRowL = 76, kRowR = 1204;
 constexpr float kButtonsY = 590;
 constexpr int kVisibleRows = int((kListBottom - kListTop + kPitch - kRowH) / kPitch);  // 10
-constexpr float kSlotX[2] = {600, 905}, kSlotW = 290, kBindDivider = 466;  // binding rows: wider caption column
+[[maybe_unused]] constexpr float kSlotX[2] = {600, 905}, kSlotW = 290, kBindDivider = 466;  // binding rows: wider caption column
 constexpr float kArrowL = 472, kArrowR = 1054, kBarL = 505, kBarR = 1023;
 constexpr float kTabY = 34, kTabH = 30;
+#if defined(__APPLE__)
+constexpr float kTabX[kPageCount] = {1054}, kTabW[kPageCount] = {150};
+#else
 constexpr float kTabX[kPageCount] = {656, 816, 1064}, kTabW[kPageCount] = {150, 238, 140};
+#endif
 constexpr float kButtonX[2] = {76, 287}, kButtonW = 199;
 
 struct Canvas {
@@ -426,9 +457,13 @@ void apply_choice(Row& r, int index) {
       break;
     }
     case kMode:
+#if defined(__APPLE__)
+      settings::set_mode(index == 0 ? acfa::settings::Mode::Windowed : acfa::settings::Mode::Borderless);
+#else
       settings::set_mode(index == 1   ? acfa::settings::Mode::Fullscreen
                          : index == 2 ? acfa::settings::Mode::Borderless
                                       : acfa::settings::Mode::Windowed);
+#endif
       break;
     case kFsResolution: {  // keeps the refresh rate when the new resolution has it, else its highest
       int w = 0, h = 0;
@@ -628,7 +663,7 @@ void clear_slot() {
   set_binding(r.control, g_slot, 0, r.menu);
 }
 
-void capture_input(u32 code) {
+[[maybe_unused]] void capture_input(u32 code) {
   g_capturing = false;
   Row& r = g_rows[size_t(g_focus)];
   if (r.kind != Kind::Binding) return;
@@ -646,7 +681,7 @@ struct Hit {
   int index = 0, slot = 0;
   float x = 0;
 };
-Hit hit_test(int px, int py) {
+[[maybe_unused]] Hit hit_test(int px, int py) {
   Canvas c = canvas_for(g_client_w, g_client_h);
   float x = (float(px) - c.ox) / c.scale, y = (float(py) - c.oy) / c.scale;
   Hit h;
@@ -757,6 +792,7 @@ PadMode pad_mode() {
   return now >= g_cancel_from.load() && now < g_cancel_to.load() ? PadMode::Cancel : PadMode::Idle;
 }
 
+#if !defined(__APPLE__)
 bool on_key(u32 vk, bool down, bool repeat) {
   std::lock_guard<std::recursive_mutex> lk(g_mu);
   if (g_state != State::Open) return g_state != State::Closed;
@@ -881,11 +917,28 @@ void on_wheel(int delta) {
   g_scroll = std::clamp(g_scroll, 0, std::max(0, n - kVisibleRows));
 }
 
+#else
+// The Mac window does not forward keyboard/mouse input; keep these callbacks
+// controller-only even if a future event route invokes them directly.
+bool on_key(u32, bool, bool) { return is_open(); }
+void on_mouse_move(int, int) {}
+void on_mouse_button(int, bool, int, int) {}
+void on_wheel(int) {}
+#endif
+
 void tick() {
+#if defined(__APPLE__)
+  bool just_opened = false;
+#endif
   if (g_open_request.exchange(false)) {
     std::lock_guard<std::recursive_mutex> lk(g_mu);
     update_client_size();
-    if (g_state == State::Closed) open_locked();
+    if (g_state == State::Closed) {
+      open_locked();
+#if defined(__APPLE__)
+      just_opened = true;
+#endif
+    }
   }
   State st = g_state.load();
   if (st == State::Closed) return;
@@ -906,9 +959,15 @@ void tick() {
       float x = xs.Gamepad.sThumbLX / 32768.0f, y = xs.Gamepad.sThumbLY / 32768.0f;
       if (std::fabs(x) + std::fabs(y) > std::fabs(lx) + std::fabs(ly)) lx = x, ly = y;
     }
+  int stick = (ly > 0.55f ? 1 : 0) | (ly < -0.55f ? 2 : 0) | (lx < -0.55f ? 4 : 0) | (lx > 0.55f ? 8 : 0);
+#if defined(__APPLE__)
+  if (just_opened) {  // a press held from the game's SYSTEM menu must not change a setting
+    g_pad_prev = buttons;
+    g_stick_prev = stick;
+  }
+#endif
   u16 pressed = u16(buttons & ~g_pad_prev);
   g_pad_prev = buttons;
-  int stick = (ly > 0.55f ? 1 : 0) | (ly < -0.55f ? 2 : 0) | (lx < -0.55f ? 4 : 0) | (lx > 0.55f ? 8 : 0);
   int stick_pressed = stick & ~g_stick_prev;
   g_stick_prev = stick;
   std::lock_guard<std::recursive_mutex> lk(g_mu);
@@ -927,6 +986,10 @@ void tick() {
                stick_pressed;
   auto now = Clock::now();
   bool fire = false;
+#if defined(__APPLE__)
+  if (just_opened) g_repeat_at = now + std::chrono::milliseconds(380);
+  else
+#endif
   if (dir && (fresh || dir != g_repeat_dir)) {
     fire = true;
     g_repeat_at = now + std::chrono::milliseconds(380);
@@ -956,6 +1019,9 @@ u16 pad_suppressed(u32 port, u16 buttons) {
   return u16(buttons & ~s);
 }
 
+#if defined(__APPLE__)
+#include "platform/macos/overlay_macos_render.inc"
+#else
 // ---------------------------------------------------------------------------------------------
 // Drawing (presenting thread): Direct2D/DirectWrite on the swap chain's back buffer. Its D3D11
 // pipeline state is kept apart from the renderer's (SwapDeviceContextState).
@@ -1333,5 +1399,7 @@ void render(ID3D11Device* dev, ID3D11DeviceContext* ctx, ID3D11Texture2D* backbu
   if (prev) prev->Release();
   ctx1->Release();
 }
+
+#endif  // __APPLE__ drawing backend
 
 }  // namespace rt::ui

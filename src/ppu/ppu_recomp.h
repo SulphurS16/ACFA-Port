@@ -1,7 +1,7 @@
 // Instruction semantics for generated (recompiled) PPU code and the interpreter.
 // Everything here is header-only so clang can inline it into generated functions.
 #pragma once
-#include <immintrin.h>
+#include "common/simd.h"
 
 #include <atomic>
 #include <cfloat>

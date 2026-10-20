@@ -1,3 +1,4 @@
+#include "common/known_inputs.h"
 // HLE (cellSysutil): cellSaveData*2 — the system save data utility.
 //
 // Saves live in the console layout under /dev_hdd0/home/00000001/savedata/<DIR> (the project-owned
@@ -8,8 +9,12 @@
 // Writes are transactional: file operations act on an in-memory copy, and only a sequence that
 // the game finishes successfully is committed, by writing a complete new directory and swapping it
 // in (an interrupted commit is repaired the next time the directory is used).
+#ifdef _WIN32
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
+#elif defined(__APPLE__)
+#include <sys/stat.h>
+#endif
 
 #include <algorithm>
 #include <filesystem>
@@ -157,10 +162,16 @@ const char* content_name(u32 type) {
 
 // Last modification time of a host file or directory, in seconds since 1970.
 s64 host_mtime(const fs::path& p) {
+#ifdef __APPLE__
+  struct stat info{};
+  if (::stat(p.c_str(), &info) != 0) return 0;
+  return s64(info.st_mtimespec.tv_sec);
+#else
   WIN32_FILE_ATTRIBUTE_DATA a;
   if (!GetFileAttributesExW(p.c_str(), GetFileExInfoStandard, &a)) return 0;
   u64 t = (u64(a.ftLastWriteTime.dwHighDateTime) << 32) | a.ftLastWriteTime.dwLowDateTime;
   return s64(t / 10000000ull) - 11644473600ll;
+#endif
 }
 
 s32 free_kb(const fs::path& p) {
@@ -734,7 +745,7 @@ s32 cellSaveDataDelete2(u32 /*container*/) {
   if (root.empty()) return SAVEDATA_ERROR_ACCESS_ERROR;
   bool deleted = false;
   for (;;) {
-    std::vector<Entry> entries = enumerate(root, "BLUS30187");
+    std::vector<Entry> entries = enumerate(root, acfa::inputs::kTitleId);
     sort_entries(entries, 0, 0);  // newest first
     if (entries.empty()) {
       if (!deleted) sysdlg::message("There is no saved data.");

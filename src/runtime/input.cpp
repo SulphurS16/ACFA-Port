@@ -1,3 +1,4 @@
+#include "common/input_policy.h"
 // Host input state (keyboard and mouse from the window; gamepads are polled by the pad module).
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
@@ -22,6 +23,7 @@ s32 g_abs_x = -1, g_abs_y = -1;  // last absolute position (remote desktop, tabl
 
 namespace gpu {
 void input_key(u32 vk, bool down) {
+  if (!acfa::input_policy::keyboard_mouse) return;
   if (vk < 256 && !input_isolated()) g_keys[vk] = down;
 }
 void input_focus(bool focused) {
@@ -31,6 +33,7 @@ void input_focus(bool focused) {
     for (auto& k : g_keys) k = false;
 }
 void input_mouse_raw(u16 flags, s32 x, s32 y, u16 bf, u16 bd) {
+  if (!acfa::input_policy::keyboard_mouse) return;
   if (!g_captured || input_isolated()) return;
   if (flags & MOUSE_MOVE_ABSOLUTE) {
     // Normalized 0..65535 over the (virtual) screen: the difference, in screen pixels.
@@ -65,6 +68,7 @@ void input_mouse_capture(bool captured) {
 
 bool input_isolated() { return cfg().isolate_input; }
 void input_key_inject(u32 vk, bool down) {
+  if (!acfa::input_policy::keyboard_mouse) return;
   if (vk < 256) g_keys[vk] = down;
 }
 bool input_key_down(u32 vk) { return vk < 256 && g_keys[vk].load(); }
@@ -76,12 +80,14 @@ void input_mouse_take(s64* dx, s64* dy) {
 }
 bool input_mouse_button(int i) { return i >= 0 && i < 5 && ((g_mouse_buttons.load() >> i) & 1); }
 s32 input_mouse_wheel_take() { return g_wheel.exchange(0); }
-bool input_mouse_captured() { return g_captured.load(); }
+bool input_mouse_captured() { return acfa::input_policy::keyboard_mouse && g_captured.load(); }
 void input_mouse_inject(s64 dx, s64 dy) {
+  if (!acfa::input_policy::keyboard_mouse) return;
   g_mouse_dx += dx;
   g_mouse_dy += dy;
 }
 void input_mouse_button_inject(int i, bool down) {
+  if (!acfa::input_policy::keyboard_mouse) return;
   if (i < 0 || i >= 5) return;
   if (down) g_mouse_buttons |= 1u << i;
   else g_mouse_buttons &= ~(1u << i);

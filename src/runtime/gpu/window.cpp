@@ -1,3 +1,4 @@
+#include "common/input_policy.h"
 #include "runtime/gpu/window.h"
 
 #define WIN32_LEAN_AND_MEAN
@@ -48,6 +49,7 @@ void clip_cursor() {
 // Mouse capture for mouse look: the cursor is hidden and confined to the client area (isolated
 // test runs keep only the state: the real cursor stays as it is).
 void set_mouse_capture(bool on) {
+  if (!acfa::input_policy::keyboard_mouse) on = false;
   if (on == g_mouse_captured) return;
   g_mouse_captured = on;
   if (input_isolated()) {
@@ -523,7 +525,7 @@ bool window_create(const std::string& title, int w, int h, bool visible) {
   rid.usUsagePage = 0x01;  // generic desktop
   rid.usUsage = 0x02;      // mouse
   rid.hwndTarget = g_hwnd;
-  if (!RegisterRawInputDevices(&rid, 1, sizeof rid))
+  if (acfa::input_policy::keyboard_mouse && !RegisterRawInputDevices(&rid, 1, sizeof rid))
     LOG_W("input", "raw mouse input unavailable (RegisterRawInputDevices failed, error %lu)", GetLastError());
   if (visible && (input_isolated() || cfg().no_activate)) {
     ShowWindow(g_hwnd, SW_SHOWNOACTIVATE);  // test runs never take the focus

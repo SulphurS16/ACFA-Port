@@ -1,8 +1,13 @@
 #include "runtime/sysdialog.h"
 
+#if defined(_WIN32)
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
-#include <xinput.h>
+#elif defined(__APPLE__)
+#include <CoreFoundation/CoreFoundation.h>
+#else
+#error "System dialogs require a supported host platform"
+#endif
 
 #include <algorithm>
 #include <atomic>
@@ -36,17 +41,33 @@ bool scripted(std::string*) { return false; }
 
 std::u16string utf16(const std::string& s) {
   if (s.empty()) return {};
+#if defined(_WIN32)
   int n = MultiByteToWideChar(CP_UTF8, 0, s.data(), int(s.size()), nullptr, 0);
   std::wstring w(size_t(n), L'\0');
   MultiByteToWideChar(CP_UTF8, 0, s.data(), int(s.size()), w.data(), n);
   return std::u16string(w.begin(), w.end());
+#else
+  const auto text = CFStringCreateWithBytes(kCFAllocatorDefault, reinterpret_cast<const UInt8*>(s.data()),
+                                           CFIndex(s.size()), kCFStringEncodingUTF8, false);
+  if (!text) return {};
+  const auto count = CFStringGetLength(text);
+  std::u16string out(size_t(count), u'\0');
+  static_assert(sizeof(char16_t) == sizeof(UniChar));
+  CFStringGetCharacters(text, CFRangeMake(0, count), reinterpret_cast<UniChar*>(out.data()));
+  CFRelease(text);
+  return out;
+#endif
 }
 
 std::string date_text(s64 t) {
   if (!t) return "";
   time_t tt = time_t(t);
   tm lt{};
-  localtime_s(&lt, &tt);
+#if defined(_WIN32)
+  if (localtime_s(&lt, &tt)) return "";
+#else
+  if (!localtime_r(&tt, &lt)) return "";
+#endif
   char b[32];
   std::strftime(b, sizeof b, "%Y/%m/%d %H:%M", &lt);
   return b;
@@ -171,8 +192,10 @@ bool show(Dlg* d) {
   } hold;
   if (!gpu::window_handle()) return false;
   d->pad_last = pad_now();
+#if defined(_WIN32)
   const bool captured = gpu::window_mouse_captured();
   if (captured) gpu::window_set_mouse_capture(false);  // the dialog takes the mouse
+#endif
   {
     std::unique_lock lk(g_dmu);
     g_dlg = d;
@@ -181,7 +204,9 @@ bool show(Dlg* d) {
     g_dlg = nullptr;
   }
   gpu::window_refresh_cursor();
+#if defined(_WIN32)
   if (captured) gpu::window_set_mouse_capture(true);
+#endif
   return true;
 }
 
@@ -207,6 +232,7 @@ bool view(ui::DialogView* out) {
   return true;
 }
 
+#if defined(_WIN32)
 void on_key(u32 vk, bool down, bool repeat) {
   std::lock_guard lk(g_dmu);
   Dlg* d = g_dlg;
@@ -302,6 +328,16 @@ void on_wheel(int delta) {
   rest -= notches * WHEEL_DELTA;
   if (notches) list_move(d, -notches);
 }
+
+#else
+// macOS system overlays are controller-only, just like guest pad input. Keep
+// these public callbacks inert even if a future window event route calls one.
+void on_key(u32, bool, bool) {}
+void on_char(u32) {}
+void on_mouse_move(int, int) {}
+void on_mouse_button(int, bool, int, int) {}
+void on_wheel(int) {}
+#endif
 
 void tick() {
   std::lock_guard lk(g_dmu);

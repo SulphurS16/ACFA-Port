@@ -10,6 +10,8 @@
 #include <sstream>
 
 #include "common/crypto.h"
+#include "common/game_profile.h"
+#include "common/input_policy.h"
 #include "common/known_inputs.h"
 #include "common/privacy.h"
 #include "launcher/download.h"
@@ -74,7 +76,7 @@ std::string content_hash(const fs::path& p) {
   }
 }
 
-fs::path prepared(const SetupConfig& c) { return c.data / "game" / "BLUS30187"; }
+fs::path prepared(const SetupConfig& c) { return c.data / "game" / acfa::inputs::kTitleId; }
 // The one dev_flash file the game reads (flashATRAC.pic), imported from the player's files.
 fs::path flash(const SetupConfig& c) { return c.data / "game" / "dev_flash"; }
 fs::path build_dir(const SetupConfig& c) { return c.data / "build"; }
@@ -106,11 +108,12 @@ std::string stamp(const SetupConfig& c, size_t step) {
     }
     case kRecompile:
       return "prepared " + content_hash(prepared(c) / "manifest.txt") + "\nlle " + content_hash(prepared(c) / "lle" / "manifest.txt") +
-             "\nhooks " + content_hash(c.src / "src" / "runtime" / "game" / "hooks.txt") + "\nrecompiler " +
+             "\nhooks " + content_hash(c.src / acfa::inputs::kHooksFile) + "\nrecompiler " +
              file_stamp(build_dir(c) / "acfa-recomp.exe");
     case kSpu:
       return "prepared " + content_hash(prepared(c) / "manifest.txt") + "\nlle " + content_hash(prepared(c) / "lle" / "manifest.txt") +
-             "\nmanifest " + content_hash(c.src / "data" / "spu_manifest.txt") + "\nspurecomp " +
+             "\nmanifest " + acfa::game_profile::kSpuManifestFile + " " +
+             content_hash(c.src / acfa::game_profile::kSpuManifestFile) + "\nspurecomp " +
              file_stamp(build_dir(c) / "acfa-spurecomp.exe");
     default:
       return "";
@@ -424,7 +427,9 @@ void Setup::run(SetupConfig c) {
     auto configure = [&] {
       return exec(cmake_exe(c),
                   {L"-S", fwd(c.src), L"-B", fwd(build_dir(c)), L"-G", L"Ninja", L"-DCMAKE_BUILD_TYPE=Release", L"-DCMAKE_C_COMPILER=clang",
-                   L"-DCMAKE_CXX_COMPILER=clang++", L"-DACFA_GEN_DIR=" + fwd(gen_dir(c) / "ppu"),
+                   L"-DCMAKE_CXX_COMPILER=clang++",
+                   L"-DACFA_GAME_PROFILE=" + widen(acfa::game_profile::kCMakeProfileName), L"-DACFA_CONTROLLER_ONLY=" + std::wstring(acfa::input_policy::keyboard_mouse ? L"OFF" : L"ON"),
+                   L"-DACFA_GEN_DIR=" + fwd(gen_dir(c) / "ppu"),
                    L"-DACFA_SPU_GEN_DIR=" + fwd(gen_dir(c) / "spu")},
                   c.data);
     };
@@ -463,7 +468,7 @@ void Setup::run(SetupConfig c) {
            // then compiles only those (an update rebuilds what changed).
            std::vector<std::wstring> a = {L"emit", w(prepared(c) / "eboot.elf"), w(gen_dir(c) / "ppu")};
            for (const char* m : ki::kModules) a.insert(a.end(), {L"--module", w(prepared(c) / "lle" / (widen(m) + L".elf"))});
-           a.insert(a.end(), {L"--hooks", w(c.src / "src" / "runtime" / "game" / "hooks.txt")});
+           a.insert(a.end(), {L"--hooks", w(c.src / acfa::inputs::kHooksFile)});
            return exec(build_dir(c) / "acfa-recomp.exe", a, c.data);
          },
          "Translating the game code failed"},
@@ -471,7 +476,7 @@ void Setup::run(SetupConfig c) {
          [&] {
            fs::create_directories(gen_dir(c) / "spu", ec);  // acfa-spurecomp, too, writes only what changed
            fs::remove_all(c.data / "spu_cache", ec);  // records of another system software version go too
-           return exec(prep, {L"spu-records", L"--manifest", w(c.src / "data" / "spu_manifest.txt"), L"--out", w(c.data / "spu_cache"), w(prepared(c))},
+           return exec(prep, {L"spu-records", L"--manifest", w(c.src / acfa::game_profile::kSpuManifestFile), L"--out", w(c.data / "spu_cache"), w(prepared(c))},
                        c.data) &&
                   exec(build_dir(c) / "acfa-spurecomp.exe", {w(gen_dir(c) / "spu"), w(c.data / "spu_cache")}, c.data);
          },

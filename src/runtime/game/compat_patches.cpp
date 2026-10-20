@@ -8,7 +8,15 @@
 #include "ppu/ppu_recomp.h"
 #include "runtime/log.h"
 
-void f_00ede7e8(ppu::Ctx&);  // MultiStream: unregister a stream (takes the stream list lock)
+#include "common/known_inputs.h"
+#if ACFA_GAME_JP
+void f_00edef38(ppu::Ctx&);
+#define ACFA_STREAM_UNREGISTER f_00edef38
+#else
+void f_00ede7e8(ppu::Ctx&);
+#define ACFA_STREAM_UNREGISTER f_00ede7e8
+#endif
+//  // MultiStream: unregister a stream (takes the stream list lock)
 
 namespace ppu {
 namespace {
@@ -32,7 +40,7 @@ void call_guest_r3(Ctx& ctx, void (*fn)(Ctx&), u64 arg) {
 // no-op once the tick has dropped it.
 void unregister_inactive_stream(Ctx& ctx) {
   u32 s = u32(ctx.r[3]);
-  if (s && r8(s + 828) == 0) call_guest_r3(ctx, f_00ede7e8, s);
+  if (s && r8(s + 828) == 0) call_guest_r3(ctx, ACFA_STREAM_UNREGISTER, s);
 }
 
 }  // namespace

@@ -1,0 +1,2 @@
+# Keep vendored SIMD headers collapsed during code review.
+third_party/simde/** linguist-vendored

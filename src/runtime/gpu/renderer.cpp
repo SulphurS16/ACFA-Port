@@ -5,14 +5,24 @@
 // fragment programs are translated to HLSL (vp_hlsl/fp_hlsl) and cached. Vertex data is uploaded
 // as raw guest bytes and decoded by the vertex shader (see "Raw vertex streams"). Known gaps are
 // logged once and listed in docs/STATUS.md.
-#include <d3dcompiler.h>
+#include "runtime/gpu/host_gpu_api.h"
+#include "runtime/memory.h"
+#include "runtime/gpu/content_snapshot.h"
+#ifdef __APPLE__
+#include "platform/macos/render_scale.h"
+#endif
+#ifdef __APPLE__
+#include "platform/macos/host_thread.h"
+#else
 #include <x86intrin.h>
+#endif
 
 #include <algorithm>
 #include <array>
 #include <atomic>
 #include <cmath>
 #include <cstring>
+#include <stdexcept>
 #include <filesystem>
 #include <map>
 #include <mutex>
@@ -46,6 +56,14 @@ namespace rt::rsx {
 namespace {
 
 using gpu::device;
+
+u64 renderer_ticks() {
+#ifdef __APPLE__
+  return acfa::host::monotonic_time_ns();
+#else
+  return __rdtsc();
+#endif
+}
 
 // Objects may still be referenced by recorded calls (submit.h): they are released after those.
 template <typename T>
@@ -95,16 +113,21 @@ u64 g_frame = 0;
 struct RenderStats {
   u64 draws = 0, vcached = 0, vconverted = 0, tex_hashed = 0, tex_uploaded = 0, surfaces = 0, target_binds = 0, collections = 0,
       bytes_queried = 0, vertices = 0, max_draw_vertices = 0, vbytes = 0, query_calls = 0, query_ticks = 0, query_written = 0,
+      tex_snapshot_hits=0, tex_snapshot_bytes=0, stream_checks=0,stream_hits=0,stream_hit_bytes=0,
       cond_draws = 0, cond_skipped = 0, zpass_reports = 0, zcull_reports = 0;
 };
 RenderStats g_rs, g_rs_last;
 
-// Phase timing (rsx_internal.h): performance counter ticks per phase.
+// Phase timing: x86 TSC ticks on Windows; monotonic nanoseconds on Apple.
 const char* const kPhaseNames[kPhCount] = {"methods",    "surfaces", "shaders", "textures", "vertices",
                                            "write checks", "draw calls", "flip", "waits", "state",
                                            "constants",  "uploads"};
 u64 g_phase_ticks[kPhCount];
+#ifdef __APPLE__
+double g_ms_per_tick = 1.0e-6;  // fixed ns -> ms, no x86 TSC calibration
+#else
 double g_ms_per_tick = 0;  // TSC rate (pacing_frame)
+#endif
 int g_phase = kPhMethods;
 u64 g_phase_at = 0;
 
@@ -156,6 +179,8 @@ struct Surface {
   u32 width = 0, height = 0;  // storage: the game's size times the render scale
   bool depth = false;
   u32 gw = 0, gh = 0;  // the game's size (antialiased surfaces: their super-sized storage)
+  u32 guest_pitch = 0;
+  u64 readback_serial = 0;
   DXGI_FORMAT dxgi = DXGI_FORMAT_UNKNOWN;
   ID3D11Texture2D* tex = nullptr;
   ID3D11RenderTargetView* rtv = nullptr;
@@ -379,8 +404,12 @@ Targets bind_targets(bool want_depth) {
     default: break;
   }
   if ((sf >> 8 & 15) == 2) warn_once("swizzled-rt", "swizzled render targets are rendered as linear surfaces");
-  for (u32 i = 0; i < n; ++i)
-    t.color[t.count++] = get_surface(dma_location(reg(kDmaReg[idx[i]])), reg(kOffsetReg[idx[i]]), t.color_format, gsw, gsh, false);
+  static const u32 kPitchReg[4]={m::SET_SURFACE_PITCH_A,m::SET_SURFACE_PITCH_B,m::SET_SURFACE_PITCH_C,m::SET_SURFACE_PITCH_D};
+  for (u32 i = 0; i < n; ++i) {
+    auto* surface=get_surface(dma_location(reg(kDmaReg[idx[i]])),reg(kOffsetReg[idx[i]]),t.color_format,gsw,gsh,false);
+    surface->guest_pitch=reg(kPitchReg[idx[i]]);
+    t.color[t.count++]=surface;
+  }
   if (want_depth && t.depth_format)
     t.depth = get_surface(dma_location(reg(m::SET_CONTEXT_DMA_ZETA)), reg(m::SET_SURFACE_ZETA_OFFSET), t.depth_format, gsw, gsh, true);
   const Surface* first = t.count ? t.color[0] : t.depth;
@@ -555,6 +584,11 @@ struct StateCache {
     if (it != map.end()) return it->second;
     Obj* o = nullptr;
     create(&d, &o);
+#ifdef __APPLE__
+    // Unsupported native states must surface a diagnostic, not enter the cache
+    // as nullptr and silently render with an unrelated default Metal sampler/state.
+    if (!o) throw std::runtime_error("Metal renderer state creation: " + acfa::metal::last_error(device().dev));
+#endif
     map[h] = o;
     return o;
   }
@@ -788,6 +822,7 @@ const PsEntry* pixel_shader(const gpu::FpEnv& env, const u8* ucode, u32 max_byte
 // ---------------------------------------------------------------------------------------------
 // Textures
 struct TexEntry {
+  gpu::ContentSnapshot snapshot;
   ID3D11Resource* tex = nullptr;
   ID3D11ShaderResourceView* srv = nullptr;
   u64 hash = 0, checked_frame = ~0ull;
@@ -835,13 +870,13 @@ bool query_pages(u32 first, u32 end, std::vector<u32>& pages) {
   g_rs.bytes_queried += u64(end - first) << kGranuleShift;
   ++g_rs.query_calls;
   size_t before = pages.size();
-  u64 t0 = __rdtsc();
+  u64 t0 = renderer_ticks();
   bool ok = vm::take_written_pages(first << kGranuleShift, (end - first) << kGranuleShift, pages);
-  g_rs.query_ticks += __rdtsc() - t0;
+  g_rs.query_ticks += renderer_ticks() - t0;
   g_rs.query_written += pages.size() - before;
   if (ok) return true;
   g_track_writes = false;
-  LOG_W("gpu", "guest write tracking query failed: cached textures and vertices are re-checked by hashing");
+  LOG_W("gpu", "guest write tracking unavailable: using bounded exact-content caches with hash/ring fallback");
   return false;
 }
 // Brings the page serials of [ea, ea + size) up to date for this collection epoch. Pages found
@@ -914,7 +949,9 @@ bool written_since(u32 ea, u32 size, u32 serial) {
   return false;
 }
 std::unordered_map<u64, TexEntry> g_tex;  // key: offset/location/format/dims
-u64 g_tex_bytes = 0;
+u64 g_tex_bytes = 0, g_tex_snapshot_bytes = 0;
+constexpr u64 kTexSnapshotBudget = 192ull << 20;
+constexpr u32 kTexSnapshotMax = 16u << 20;
 constexpr u64 kTexBudget = 512ull << 20;
 
 // Each mission brings its own textures: once the budget is exceeded, entries unused for ten
@@ -934,6 +971,7 @@ void tex_trim() {
     release(e.srv);
     release(e.tex);
     g_tex_bytes -= e.bytes;
+    g_tex_snapshot_bytes -= e.snapshot.size();
     g_tex.erase(key);
     ++dropped;
   }
@@ -1141,8 +1179,12 @@ void update_render_scale() {
   gpu::window_client_size(&w, &h);
   if (w <= 0 || h <= 0) return;  // minimized: keep the scale
   int pct = cfg().render_scale ? cfg().render_scale : settings::display().render_scale;
+#ifdef __APPLE__
+  const float target = acfa::metal::scene_scale(w, h, pct);
+#else
   float fit_h = std::min(float(h), float(w) * 9.0f / 16.0f);
   float target = std::clamp(fit_h / 720.0f * float(pct) / 100.0f, 0.5f, 4.0f);
+#endif
   static float pending = 0;
   static int stable = 0;
   if (std::abs(target - g_scale) < 0.001f) {
@@ -1214,13 +1256,34 @@ ID3D11ShaderResourceView* texture_view(const gpu::TexDesc& t, float* scale) {
     e.checked_serial = g_mem_serial;
     return e.srv;
   }
-  u64 h = hash_bytes(::ppu::mem() + ea, size);
+  const u8* source = ::ppu::mem() + ea;
+#ifdef __APPLE__
+  if (!g_track_writes && e.srv && e.snapshot.matches(source,size)) {
+    ++g_rs.tex_snapshot_hits;
+    g_rs.tex_snapshot_bytes += size;
+    return e.srv;
+  }
+  // Exact SIMD comparison replaces the serial hash chain for unchanged textures.
+  // Capture before conversion so the verified snapshot is what is actually uploaded.
+  if (!g_track_writes && size <= kTexSnapshotMax &&
+      g_tex_snapshot_bytes - e.snapshot.size() + size <= kTexSnapshotBudget) {
+    g_tex_snapshot_bytes -= e.snapshot.size();
+    e.snapshot.capture(source,size);
+    g_tex_snapshot_bytes += size;
+    source = static_cast<const u8*>(e.snapshot.data());
+  } else {
+    g_tex_snapshot_bytes -= e.snapshot.size();
+    e.snapshot.clear();
+  }
+#endif
+  u64 h = hash_bytes(source, size);
   ++g_rs.tex_hashed;
   e.checked_serial = g_mem_serial;
   if (e.srv && e.hash == h) return e.srv;
   gpu::TexData data;
   ++g_rs.tex_uploaded;
-  if (!gpu::convert_texture(t, ::ppu::mem() + ea, &data)) {
+  if (!gpu::convert_texture(t, source, &data)) {
+    g_tex_snapshot_bytes -= e.snapshot.size();e.snapshot.clear();
     warn_once("tex-cvt-" + std::to_string(t.format), "texture conversion failed: " + data.error);
     return nullptr;
   }
@@ -1664,12 +1727,15 @@ void set_pipeline_state(const Targets& t) {
 // recorded when first seen and stored when seen again in a later frame without writes in between;
 // data rewritten every frame keeps going through the rings (buffer creation is costly).
 struct StreamEntry {
+  gpu::ContentSnapshot snapshot;
+  bool candidate() const { return !buf; }
   ID3D11Buffer* buf = nullptr;
   ID3D11ShaderResourceView* srv = nullptr;
   u32 serial = 0, bytes = 0;
   u64 last_frame = 0, seen_frame = ~0ull;
 };
 struct IndexEntry {
+  bool candidate() const { return !ib; }
   ID3D11Buffer* ib = nullptr;
   u32 count = 0, lo = 0, hi = 0, serial = 0, bytes = 0;
   D3D11_PRIMITIVE_TOPOLOGY topo = D3D11_PRIMITIVE_TOPOLOGY_UNDEFINED;
@@ -1679,11 +1745,16 @@ struct IndexEntry {
 std::unordered_map<u64, StreamEntry> g_streams;     // key: ea << 32 | size
 std::unordered_map<u64, IndexEntry> g_index_lists;  // key: hash of the index source and primitive
 u64 g_vdata_bytes = 0;
+u64 g_stream_snapshot_bytes = 0;
+constexpr u64 kStreamSnapshotBudget = 64ull << 20;
+constexpr u32 kStreamSnapshotMax = 2u << 20;
 constexpr u64 kVdataBudget = 512ull << 20;
 constexpr u32 kStreamCacheMin = 16u << 10;  // bytes; smaller streams always go through the ring
 constexpr u32 kIndexCacheMin = 256;         // indices
 
 void vdata_release(StreamEntry& e) {
+  g_stream_snapshot_bytes -= e.snapshot.size();
+  e.snapshot.clear();
   release(e.srv);
   release(e.buf);
   g_vdata_bytes -= e.bytes;
@@ -1698,11 +1769,11 @@ void vdata_release(IndexEntry& e) {
 // candidates unused for two (at frame boundaries; while everything is in use, once a second).
 void vdata_trim() {
   static u64 next_scan = 0;
-  if ((g_vdata_bytes <= kVdataBudget && g_streams.size() + g_index_lists.size() < 50000) || g_frame < next_scan) return;
+  if ((g_vdata_bytes <= kVdataBudget && g_streams.size() + g_index_lists.size() < 50000 && g_stream_snapshot_bytes < (48ull << 20)) || g_frame < next_scan) return;
   next_scan = g_frame + 60;
   auto trim = [](auto& map) {
     for (auto it = map.begin(); it != map.end();) {
-      if (it->second.last_frame + 120 < g_frame || (!it->second.bytes && it->second.last_frame + 2 < g_frame)) {
+      if (it->second.last_frame + 120 < g_frame || (it->second.candidate() && it->second.last_frame + 2 < g_frame)) {
         vdata_release(it->second);
         it = map.erase(it);
       } else {
@@ -1719,6 +1790,37 @@ void vdata_trim() {
 StreamEntry* stream_cached(u32 ea, u32 size) {
   StreamEntry& e = g_streams[(u64(ea) << 32) | size];
   e.last_frame = g_frame;
+#ifdef __APPLE__
+  if (!g_track_writes) {
+    // No dirty-page API on macOS. Validate every use, even within one frame.
+    // Keep the exact CPU snapshot uploaded to an immutable GPU allocation.
+    if (size > kStreamSnapshotMax) return nullptr;
+    const auto* source = ::ppu::mem() + ea;
+    ++g_rs.stream_checks;
+    const bool same = e.snapshot.matches(source, size);
+    if (same && e.buf) {++g_rs.stream_hits;g_rs.stream_hit_bytes+=size;return &e;}
+    if (!same) {
+      vdata_release(e);
+      e.seen_frame = g_frame;
+      if (g_stream_snapshot_bytes + size > kStreamSnapshotBudget) return nullptr;
+      e.snapshot.capture(source, size);
+      e.bytes = size;
+      g_stream_snapshot_bytes += size;
+      g_vdata_bytes += size;
+      return nullptr;
+    }
+    // Only promote contents stable across frames. Dynamic streams stay in rings.
+    if (e.seen_frame == g_frame) return nullptr;
+    D3D11_BUFFER_DESC bd{size,D3D11_USAGE_IMMUTABLE,D3D11_BIND_SHADER_RESOURCE,0,D3D11_RESOURCE_MISC_BUFFER_ALLOW_RAW_VIEWS,0};
+    D3D11_SUBRESOURCE_DATA init{e.snapshot.data(),0,0};
+    if (FAILED(device().dev->CreateBuffer(&bd,&init,&e.buf)) || !(e.srv=raw_view(e.buf,size))) {
+      release(e.buf); return nullptr;
+    }
+    e.bytes += size;
+    g_vdata_bytes += size;
+    return &e;
+  }
+#endif
   if (e.buf) {
     if (g_track_writes && !written_since(ea, size, e.serial)) return &e;
     vdata_release(e);  // rewritten: a candidate again
@@ -2411,7 +2513,7 @@ void present_memory(const DisplayBuffer& b) {
 }  // namespace
 
 int phase_switch(int p) {
-  u64 now = __rdtsc();  // a QueryPerformanceCounter call per phase change was ~3% of the FIFO thread
+  u64 now = renderer_ticks();  // platform wall-clock counter; Apple uses monotonic ns
   if (g_phase_at) g_phase_ticks[g_phase] += now - g_phase_at;
   g_phase_at = now;
   int prev = g_phase;
@@ -2573,8 +2675,11 @@ void pacing_frame() {
   static u64 prev_idle = 0;
   static u64 prev_ticks[kPhCount] = {}, window_ticks[kPhCount] = {};
   static u64 window_idle = 0;
-  // Phase ticks are time stamp counter ticks (phase_switch); their rate is measured against the
-  // performance counter since the first frame.
+#ifdef __APPLE__
+  double& ms_per_tick = g_ms_per_tick;
+  ms_per_tick = 1.0e-6;
+#else
+  // Windows phase ticks are time stamp counter ticks, calibrated against QPC.
   static u64 tsc0 = 0;
   static LARGE_INTEGER qpc0{}, qpf{};
   double& ms_per_tick = g_ms_per_tick;
@@ -2582,7 +2687,7 @@ void pacing_frame() {
   {
     LARGE_INTEGER q;
     QueryPerformanceCounter(&q);
-    u64 tsc = __rdtsc();
+    u64 tsc = renderer_ticks();
     if (!tsc0) {
       tsc0 = tsc;
       qpc0 = q;
@@ -2591,6 +2696,7 @@ void pacing_frame() {
       ms_per_tick = double(q.QuadPart - qpc0.QuadPart) * 1000.0 / double(qpf.QuadPart) / double(tsc - tsc0);
     }
   }
+#endif
   phase_switch(g_phase);  // account the current phase up to now
   double now = log_time();
   u32 compiled = 0, cached = 0;
@@ -2654,18 +2760,26 @@ void pacing_frame() {
       if (p == kPhMethods) t -= (idle - window_idle) / 1000.0;
       if (t / n >= 0.05) times += acfa::strprintf(", %s %.1f", kPhaseNames[p], t / n);
     }
-    // The thread's own CPU time (cycles it ran, counted by the OS; TSC rate measured over the
-    // window): unlike the phase times it excludes time the thread waited for a CPU, so it stays
+    // CPU time: Windows OS cycles calibrated over this window; Apple CLOCK_THREAD_CPUTIME_ID
+    // nanoseconds. Unlike phase wall times, this excludes waiting for a CPU, so it stays
     // comparable when other programs load the machine.
     static u64 window_cycles = 0, window_tsc = 0;
     static double window_wall = 0;
+#ifdef __APPLE__
+    const u64 cycles = acfa::host::current_thread_cpu_time_ns();  // true CPU ns, not emulated cycles
+#else
     ULONG64 cycles = 0;
     QueryThreadCycleTime(GetCurrentThread(), &cycles);
-    u64 tsc = __rdtsc();
+#endif
+    u64 tsc = renderer_ticks();
     std::string cpu;
     if (window_tsc && now > window_wall) {
-      double tsc_per_ms = double(tsc - window_tsc) / ((now - window_wall) * 1000.0);
-      cpu = acfa::strprintf("; on CPU %.1f", double(cycles - window_cycles) / tsc_per_ms / n);
+#ifdef __APPLE__
+      constexpr double cpu_units_per_ms = 1000000.0;
+#else
+      const double cpu_units_per_ms = double(tsc - window_tsc) / ((now - window_wall) * 1000.0);
+#endif
+      cpu = acfa::strprintf("; on CPU %.1f", double(cycles - window_cycles) / cpu_units_per_ms / n);
     }
     // The submission thread (submit.h): time executing D3D11 calls and its own CPU time.
     static double sub_busy_prev = 0;
@@ -2674,9 +2788,13 @@ void pacing_frame() {
     u64 sub_cycles = 0;
     gpu::submit_stats(&sub_busy, &sub_cycles);
     if (window_tsc && now > window_wall && gpu::rec().async()) {
-      double tsc_per_ms = double(tsc - window_tsc) / ((now - window_wall) * 1000.0);
+#ifdef __APPLE__
+      constexpr double cpu_units_per_ms = 1000000.0;
+#else
+      const double cpu_units_per_ms = double(tsc - window_tsc) / ((now - window_wall) * 1000.0);
+#endif
       cpu += acfa::strprintf("; submit thread: busy %.1f, on CPU %.1f (%s)", (sub_busy - sub_busy_prev) / n,
-                             double(sub_cycles - sub_cycles_prev) / tsc_per_ms / n, gpu::submit_memory().c_str());
+                             double(sub_cycles - sub_cycles_prev) / cpu_units_per_ms / n, gpu::submit_memory().c_str());
     }
     sub_busy_prev = sub_busy;
     sub_cycles_prev = sub_cycles;
@@ -2718,6 +2836,9 @@ void present_buffer(u32 id, const DisplayBuffer& b) {
           pf(&RenderStats::bytes_queried) / 1048576.0, pf(&RenderStats::query_ticks) * g_ms_per_tick, pf(&RenderStats::query_written),
           g_streams.size() + g_index_lists.size(), g_vdata_bytes / 1048576.0, g_tex.size(), g_tex_bytes / 1048576.0,
           g_surfaces.size(), surf_bytes / 1048576.0);
+    LOG_I("perf", "content cache per frame: streams %.0f checks, %.0f hits, %.0f KiB reused; textures %.1f exact hits, %.1f MiB checked; texture CPU snapshots %.1f MiB",
+      pf(&RenderStats::stream_checks),pf(&RenderStats::stream_hits),pf(&RenderStats::stream_hit_bytes)/1024.0,
+      pf(&RenderStats::tex_snapshot_hits),pf(&RenderStats::tex_snapshot_bytes)/1048576.0,g_tex_snapshot_bytes/1048576.0);
     g_rs_last = g_rs;
   }
   ++g_frame;
@@ -2901,7 +3022,53 @@ u32 g_covered_put = ~0u;
 
 void renderer_guest_sync() { g_writes_stale = true; }
 
-void renderer_memory_written(u32 ea, u32 size) {
+// Copy engines read guest bytes, but rendered surfaces live in the native GPU.
+// Synchronize only a requested, dirty color source rather than every frame/label.
+bool renderer_memory_read(u32 ea,u32 size) {
+  if(!size||!g_have_device)return false;
+  Surface* selected=nullptr;
+  for(auto* s:g_surfaces) {
+    if(s->depth||!s->written||!s->guest_pitch||!s->gw||!s->gh)continue;
+    const u32 base=offset_to_ea(s->offset,s->location);
+    const u64 span=u64(s->guest_pitch)*(s->gh-1)+u64(s->gw)*4;
+    if(!base||u64(ea)>=u64(base)+span||u64(ea)+size<=base)continue;
+    if(!selected||s->written>selected->written)selected=s;
+  }
+  if(!selected||selected->readback_serial==selected->written)return false;
+  {
+    auto* s=selected;
+    const u32 base=offset_to_ea(s->offset,s->location);
+    const u64 span=u64(s->guest_pitch)*(s->gh-1)+u64(s->gw)*4;
+    if(s->format!=8&&s->format!=5&&s->format!=4){
+      warn_once("readback-format-"+std::to_string(s->format),"CPU transfer source requires unsupported color readback format "+std::to_string(s->format));return false;
+    }
+    if(s->guest_pitch<s->gw*4||span>UINT32_MAX||!vm::committed(base,u32(span)))return false;
+    gpu::rec().finish();
+    std::vector<u8> rgba;u32 w=0,h=0;
+    if(!gpu::read_back_texture(s->tex,rgba,w,h)||!w||!h)return false;
+    for(u32 y=0;y<s->gh;++y)for(u32 x=0;x<s->gw;++x){
+      const u32 sx=std::min(w-1,u32((u64(2*x+1)*w)/(2*s->gw)));
+      const u32 sy=std::min(h-1,u32((u64(2*y+1)*h)/(2*s->gh)));
+      const auto* p=rgba.data()+(size_t(sy)*w+sx)*4;
+      auto* d=::ppu::mem()+base+size_t(y)*s->guest_pitch+x*4;
+      d[0]=s->format==8?p[3]:255;d[1]=p[0];d[2]=p[1];d[3]=p[2];
+    }
+    s->readback_serial=s->written;
+    LOG_I("gpu","rendered color readback for CPU transfer: %ux%u -> %ux%u fmt %u, pitch %u, guest 0x%08x",w,h,s->gw,s->gh,s->format,s->guest_pitch,base);
+  }
+  return true;
+}
+
+void renderer_memory_written(u32 ea, u32 size, bool transfer) {
+  // An explicit CPU transfer supersedes old native bytes at the same address.
+  // A later GPU draw advances written and makes that native surface dirty again.
+  if(transfer) for(auto* surface:g_surfaces) {
+    if(surface->depth||!surface->guest_pitch)continue;
+    const u32 base=offset_to_ea(surface->offset,surface->location);
+    const u64 span=u64(surface->guest_pitch)*(surface->gh-1)+u64(surface->gw)*4;
+    if(base&&size&&u64(ea)<u64(base)+span&&u64(ea)+size>base)surface->readback_serial=surface->written;
+  }
+
   // The RSX wrote guest memory: data cached from those pages is stale from now on, before a
   // collection would report it.
   if (g_page_serial.empty() || !size) return;
