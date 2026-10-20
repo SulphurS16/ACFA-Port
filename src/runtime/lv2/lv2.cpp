@@ -2,6 +2,7 @@
 #include <filesystem>
 
 #include "common/file.h"
+#include "common/known_inputs.h"
 #include "runtime/config.h"
 #include "runtime/hle.h"
 #include "runtime/log.h"
@@ -23,8 +24,8 @@ static void install_update_data() {
   for (const auto& pkg : fs::directory_iterator(upd, ec)) {
     if (!pkg.is_directory()) continue;
     std::string cid = pkg.path().filename().string();  // UP0001-BLUS30187_00-...
-    if (cid.size() < 16) continue;
-    std::string title = cid.substr(7, 9);
+    std::string title = cid.size() == 9 ? cid : (cid.size() >= 16 ? cid.substr(7, 9) : "");
+    if (title != acfa::inputs::kTitleId) continue;
     fs::path dst = fs::path(cfg().hdd0) / "game" / title;
     size_t copied = 0;
     for (const auto& e : fs::recursive_directory_iterator(pkg.path(), ec)) {

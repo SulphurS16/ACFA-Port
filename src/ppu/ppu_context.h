@@ -1,6 +1,6 @@
 // Guest PPU register context shared by the runtime, generated code and the interpreter.
 #pragma once
-#include <immintrin.h>
+#include "common/simd.h"
 
 #include <cstdint>
 #include <cstring>

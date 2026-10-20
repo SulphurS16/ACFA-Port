@@ -1,3 +1,44 @@
+#if defined(__APPLE__)
+#include "common/crypto.h"
+#include <CommonCrypto/CommonDigest.h>
+#include <algorithm>
+#include <fstream>
+#include <stdexcept>
+namespace acfa::crypto {
+std::array<u8, 20> sha1(const void* data, size_t len) {
+  CC_SHA1_CTX ctx;
+  CC_SHA1_Init(&ctx);
+  const auto* p = static_cast<const u8*>(data);
+  while (len) {
+    auto n = static_cast<CC_LONG>(std::min<size_t>(len, 1u << 20));
+    CC_SHA1_Update(&ctx, p, n); p += n; len -= n;
+  }
+  std::array<u8, 20> out{}; CC_SHA1_Final(out.data(), &ctx); return out;
+}
+std::array<u8, 32> sha256(const void* data, size_t len) {
+  CC_SHA256_CTX ctx;
+  CC_SHA256_Init(&ctx);
+  const auto* p = static_cast<const u8*>(data);
+  while (len) {
+    auto n = static_cast<CC_LONG>(std::min<size_t>(len, 1u << 20));
+    CC_SHA256_Update(&ctx, p, n); p += n; len -= n;
+  }
+  std::array<u8, 32> out{}; CC_SHA256_Final(out.data(), &ctx); return out;
+}
+std::string sha256_file_hex(const std::string& path) {
+  std::ifstream f(path, std::ios::binary);
+  if (!f) throw std::runtime_error("cannot open " + path);
+  CC_SHA256_CTX ctx; CC_SHA256_Init(&ctx);
+  std::vector<char> buf(1 << 20);
+  while (f) {
+    f.read(buf.data(), static_cast<std::streamsize>(buf.size()));
+    if (auto n = f.gcount(); n > 0) CC_SHA256_Update(&ctx, buf.data(), static_cast<CC_LONG>(n));
+  }
+  if (f.bad()) throw std::runtime_error("read failed: " + path);
+  std::array<u8, 32> out{}; CC_SHA256_Final(out.data(), &ctx); return hex(out.data(), out.size());
+}
+}
+#else
 #include "common/crypto.h"
 
 #define WIN32_LEAN_AND_MEAN
@@ -56,3 +97,5 @@ std::string sha256_file_hex(const std::string& path) {
 }
 
 }  // namespace acfa::crypto
+
+#endif

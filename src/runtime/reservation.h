@@ -7,7 +7,7 @@
 // do not bump it; waiters therefore also poll with a bounded timeout.)
 #pragma once
 #include <atomic>
-#include <immintrin.h>
+#include "common/simd.h"
 
 #include "common/bytes.h"
 

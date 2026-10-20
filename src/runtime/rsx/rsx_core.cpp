@@ -1,7 +1,12 @@
 // RSX command processor: FIFO fetch (jump/call/return), method register file, sync methods
 // (reference, semaphores, labels, reports), memory transfer engines, flips and vblank.
+#ifdef _WIN32
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
+#else
+#include "platform/macos/host_thread.h"
+#endif
+#include "common/simd.h"
 
 #include <atomic>
 #include <deque>
@@ -17,6 +22,7 @@
 #include "runtime/ppu_thread.h"
 #include "runtime/rsx/methods.h"
 #include "runtime/rsx/rsx.h"
+#include "runtime/rsx/cpu_readback.h"
 #include "runtime/profiler.h"
 #include "runtime/rsx/rsx_internal.h"
 
@@ -31,10 +37,15 @@ std::atomic<u64> g_fifo_idle_us{0};
 
 namespace {
 
+CpuReadbackMailbox g_cpu_readback;
 std::atomic<u32> g_get_waiters{0}, g_get_wait_lo{0}, g_get_wait_hi{0};  // wait_get_outside()
 // The FIFO's position in the command ring: GET, or while inside called command lists the
 // outermost return address (the place in the ring it will continue from).
 std::atomic<u32> g_ring_get{0};
+#ifdef __APPLE__
+std::mutex g_get_wait_mu;
+std::condition_variable g_get_wait_cv;
+#endif
 std::mutex g_io_mu;
 u32 g_io_ea[512];   // io >> 20 -> ea >> 20 (0xffffffff = unmapped)
 u32 g_ea_io[4096];  // ea >> 20 -> io >> 20
@@ -88,7 +99,11 @@ DisplayBuffer g_display[8];
 // The emulated vertical blank: from the display's own vblank when its refresh is a multiple of
 // about 60 Hz, else from a 60 Hz clock (gpu/display.h).
 void vblank_thread() {
+#ifdef __APPLE__
+  acfa::host::set_current_thread_name("rsx-vblank");
+#else
   SetThreadDescription(GetCurrentThread(), L"rsx-vblank");
+#endif
   for (;;) {
     gpu::display::wait_next_vblank();
     {
@@ -347,9 +362,13 @@ u32 fifo_read(u32 io) {
 }
 
 void fifo_thread() {
+#ifdef __APPLE__
+  acfa::host::set_current_thread_name("rsx-fifo");
+#else
   SetThreadDescription(GetCurrentThread(), L"rsx-fifo");
   prof::register_thread("rsx-fifo", OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT | THREAD_QUERY_INFORMATION, FALSE,
                                                  GetCurrentThreadId()));
+#endif
   renderer_thread_init();
   auto* ctrl_put = reinterpret_cast<volatile u32*>(ppu::mem() + kControlAddr);
   auto* ctrl_get = reinterpret_cast<volatile u32*>(ppu::mem() + kControlAddr + 4);
@@ -368,6 +387,7 @@ void fifo_thread() {
     }
     if (get == g_covered_put) renderer_guest_sync();
     if (get == put) {
+      g_cpu_readback.service([](u32 ea,u32 size){return renderer_memory_read(ea,size);});
       if (idle == 0) idle_since = lv2::system_time_us();
       if (++idle < 64) {
         _mm_pause();
@@ -439,12 +459,25 @@ void fifo_thread() {
     g_ring_get.store(ring, std::memory_order_release);
     if (g_get_waiters.load(std::memory_order_acquire)) {
       u32 lo = g_get_wait_lo.load(std::memory_order_relaxed), hi = g_get_wait_hi.load(std::memory_order_relaxed);
-      if ((ring < lo || ring > hi) && (get < lo || get > hi)) WakeByAddressAll(&g_ring_get);
+      if ((ring < lo || ring > hi) && (get < lo || get > hi)) {
+#ifdef __APPLE__
+        // Synchronize notification with wait's predicate-to-sleep transition.
+        { std::lock_guard lock(g_get_wait_mu); }
+        g_get_wait_cv.notify_all();
+#else
+        WakeByAddressAll(&g_ring_get);
+#endif
+      }
     }
   }
 }
 
 }  // namespace
+
+bool read_rendered_memory(u32 ea,u32 size) {
+  if(!g_init||!ea||!size||size>64u*1024*1024||!vm::committed(ea,size))return false;
+  return g_cpu_readback.request(ea,size);
+}
 
 // A PPU thread waiting for the FIFO to leave the command ring range [lo, hi] (io offsets): libgcm's
 // fragment callback, before the game overwrites the next fragment. The FIFO's position in the ring
@@ -463,7 +496,13 @@ void wait_get_outside(u32 lo, u32 hi) {
   };
   if (cfg().gcm_wait_spin) {  // --gcm-wait spin: a Sleep(0) loop (A/B comparisons)
     for (u32 spins = 0; !released(g_ring_get.load(std::memory_order_acquire)); ++spins)
-      if (spins > 64) Sleep(0);
+      if (spins > 64) {
+#ifdef __APPLE__
+        acfa::host::yield();
+#else
+        Sleep(0);
+#endif
+      }
     return;
   }
   for (u32 spins = 0; spins < 64; ++spins) {
@@ -493,7 +532,14 @@ void wait_get_outside(u32 lo, u32 hi) {
         }
       }
     }
+#ifdef __APPLE__
+    std::unique_lock lock(g_get_wait_mu);
+    g_get_wait_cv.wait_for(lock,std::chrono::milliseconds(2),[&] {
+      return g_ring_get.load(std::memory_order_acquire)!=seen;
+    });
+#else
     WaitOnAddress(&g_ring_get, &seen, sizeof seen, 2);
+#endif
   }
   g_get_waiters.fetch_sub(1, std::memory_order_acq_rel);
 }

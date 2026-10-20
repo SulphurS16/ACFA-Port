@@ -1,8 +1,12 @@
 // SPU thread execution and the LV2-side SPU protocols (local\research\spu_facts.md §7.4-§7.5):
 // stop-and-signal codes and the outbound-interrupt-mailbox gateway (send/throw event, event flag
 // bits).
+#ifdef _WIN32
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
+#elif defined(__APPLE__)
+#include "platform/macos/host_thread.h"
+#endif
 
 #include "runtime/hle.h"
 #include "runtime/log.h"
@@ -96,13 +100,21 @@ bool stop_and_signal(Thread& t, u32 code) {
   if (trace_on(t, 4)) LOG_I("spu-trace", "%s pc %05x stop 0x%x", t.name.c_str(), t.pc, code);
   switch (code) {
     case 0x001:  // meaning unknown; the reference emulator sleeps 1 ms and continues
+#ifdef __APPLE__
+      acfa::host::sleep_us(1000);
+#else
       Sleep(1);
+#endif
       t.pc += 4;
       return true;
     case 0x100: {  // SYS_SPU_THREAD_STOP_YIELD
       u32 dummy;
       if (take_out_mbox(t, &dummy)) LOG_W("spu", "SPU %s: yield with outbound mailbox data 0x%x", t.name.c_str(), dummy);
+#ifdef __APPLE__
+      acfa::host::yield();
+#else
       SwitchToThread();
+#endif
       t.pc += 4;
       return true;
     }

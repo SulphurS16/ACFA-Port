@@ -4,9 +4,13 @@
 // them alike. Cross is A, Circle B, Square X, Triangle Y, L1 / R1 the shoulders, L2 / R2 the
 // triggers (analog), Options START, Share / Create and the touchpad click BACK (the PS3's SELECT).
 #pragma once
+#if defined(_WIN32)
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 #include <xinput.h>
+#else
+#include "platform/pad_types.h"
+#endif
 
 #include <cstddef>
 

@@ -1,7 +1,11 @@
 // RSX texture decoding (rsx_facts.md §5): register decode and conversion of guest texture memory
 // into Direct3D 11 upload data.
 #pragma once
+#ifdef __APPLE__
+#include "platform/macos/metal_compat.h"
+#else
 #include <dxgiformat.h>
+#endif
 
 #include <vector>
 

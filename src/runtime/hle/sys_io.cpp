@@ -1,3 +1,4 @@
+#include "common/input_policy.h"
 // HLE: sys_io (cellPad, cellKb, cellMouse).
 // Pad port 0 combines the first controller (gamepads.h: XInput controllers, then PlayStation
 // controllers) with the keyboard and mouse; ports 1-3 map to further controllers when connected.
@@ -14,8 +15,10 @@
 #include <sstream>
 #include <thread>
 
+#ifdef _WIN32
 #include <windows.h>
 #include <xinput.h>
+#endif
 
 #include "common/file.h"
 #include "ppu/ppu_recomp.h"
@@ -99,7 +102,8 @@ PadState read_port(u32 port) {
         away(g.sThumbRY))
       game::note_pad_input();
   }
-  if (port == 0) {
+  if constexpr (acfa::input_policy::keyboard_mouse) {
+   if (port == 0) {
     // Keyboard and mouse bindings (bindings.h; always available on port 0).
     s.connected = true;
     bindings::PadOut k = bindings::sample();
@@ -110,6 +114,7 @@ PadState read_port(u32 port) {
     if (k.ly >= 0) s.ly = u8(k.ly);
     if (k.rx >= 0) s.rx = u8(k.rx);
     if (k.ry >= 0) s.ry = u8(k.ry);
+   }
   }
   auto pr = [](bool on, u8 cur) { return on ? std::max<u8>(cur, 255) : cur; };
   s.press[0] = pr(s.d1 & RIGHT, s.press[0]);

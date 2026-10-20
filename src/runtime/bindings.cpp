@@ -1,3 +1,4 @@
+#include "common/input_policy.h"
 #include "runtime/bindings.h"
 
 #define WIN32_LEAN_AND_MEAN
@@ -212,6 +213,7 @@ void reset_defaults(Layer l) {
 
 PadOut sample() {
   PadOut o;
+  if (!acfa::input_policy::keyboard_mouse) return o;
   if (!input_has_focus()) return o;
   auto now = std::chrono::steady_clock::now();
   if (s32 w = input_mouse_wheel_take()) {  // one notch: a press of 0.1 s

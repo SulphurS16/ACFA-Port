@@ -2,8 +2,13 @@
 
 namespace acfa::inputs {
 
+#if ACFA_GAME_JP
+const Known kEbootBin = {"EBOOT.BIN", "556da01a845f97299bc89ef5e7a13e20998db36fedf345d3456a887c9a62ccf1", 20283320};
+const Known kEbootElf = {"EBOOT.elf", "ee03439ea2cbda0de31b32848bc8b686c60dc0761b54db25be7281afbe20d5d2", 20280888};
+#else
 const Known kEbootBin = {"EBOOT.BIN", "96fb034cb52748c76d243d665b1aa4979ba384b7c5deba38b02438ff7de52ce1", 20282920};
 const Known kEbootElf = {"EBOOT.elf", "084c9c3fbe6b68e0e3427a056385f50474cdc7d28cabb167bb2c5d1e91c7aa15", 20280488};
+#endif
 
 const char* const kModules[kModuleCount] = {"libsre",  "libsail", "libpamf",       "libdmux",   "libdmuxpamf",
                                             "libadec", "libvpost", "libatrac3plus", "libatxdec", "libat3dec"};
@@ -52,6 +57,24 @@ std::string module_other_version(const std::string& name, const std::string& sha
 }
 
 const Known kFlashAtrac = {"flashATRAC.pic", "1edf54e1323dd736b71958ca56307d536dedc7c05ccb0dd3b2a3be1af5b50e30", 35131};
+#if ACFA_GAME_JP
+// Exact installed regulation, not a claim that all Japanese regulation revisions match.
+const Known kRegulation = {"regulation.bin", "b99c9198d6862e683bad62e1fafc82a83bc7ff799dd20540b206899b6cca1118", 242580};
+#else
 const Known kRegulation = {"regulation.bin", "c7e993ad592c681963426b7ac7f2c5f4de28aa8b8a1a466f2b1518954232f70f", 245656};
+#endif
 
+bool valid_hook(u32 address, const std::string& name) {
+#if ACFA_GAME_JP
+  return (address == 0x00ef97c8 && name == "ms_stream_dtor") ||
+         (address == 0x00ef95f8 && name == "ms_stream_dtor_delete") ||
+         (address == 0x00efad28 && name == "snd_bank_find") ||
+         (address == 0x00efa740 && name == "ms_bank_remove") ||
+         (address == 0x003fdfa0 && name == "texture_compress") ||
+         (address == 0x00d60f30 && name == "compression_texture_lock");
+#else
+  // Exact US executable SHA is checked before applying the upstream hook map.
+  return true;
+#endif
+}
 }  // namespace acfa::inputs

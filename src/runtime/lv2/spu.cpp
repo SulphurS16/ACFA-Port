@@ -1,7 +1,11 @@
 // LV2 SPU syscalls: SPU thread groups, SPU threads, event connections
 // (local\research\spu_facts.md §7.6, §8, §9.4-§9.5).
+#ifdef _WIN32
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
+#elif defined(__APPLE__)
+#include "platform/macos/host_thread.h"
+#endif
 
 #include <cstring>
 
@@ -120,7 +124,11 @@ s32 sys_spu_thread_set_argument(u32 id, Ptr<ThreadArg> arg) {
   return CELL_OK;
 }
 
+#ifdef _WIN32
 DWORD WINAPI spu_host_thread(LPVOID p) {
+#else
+void spu_host_thread(void* p) {
+#endif
   auto* t = static_cast<spu::Thread*>(p);
   spu::run_thread(*t);
   spu::on_thread_stopped(*t);
@@ -144,7 +152,9 @@ DWORD WINAPI spu_host_thread(LPVOID p) {
     g->cv.notify_all();
     LOG_D("spu", "SPU group 0x%x '%s' stopped (cause %u, status 0x%x)", g->id, g->name.c_str(), g->join_cause, g->exit_status);
   }
+#ifdef _WIN32
   return 0;
+#endif
 }
 
 void stop_threads(spu::Group& g) {
@@ -173,8 +183,13 @@ s32 sys_spu_thread_group_start(u32 id) {
     for (auto& tp : g->threads) {
       spu::Thread& t = *tp;
       if (t.host) {  // previous run's host thread has finished (the group was stopped)
+#ifdef __APPLE__
+        if (acfa::host::join_thread(static_cast<acfa::host::Thread*>(t.host)))
+          fatal("cannot join previous host SPU thread " + t.name);
+#else
         WaitForSingleObject(static_cast<HANDLE>(t.host), INFINITE);
         CloseHandle(static_cast<HANDLE>(t.host));
+#endif
         t.host = nullptr;
       }
       spu::prepare_start(t);
@@ -187,11 +202,17 @@ s32 sys_spu_thread_group_start(u32 id) {
   if (run_queue) event_queue_send(run_queue, SYS_SPU_THREAD_GROUP_EVENT_RUN_KEY, id, 0, 0);
   for (auto& tp : g->threads) {
     spu::Thread& t = *tp;
+#ifdef _WIN32
     DWORD hid = 0;
     HANDLE h = CreateThread(nullptr, 16u << 20, spu_host_thread, &t, STACK_SIZE_PARAM_IS_A_RESERVATION, &hid);
-    t.host = h;
     std::wstring wn(t.name.begin(), t.name.end());
-    SetThreadDescription(h, (L"spu:" + wn).c_str());
+    if (h) SetThreadDescription(h, (L"spu:" + wn).c_str());
+#else
+    auto* h = acfa::host::start_thread(spu_host_thread, &t, 16u << 20, "spu:" + t.name);
+#endif
+    // Partly starting an SPU group cannot be reported as success: other SPUs may wait for it.
+    if (!h) fatal("cannot create host SPU thread " + t.name);
+    t.host = h;
     prof::register_thread("spu:" + t.name, h);
   }
   LOG_D("spu", "SPU group 0x%x '%s' started", id, g->name.c_str());
@@ -252,8 +273,13 @@ s32 sys_spu_thread_group_destroy(u32 id) {
   for (auto& t : g->threads)
     if (t) {
       if (t->host) {
+#ifdef __APPLE__
+        if (acfa::host::join_thread(static_cast<acfa::host::Thread*>(t->host)))
+          fatal("cannot join host SPU thread " + t->name);
+#else
         WaitForSingleObject(static_cast<HANDLE>(t->host), INFINITE);
         CloseHandle(static_cast<HANDLE>(t->host));
+#endif
         t->host = nullptr;
       }
       g_spu_threads.remove(t->id);
@@ -427,11 +453,13 @@ void spu_dump() {
             (unsigned long long)t->ch_reads, (unsigned long long)t->ch_writes, (unsigned long long)t->intr_events,
             (unsigned long long)t->stops,
             ch == ~0u ? "" : acfa::strprintf(", blocked on channel %u", ch).c_str());
+#ifdef _WIN32
       ULONG64 cycles = 0;
       if (t->host) QueryThreadCycleTime(static_cast<HANDLE>(t->host), &cycles);
       if (cycles)
         LOG_I("dump", "    host thread: %.2f G cycles, %.1f cycles per SPU instruction", double(cycles) / 1e9,
               double(cycles) / double(t->steps ? t->steps : 1));
+#endif
       std::map<u32, u32> hist;
       for (u32 pc : t->pc_ring)
         if (pc) ++hist[pc];

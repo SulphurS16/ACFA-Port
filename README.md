@@ -6,6 +6,18 @@ A native Windows version of ARMORED CORE for Answer (PS3, USA, BLUS30187). The g
 
 Not affiliated with, endorsed or sponsored by FromSoftware, Ubisoft, Sony Interactive Entertainment or any other rights holder. ARMORED CORE is a trademark of its owners.
 
+## Experimental macOS / Japanese-disc development
+
+An opt-in Apple Silicon / Metal backend and an exact Japanese `BLJM55005`
+(disc 01.02) profile are available for developer review. The existing US/Windows
+profile remains the default. Japanese and macOS builds currently support
+Xbox/PlayStation-style controllers only.
+
+See [macOS build, architecture and verification notes](docs/MAC_PORT.md).
+This is source-level development support, not a ready-to-download Mac release.
+The game, firmware and all generated code still come from the user's own files.
+No Chinese translation assets, personal saves or on-screen performance HUD are included.
+
 ## Highlights
 
 - Native, not emulated. The whole game runs as a 64-bit Windows program.

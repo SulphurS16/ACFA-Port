@@ -1,0 +1,62 @@
+{
+  "schema": 1,
+  "profile": "BLJM55005",
+  "records": 1987,
+  "record_bytes": 7262512,
+  "entry_seeds": 43420,
+  "ranges": 13216,
+  "source_files_checked": 11,
+  "native_emitted_chunks": 3131,
+  "native_verified_legacy_roots": 555,
+  "byte_roundtrip_passed": true,
+  "native_identity_crosscheck_passed": true,
+  "stale_records": 0,
+  "game_runtime_verified": false,
+  "complete_runtime_coverage": false,
+  "eboot_sha256": "ee03439ea2cbda0de31b32848bc8b686c60dc0761b54db25be7281afbe20d5d2",
+  "manifest_sha256": "0ccd80f6fcaea6e48bf1b3e7bdbc66db61e02e7533213a40aab093744531c962",
+  "firmware_records": 1430,
+  "firmware_partial_records": 123,
+  "embedded_spu_images": [
+    {
+      "name": "synth2.elf",
+      "eboot_offset": "0x11d0080",
+      "entry": "0x100",
+      "static_seeds": 625
+    },
+    {
+      "name": "spu/msngSPURS_ATRAC",
+      "eboot_offset": "0x11da800",
+      "entry": "0x3080",
+      "static_seeds": 731
+    }
+  ],
+  "candidate_shift": "0x780",
+  "legacy_rejected": {
+    "other_firmware_version": 261,
+    "no_root_identity_match": 4
+  },
+  "unmatched_legacy_root_hashes": [
+    "42e0c3c066669620",
+    "a16e0945d6a11a8f",
+    "b1cc60b0d1f7dbc3",
+    "eeca6028eba5c018"
+  ],
+  "native_static_library_bytes": 12234320,
+  "native_static_library_sha256": "5d5f5efa788f4edac8fd994d7a9a2dbcbaa86a28bc0f5bdbc54a3dda6e999bdd",
+  "native_static_library_arch": "arm64",
+  "wrong_eboot_sha_rejected_without_output": true,
+  "position_metadata_only": true,
+  "notes": [
+    "The manifest contains file hashes, positions and entry metadata only, no instruction words or game/firmware bytes.",
+    "Native dispatch still checks complete code bytes. Four legacy reconstruction roots were rejected; one is supplied by another matched record, while three lack the same native identity. Unobserved/dynamically overlaid code can use the interpreter; runtime coverage is not certified."
+  ],
+  "unmatched_roots_covered_by_other_records": [
+    "eeca6028eba5c018"
+  ],
+  "legacy_roots_without_same_native_identity": [
+    "42e0c3c066669620",
+    "a16e0945d6a11a8f",
+    "b1cc60b0d1f7dbc3"
+  ]
+}

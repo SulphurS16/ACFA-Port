@@ -1,9 +1,20 @@
 #include "runtime/ppu_runtime.h"
 
+#ifdef _WIN32
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
+#else
+#include "platform/macos/host_thread.h"
+#include <csignal>
+#include <cstdlib>
+#include <sys/ucontext.h>
+#include <dlfcn.h>
+#include <unistd.h>
+#include <condition_variable>
+#endif
 
 #include <algorithm>
+#include <deque>
 #include <mutex>
 
 #include "common/file.h"
@@ -27,9 +38,23 @@ namespace res {
 Stripe g_stripes[kStripes];
 std::atomic<u32> g_seq{0}, g_waiters{0};
 
+#ifdef __APPLE__
+namespace {
+std::mutex g_res_wait_mu;
+std::condition_variable g_res_wait_cv;
+}
+#endif
 void notify_slow() {
+#ifdef __APPLE__
+  { // Serialize the predicate update with wait's unlock/sleep: no lost wake-up.
+    std::lock_guard lock(g_res_wait_mu);
+    g_seq.fetch_add(1, std::memory_order_seq_cst);
+  }
+  g_res_wait_cv.notify_all();
+#else
   g_seq.fetch_add(1, std::memory_order_seq_cst);
   WakeByAddressAll(&g_seq);
+#endif
 }
 
 std::atomic<int> g_watch_ranges{0};
@@ -111,21 +136,37 @@ void watch_dump(const std::string& path) {
 void wait(u32 seq, u64 timeout_us) {
   if (g_seq.load(std::memory_order_seq_cst) != seq) return;
   if (timeout_us < 1000) {  // below the wait granularity: yield instead
+#ifdef __APPLE__
+    acfa::host::yield();
+#else
     SwitchToThread();
+#endif
     return;
   }
+#ifdef __APPLE__
+  std::unique_lock lock(g_res_wait_mu);
+  g_res_wait_cv.wait_for(lock, std::chrono::microseconds(std::min<u64>(timeout_us,100000)),
+                       [&] { return g_seq.load(std::memory_order_seq_cst) != seq; });
+#else
   u32 expected = seq;
   WaitOnAddress(&g_seq, &expected, sizeof(expected), DWORD(std::min<u64>(timeout_us / 1000, 100)));
+#endif
 }
 }  // namespace res
 namespace {
 
 u32 g_tab_base = 0, g_tab_end = 0;
 ppu::Fn* g_tab = nullptr;
-std::vector<HleImport> g_imports;
+// References (including CallScope names) must survive imports registered by running guest callbacks.
+std::deque<HleImport> g_imports;
 std::mutex g_imp_mu;
 std::vector<std::pair<uintptr_t, u32>> g_host_sorted;  // host fn address -> guest address
+#ifdef __APPLE__
+u64 g_clock_start_ns = 0;
+uintptr_t g_fault_image_base=0;
+#else
 LARGE_INTEGER g_qpf, g_qpc0;
+#endif
 
 void dump_ctx(const ppu::Ctx& c, std::string& s) {
   for (int i = 0; i < 32; i += 4)
@@ -140,6 +181,7 @@ std::string thread_desc() {
   return t ? acfa::strprintf("thread 0x%x '%s'", t->id, t->name.c_str()) : std::string("non-guest thread");
 }
 
+#ifdef _WIN32
 LONG CALLBACK fault_handler(PEXCEPTION_POINTERS ep) {
   DWORD code = ep->ExceptionRecord->ExceptionCode;
   if (code != EXCEPTION_ACCESS_VIOLATION && code != EXCEPTION_ILLEGAL_INSTRUCTION && code != EXCEPTION_STACK_OVERFLOW &&
@@ -187,14 +229,69 @@ LONG CALLBACK fault_handler(PEXCEPTION_POINTERS ep) {
   }
   fatal(s);
 }
+#else
+// A signal can interrupt malloc/the logger or a reservation mutex. Only fixed stack
+// storage and async-signal-safe write/_exit are used here; no guest memory is read.
+void fault_handler(int sig, siginfo_t* info, void* context) {
+  char text[4096]; size_t size=0;
+  auto literal=[&](const char* p) { while(*p && size<sizeof(text)) text[size++]=*p++; };
+  auto hex=[&](uintptr_t value) {
+    literal("0x");
+    for(int n=int(sizeof(value)*2)-1;n>=0;--n)
+      if(size<sizeof(text)) text[size++]="0123456789abcdef"[(value>>(n*4))&15];
+  };
+  uintptr_t pc=0;
+  auto* uc=static_cast<ucontext_t*>(context);
+#if defined(__aarch64__)
+  if(uc && uc->uc_mcontext) pc=uc->uc_mcontext->__ss.__pc;
+#elif defined(__x86_64__)
+  if(uc && uc->uc_mcontext) pc=uc->uc_mcontext->__ss.__rip;
+#endif
+  literal("ACFA host fault signal=");hex(uintptr_t(sig));literal(" pc=");hex(pc);
+  uintptr_t address=info?reinterpret_cast<uintptr_t>(info->si_addr):0;
+  literal(" address=");hex(address);
+  uintptr_t base=uintptr_t(PPU_MEM_BASE);
+  if(address>=base && address-base<0x100000000ull){literal(" guest=");hex(address-base);}
+  literal(" image=");hex(g_fault_image_base);literal("\n");
+  // Existing native thread context only: no guest-memory reads, logger, locks,
+  // allocations, unwinding or symbol lookup are safe in a synchronous signal.
+  if(PpuThread* thread=cur_thread()){
+    literal("PPU context snapshot thread=");hex(thread->id);
+    literal(" last_cia=");hex(thread->ctx.cia);literal(" lr=");hex(thread->ctx.lr);
+    literal(" ctr=");hex(thread->ctx.ctr);literal("\n");
+    for(unsigned i=0;i<32;++i){
+      literal(" r");text[size++]=char('0'+i/10);text[size++]=char('0'+i%10);
+      literal("=");hex(thread->ctx.r[i]);if(i%4==3)literal("\n");
+    }
+  }
+#if defined(__aarch64__)
+  if(uc && uc->uc_mcontext){
+    literal("ARM saved registers\n");
+    for(unsigned i=0;i<29;++i){
+      literal(" x");text[size++]=char('0'+i/10);text[size++]=char('0'+i%10);
+      literal("=");hex(uc->uc_mcontext->__ss.__x[i]);if(i%4==3)literal("\n");
+    }
+    literal(" fp=");hex(uc->uc_mcontext->__ss.__fp);literal(" lr=");hex(uc->uc_mcontext->__ss.__lr);
+    literal(" sp=");hex(uc->uc_mcontext->__ss.__sp);literal("\n");
+  }
+#endif
+  // Retrying on a damaged process can recurse forever. Preserve the failure code.
+  (void)::write(STDERR_FILENO,text,size);
+  _exit(128+sig);
+}
+#endif
 
 }  // namespace
 
 void ppu_runtime_init() {
   // HLE area for fake import descriptors (must exist before any module binds imports).
   if (!vm::alloc_fixed(vm::Area::Main, kHleCodeBase, kHleAreaEnd - kHleCodeBase)) fatal("cannot map HLE area");
+#ifdef __APPLE__
+  g_clock_start_ns = acfa::host::monotonic_time_ns();
+#else
   QueryPerformanceFrequency(&g_qpf);
   QueryPerformanceCounter(&g_qpc0);
+#endif
   u32 lo = ~0u, hi = 0;
   for (size_t i = 0; i < ppu::g_func_count; ++i) {
     lo = std::min(lo, ppu::g_funcs[i].addr);
@@ -203,7 +300,11 @@ void ppu_runtime_init() {
   g_tab_base = lo;
   g_tab_end = hi + 4;
   size_t n = (g_tab_end - g_tab_base) / 4;
+#ifdef __APPLE__
+  g_tab = static_cast<ppu::Fn*>(std::calloc(n,sizeof(ppu::Fn)));
+#else
   g_tab = static_cast<ppu::Fn*>(VirtualAlloc(nullptr, n * sizeof(ppu::Fn), MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
+#endif
   if (!g_tab) fatal("cannot allocate function table");
   g_host_sorted.reserve(ppu::g_func_count);
   for (size_t i = 0; i < ppu::g_func_count; ++i) {
@@ -268,7 +369,21 @@ void dump_hle_stats() {
   LOG_I("hle", "%s", s.c_str());
 }
 
-void install_fault_handler() { AddVectoredExceptionHandler(1, fault_handler); }
+void install_fault_handler() {
+#ifdef __APPLE__
+  Dl_info image{};
+  if(dladdr(reinterpret_cast<void*>(&install_fault_handler),&image))
+    g_fault_image_base=reinterpret_cast<uintptr_t>(image.dli_fbase);
+  struct sigaction action{};
+  action.sa_sigaction = fault_handler;
+  sigemptyset(&action.sa_mask);
+  action.sa_flags = SA_SIGINFO;
+  for(int sig : {SIGSEGV,SIGBUS,SIGILL,SIGFPE})
+    if(sigaction(sig,&action,nullptr)!=0) fatal("cannot install host fault handler");
+#else
+  AddVectoredExceptionHandler(1, fault_handler);
+#endif
+}
 
 }  // namespace rt
 
@@ -290,8 +405,8 @@ void icall(Ctx& ctx, u32 target) {
       std::lock_guard lk(g_imp_mu);
       if (i >= g_imports.size()) fatal(acfa::strprintf("bad HLE code address 0x%08x", target));
       imp = &g_imports[i];
+      ++imp->calls;  // serialized with dump_hle_stats and other dispatchers
     }
-    ++imp->calls;
     if (imp->lle_opd) {  // traced call into a firmware module: the callee runs with its own TOC
       LOG_I("lle", "%s::%s(0x%llx, 0x%llx, 0x%llx, 0x%llx, 0x%llx) lr=0x%08llx in %s", imp->module.c_str(), imp->name.c_str(),
             (unsigned long long)ctx.r[3], (unsigned long long)ctx.r[4], (unsigned long long)ctx.r[5], (unsigned long long)ctx.r[6],
@@ -372,10 +487,15 @@ void bad_switch(Ctx& ctx, u32 pc, u32 target) {
 
 u64 timebase() {
   // Cell timebase runs at 79.8 MHz.
+#ifdef __APPLE__
+  u64 ticks = acfa::host::monotonic_time_ns() - g_clock_start_ns;
+  constexpr u64 q = 1000000000ull;
+#else
   LARGE_INTEGER now;
   QueryPerformanceCounter(&now);
   u64 ticks = u64(now.QuadPart - g_qpc0.QuadPart);
   u64 q = u64(g_qpf.QuadPart);
+#endif
   return (ticks / q) * 79800000ull + (ticks % q) * 79800000ull / q;
 }
 

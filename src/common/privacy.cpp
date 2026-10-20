@@ -1,7 +1,12 @@
 #include "common/privacy.h"
 
+#if defined(_WIN32)
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
+#else
+#include <cstdlib>
+#include <string>
+#endif
 
 #include <algorithm>
 #include <cctype>
@@ -11,6 +16,7 @@ namespace acfa {
 namespace {
 
 std::string env_utf8(const wchar_t* name) {
+#if defined(_WIN32)
   wchar_t buf[1024];
   DWORD n = GetEnvironmentVariableW(name, buf, DWORD(std::size(buf)));
   if (!n || n >= std::size(buf)) return {};
@@ -18,6 +24,10 @@ std::string env_utf8(const wchar_t* name) {
   std::string s(size_t(len), '\0');
   WideCharToMultiByte(CP_UTF8, 0, buf, int(n), s.data(), len, nullptr, nullptr);
   return s;
+#else
+  const char* value = std::getenv(std::wstring(name) == L"USERPROFILE" ? "HOME" : "USER");
+  return value ? value : "";
+#endif
 }
 
 std::string lower(std::string s) {

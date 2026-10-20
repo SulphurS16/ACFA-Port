@@ -1,3 +1,4 @@
+#include "common/known_inputs.h"
 // HLE (cellSysutil): cellGameDataCheckCreate2, cellHddGameCheck, cellSysCacheMount.
 // Game data lives under /dev_hdd0/game/<dir> (project-owned local/hdd0); the system cache is
 // /dev_hdd1 (local/hdd1), cleared when a different cache id is mounted.
@@ -142,12 +143,12 @@ void cellSysCacheMount(ppu::Ctx& ctx) {
     prev.assign(v.begin(), v.end());
   }
   s32 r;
-  if (!id.empty() && prev == "BLUS30187_" + id) {
+  if (!id.empty() && prev == (std::string(acfa::inputs::kTitleId) + "_") + id) {
     r = 1;  // CELL_SYSCACHE_RET_OK_RELAYED: contents preserved
   } else {
     for (const auto& e : fs::directory_iterator(root, ec))  // project-owned cache directory only
       if (e.path().filename() != ".cache_id") fs::remove_all(e.path(), ec);
-    acfa::write_text(marker, "BLUS30187_" + id);
+    acfa::write_text(marker, (std::string(acfa::inputs::kTitleId) + "_") + id);
     r = 0;  // CELL_SYSCACHE_RET_OK_CLEARED
   }
   LOG_I("gamedata", "cellSysCacheMount('%s') -> %s", id.c_str(), r ? "relayed (kept)" : "cleared");

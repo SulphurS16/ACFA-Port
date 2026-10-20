@@ -53,7 +53,8 @@ void renderer_method(u32 reg_index, u32 arg, u32 count, u32 index);  // state/dr
 // A burst of SET_TRANSFORM_CONSTANT words (big-endian, as in the command buffer) starting at word
 // `first` of the method range: the same effect as renderer_method per word, in one call.
 void renderer_transform_constants(const u8* words, u32 first, u32 count);
-void renderer_memory_written(u32 ea, u32 size);  // CPU-side transfer wrote guest memory
+bool renderer_memory_read(u32 ea, u32 size); // make GPU-rendered source bytes visible to CPU transfer engines
+void renderer_memory_written(u32 ea, u32 size, bool transfer = false);  // CPU-side transfer wrote guest memory
 // Guest-write collection for the renderer's caches: the FIFO put pointer read right before the
 // renderer's last collection of guest writes. Commands past it may read data written later, so
 // reaching it, like a completed semaphore acquire, calls renderer_guest_sync().

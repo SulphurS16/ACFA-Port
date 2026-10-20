@@ -1,7 +1,12 @@
+#include "common/known_inputs.h"
 // HLE: cellSysutil (system parameters, video/audio output state, system callbacks, dialogs,
 // save data, game data).
+#ifdef _WIN32
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
+#elif defined(__APPLE__)
+#include "platform/macos/host_calendar.h"
+#endif
 
 #include <deque>
 
@@ -78,17 +83,27 @@ s32 cellSysutilCheckCallback(ppu::Ctx& ctx) {
 s32 cellSysutilGetSystemParamInt(s32 id, Ptr<bes32> value) {
   s32 v;
   switch (id) {
-    case 0x0111: v = 1; break;  // LANG: English (US)
+    case 0x0111: v = ACFA_GAME_JP ? 0 : 1; break;  // Japanese resources (including installed CN overlay), or US English
     case 0x0112: v = 1; break;  // ENTER_BUTTON_ASSIGN: cross
     case 0x0114: v = 2; break;  // DATE_FORMAT: MMDDYYYY
     case 0x0115: v = 0; break;  // TIME_FORMAT: 12h
     case 0x0116: {              // TIMEZONE (minutes east of UTC)
+#ifdef __APPLE__
+      v = acfa::host::system_timezone_now().standard_minutes;
+#else
       TIME_ZONE_INFORMATION tzi{};
       GetTimeZoneInformation(&tzi);
       v = -s32(tzi.Bias);
+#endif
       break;
     }
-    case 0x0117: v = 0; break;  // SUMMERTIME
+    case 0x0117:  // SUMMERTIME is separate from the standard TIMEZONE parameter.
+#ifdef __APPLE__
+      v = acfa::host::system_timezone_now().daylight ? 1 : 0;
+#else
+      v = 0;
+#endif
+      break;
     case 0x0121: v = 0; break;  // GAME_PARENTAL_LEVEL: off
     case 0x0122: v = 1; break;  // LICENSE_AREA: SCEA
     case 0x0123: v = 0; break;  // PARENTAL_LEVEL0_RESTRICT: off

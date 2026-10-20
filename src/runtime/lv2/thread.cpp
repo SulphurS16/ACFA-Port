@@ -1,6 +1,10 @@
 // LV2 PPU thread, time, timer and TTY syscalls.
+#ifdef _WIN32
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
+#elif defined(__APPLE__)
+#include "platform/macos/host_thread.h"
+#endif
 
 #include <ctime>
 
@@ -9,6 +13,10 @@
 namespace rt::lv2 {
 
 u64 system_time_us() {
+#ifdef __APPLE__
+  static const auto t0 = acfa::host::monotonic_time_us();
+  return acfa::host::monotonic_time_us() - t0;
+#else
   static LARGE_INTEGER f, t0;
   static bool init = [] {
     QueryPerformanceFrequency(&f);
@@ -20,11 +28,15 @@ u64 system_time_us() {
   QueryPerformanceCounter(&n);
   u64 d = u64(n.QuadPart - t0.QuadPart);
   return (d / u64(f.QuadPart)) * 1000000ull + (d % u64(f.QuadPart)) * 1000000ull / u64(f.QuadPart);
+#endif
 }
 
 // High-resolution sleep (sys_timer_usleep): waitable timer per thread.
 void sleep_us(u64 us) {
   note_block();
+#ifdef __APPLE__
+  acfa::host::sleep_us(us);
+#else
   thread_local HANDLE timer = CreateWaitableTimerExW(nullptr, nullptr, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS);
   if (!us) {
     SwitchToThread();
@@ -38,13 +50,18 @@ void sleep_us(u64 us) {
   due.QuadPart = -s64(us * 10);  // 100 ns units, relative
   SetWaitableTimer(timer, &due, 0, nullptr, nullptr, FALSE);
   WaitForSingleObject(timer, INFINITE);
+#endif
 }
 
 namespace {
 
 void sys_ppu_thread_exit(u64 val) { thread_exit(val); }
 s32 sys_ppu_thread_yield() {
+#ifdef __APPLE__
+  acfa::host::yield();
+#else
   SwitchToThread();
+#endif
   return CELL_OK;
 }
 s32 sys_ppu_thread_join(u64 id, Ptr<be64> status) {
@@ -78,19 +95,37 @@ s32 sys_timer_sleep(u32 sec) {
 }
 
 s32 sys_time_get_timezone(Ptr<bes32> timezone, Ptr<bes32> summertime) {
+#ifdef __APPLE__
+  // Darwin timezone is the standard offset (seconds west of UTC); tm_gmtoff includes DST.
+  tzset();
+  const auto now = time(nullptr);
+  tm local{};
+  if (!localtime_r(&now, &local)) return CELL_EINVAL;
+  const s32 base = -s32(::timezone / 60);
+  if (timezone) *timezone = base;
+  if (summertime) *summertime = s32(local.tm_gmtoff / 60) - base;
+#else
   TIME_ZONE_INFORMATION tzi{};
   DWORD r = GetTimeZoneInformation(&tzi);
   if (timezone) *timezone = -s32(tzi.Bias);
   if (summertime) *summertime = r == TIME_ZONE_ID_DAYLIGHT ? -s32(tzi.DaylightBias) : 0;
+#endif
   return CELL_OK;
 }
 s32 sys_time_get_current_time(Ptr<bes64> sec, Ptr<bes64> nsec) {
+#ifdef __APPLE__
+  timespec now{};
+  if (clock_gettime(CLOCK_REALTIME, &now)) return CELL_EINVAL;
+  if (sec) *sec = s64(now.tv_sec);
+  if (nsec) *nsec = s64(now.tv_nsec);
+#else
   FILETIME ft;
   GetSystemTimePreciseAsFileTime(&ft);
   u64 t = (u64(ft.dwHighDateTime) << 32) | ft.dwLowDateTime;  // 100 ns since 1601
   t -= 116444736000000000ull;                                 // -> since 1970
   if (sec) *sec = s64(t / 10000000ull);
   if (nsec) *nsec = s64((t % 10000000ull) * 100);
+#endif
   return CELL_OK;
 }
 u64 sys_time_get_timebase_frequency() { return 79800000ull; }

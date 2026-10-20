@@ -30,3 +30,15 @@
 .idea/
 Thumbs.db
 .DS_Store
+
+# Local-only game-derived and native build artifacts
+local/
+build*/
+*.o
+*.a
+*.dylib
+.DS_Store
+
+# Python tool bytecode is generated locally.
+__pycache__/
+*.pyc

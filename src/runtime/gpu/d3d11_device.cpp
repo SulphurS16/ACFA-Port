@@ -1,5 +1,7 @@
 #include "runtime/gpu/d3d11_device.h"
 
+#include <d3d11.h>
+#include <dxgi1_2.h>
 #include <d3dcompiler.h>
 #include <dxgi1_5.h>
 

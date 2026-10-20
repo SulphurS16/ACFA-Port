@@ -1,7 +1,11 @@
 #include "runtime/memory.h"
 
+#if defined(__APPLE__)
+#include "platform/macos/guest_memory.h"
+#else
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
+#endif
 
 #include <algorithm>
 #include <atomic>
@@ -94,6 +98,10 @@ u8* base() { return reinterpret_cast<u8*>(PPU_MEM_BASE); }
 bool g_write_watch = false;
 
 bool init() {
+#if defined(__APPLE__)
+  g_write_watch = false;
+  return mac_memory::reserve();
+#else
   // Write tracking lets the renderer notice changed textures without hashing them every frame.
   void* p = VirtualAlloc(base(), 0x100000000ull, MEM_RESERVE | MEM_WRITE_WATCH, PAGE_NOACCESS);
   g_write_watch = p == base();
@@ -107,9 +115,13 @@ bool init() {
     return false;
   }
   return true;
+#endif
 }
 
 bool take_written_pages(u32 begin, u32 size, std::vector<u32>& out) {
+#if defined(__APPLE__)
+  return false;  // Use the renderer's existing content-hash fallback.
+#else
   if (!g_write_watch) return false;
   static std::vector<void*> buf;
   if (buf.size() < size / 0x1000 + 1) buf.resize(size / 0x1000 + 1);  // every page fits: one call
@@ -120,13 +132,18 @@ bool take_written_pages(u32 begin, u32 size, std::vector<u32>& out) {
   if (GetWriteWatch(WRITE_WATCH_FLAG_RESET, base() + begin, size, buf.data(), &count, &gran) != 0) return false;
   for (ULONG_PTR i = 0; i < count; ++i) out.push_back(u32(static_cast<u8*>(buf[i]) - base()));
   return true;
+#endif
 }
 
 void commit(u32 addr, u32 size) {
   if (!size) return;
   u64 a = addr & ~0xfffull, e = (u64(addr) + size + 0xfff) & ~0xfffull;
+#if defined(__APPLE__)
+  if(!mac_memory::commit(a,e)) fatal("macOS guest commit failed");
+#else
   if (!VirtualAlloc(base() + a, size_t(e - a), MEM_COMMIT, PAGE_READWRITE))
     fatal(acfa::strprintf("guest commit failed at 0x%08x size 0x%x (error %lu)", addr, size, GetLastError()));
+#endif
   mark_pages(a >> 12, e >> 12, true);
 }
 
@@ -135,7 +152,11 @@ void decommit(u32 addr, u32 size) {
   u64 a = (u64(addr) + 0xfff) & ~0xfffull, e = (u64(addr) + size) & ~0xfffull;
   if (e <= a) return;
   mark_pages(a >> 12, e >> 12, false);  // before the pages go: a check never finds them committed
+#if defined(__APPLE__)
+  if(!mac_memory::decommit(a,e)) fatal("macOS guest decommit failed");
+#else
   VirtualFree(base() + a, size_t(e - a), MEM_DECOMMIT);
+#endif
 }
 
 bool committed(u32 addr, u32 size) {
@@ -157,7 +178,12 @@ u32 alloc(Area ar, u32 size, u32 align) {
   std::lock_guard lk(g_mu);
   AreaInfo& A = area(ar);
   // Stacks get an uncommitted guard page below them.
+#if defined(__APPLE__)
+  u32 guard = ar == Area::Stack ? mac_memory::host_page_size() : 0;
+  if(guard) align=std::max(align,guard);
+#else
   u32 guard = ar == Area::Stack ? 0x1000 : 0;
+#endif
   u64 cur = (u64(A.begin) + align - 1) & ~u64(align - 1);
   for (auto it = A.blocks.begin();; ++it) {
     u64 cand = (cur + guard + align - 1) & ~u64(align - 1);

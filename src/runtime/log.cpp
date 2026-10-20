@@ -1,7 +1,12 @@
 #include "runtime/log.h"
 
+#ifdef _WIN32
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
+#else
+#include "platform/macos/host_thread.h"
+#include <cstdlib>
+#endif
 
 #include <atomic>
 #include <chrono>
@@ -45,7 +50,12 @@ void log_write(Level l, const char* chan, const std::string& text) {
   const std::string msg = acfa::redact_personal(text);  // logs are shared as they are
   double t = log_time();
   char head[96];
-  std::snprintf(head, sizeof head, "[%9.4f %s %5lu %s] ", t, name(l), GetCurrentThreadId() % 100000, chan);
+#ifdef __APPLE__
+  auto tid = acfa::host::current_thread_id();
+#else
+  auto tid = GetCurrentThreadId();
+#endif
+  std::snprintf(head, sizeof head, "[%9.4f %s %5lu %s] ", t, name(l), static_cast<unsigned long>(tid % 100000), chan);
   std::lock_guard lk(g_mu);
   if (g_file) {
     std::fputs(head, g_file);
@@ -79,7 +89,11 @@ void fatal(const std::string& msg) {
     g_fatal_hook();
     log_flush();
   }
+#ifdef __APPLE__
+  std::_Exit(3);
+#else
   TerminateProcess(GetCurrentProcess(), 3);
+#endif
   for (;;) {
   }
 }

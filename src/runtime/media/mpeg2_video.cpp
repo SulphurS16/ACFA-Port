@@ -2,7 +2,7 @@
 // H.262. MPEG-1 (ISO/IEC 11172-2) streams are decoded with their differences (6.3 / 7.4).
 #include "runtime/media/mpeg2_video.h"
 
-#include <immintrin.h>
+#include "common/simd.h"
 
 #include <algorithm>
 #include <array>

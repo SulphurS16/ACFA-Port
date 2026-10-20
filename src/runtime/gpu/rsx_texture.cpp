@@ -5,7 +5,7 @@
 // keep float precision (remap is not allowed for them on hardware).
 #include "runtime/gpu/rsx_texture.h"
 
-#include <immintrin.h>
+#include "common/simd.h"
 
 #include <algorithm>
 #include <cstring>

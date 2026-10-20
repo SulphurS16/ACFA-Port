@@ -11,7 +11,7 @@
 // Synchronous mode executes every call at once on the calling thread (the previous behaviour;
 // also the fallback). "gpu submit on|off" switches at a frame boundary (A/B measurements).
 #pragma once
-#include <d3d11.h>
+#include "runtime/gpu/host_gpu_api.h"
 
 #include <functional>
 #include <string>

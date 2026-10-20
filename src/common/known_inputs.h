@@ -16,8 +16,21 @@ struct Known {
 };
 
 // The disc (VERSION 01.01): its PARAM.SFO and the still-encrypted executable it carries.
+#ifndef ACFA_GAME_JP
+#define ACFA_GAME_JP 1
+#endif
+#if ACFA_GAME_JP
+constexpr const char* kTitleId = "BLJM55005";
+constexpr const wchar_t* kTitleIdWide = L"BLJM55005";
+constexpr const char* kDiscVersion = "01.02";
+constexpr const char* kHooksFile = "data/profiles/BLJM55005/hooks.txt";
+#else
 constexpr const char* kTitleId = "BLUS30187";
+constexpr const wchar_t* kTitleIdWide = L"BLUS30187";
 constexpr const char* kDiscVersion = "01.01";
+constexpr const char* kHooksFile = "src/runtime/game/hooks.txt";
+#endif
+bool valid_hook(u32 address, const std::string& name);
 extern const Known kEbootBin;  // PS3_GAME/USRDIR/EBOOT.BIN (disc)
 // The decrypted executable: RPCS3 writes EBOOT.elf next to EBOOT.BIN.
 extern const Known kEbootElf;
@@ -41,7 +54,12 @@ extern const Known kFlashAtrac;
 // The optional update 01.35 (regulation data): its installed folder (dev_hdd0/game/BLUS30187 of an
 // emulator) or regulation.bin on its own.
 extern const Known kRegulation;      // USRDIR/regulation.bin
+#if ACFA_GAME_JP
+// Local staging folder name, not an invented PSN content ID.
+constexpr const char* kUpdateContentId = "BLJM55005";
+#else
 constexpr const char* kUpdateContentId = "UP0001-BLUS30187_00-AC45000004141906";
+#endif
 constexpr const char* kUpdateFiles[] = {"PARAM.SFO", "ICON0.PNG", "PS3LOGO.DAT"};  // copied when present
 
 }  // namespace acfa::inputs

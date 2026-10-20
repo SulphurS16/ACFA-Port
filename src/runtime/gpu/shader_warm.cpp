@@ -20,6 +20,7 @@
 #include "common/file.h"
 #include "runtime/config.h"
 #include "runtime/gpu/d3d11_device.h"
+#include "runtime/gpu/host_gpu_api.h"
 #include "runtime/gpu/fp_hlsl.h"
 #include "runtime/gpu/vp_hlsl.h"
 #include "runtime/log.h"

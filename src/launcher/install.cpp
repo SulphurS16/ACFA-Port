@@ -1,3 +1,4 @@
+#include "common/known_inputs.h"
 #include "launcher/install.h"
 
 #define WIN32_LEAN_AND_MEAN
@@ -252,7 +253,7 @@ std::wstring risk_text(Risk r) {
 bool has_build(const fs::path& data) { return is_file(data / L"state" / L"built.txt"); }
 
 bool has_install(const fs::path& data) {
-  return has_build(data) || is_file(data / L"game" / L"BLUS30187" / L"eboot.elf") || is_file(data / L"decrypted" / L"EBOOT.elf");
+  return has_build(data) || is_file(data / L"game" / acfa::inputs::kTitleIdWide / L"eboot.elf") || is_file(data / L"decrypted" / L"EBOOT.elf");
 }
 
 std::vector<Install> earlier_installs(const fs::path& self_exe) {
@@ -262,7 +263,7 @@ std::vector<Install> earlier_installs(const fs::path& self_exe) {
     if (i.data.empty() || !has_install(i.data) || inside(i.data, self_dir)) return;  // this launcher's own folder: not an earlier install
     for (const Install& o : out)
       if (same_path(o.data, i.data)) return;
-    for (const fs::path& p : {i.data / L"state" / L"built.txt", i.data / L"launcher.log", i.data / L"game" / L"BLUS30187" / L"manifest.txt",
+    for (const fs::path& p : {i.data / L"state" / L"built.txt", i.data / L"launcher.log", i.data / L"game" / acfa::inputs::kTitleIdWide / L"manifest.txt",
                               i.data / L"decrypted" / L"EBOOT.elf"})
       i.when = std::max(i.when, mtime(p));
     out.push_back(i);
@@ -425,7 +426,7 @@ bool looks_ours(const fs::path& p) {
   };
   if (n == L"tools") return any_child(L"llvm-mingw") || any_child(L"cmake-") || has(L"ninja");
   if (n == L"downloads") return fs::is_empty(p, ec) || any_child(L"llvm-mingw") || any_child(L"cmake-") || any_child(L"ninja");
-  if (n == L"game") return has(L"BLUS30187") || has(L"dev_flash");
+  if (n == L"game") return has(acfa::inputs::kTitleIdWide) || has(L"dev_flash");
   if (n == L"decrypted") return has(L"EBOOT.elf");
   if (n == L"build") return has(L"CMakeCache.txt") || has(L"build.ninja") || has(L"gen") || has(L"acfa.exe");
   if (n == L"state") return has(L"built.txt") || has(L"import.txt") || has(L"recompile.txt") || has(L"spu.txt");

@@ -1,3 +1,4 @@
+#include "common/known_inputs.h"
 // ACFA-Launcher: the player's way in. Takes the game's folder and the folder with the files the
 // player decrypted (checked by SHA-256; the port decrypts nothing), or prepares those files with
 // the player's own RPCS3 in one step (rpcs3.h: a private copy of RPCS3 does it), proposes a good
@@ -450,7 +451,7 @@ size_t copy_saves(const fs::path& from, const fs::path& to) {
   std::error_code ec;
   fs::create_directories(to, ec);
   for (const auto& e : fs::directory_iterator(from, ec)) {
-    if (!e.is_directory() || e.path().filename().wstring().rfind(L"BLUS30187", 0) != 0) continue;
+    if (!e.is_directory() || e.path().filename().wstring().rfind(acfa::inputs::kTitleIdWide, 0) != 0) continue;
     fs::copy(e.path(), to / e.path().filename(), fs::copy_options::recursive | fs::copy_options::overwrite_existing, ec);
     if (!ec) ++n;
   }
@@ -468,7 +469,7 @@ void move_to_user_dir() {
   fs::path old_saves = g_cfg.data / "hdd0" / "home" / "00000001" / "savedata";
   bool have = false;
   for (const auto& e : fs::directory_iterator(saves_dir(), ec))
-    have |= e.is_directory() && e.path().filename().wstring().rfind(L"BLUS30187", 0) == 0;
+    have |= e.is_directory() && e.path().filename().wstring().rfind(acfa::inputs::kTitleIdWide, 0) == 0;
   if (!have && fs::exists(old_saves, ec)) copy_saves(old_saves, saves_dir());
   fs::path old_backups = g_cfg.data / "backups";
   if (!fs::exists(backups_dir(), ec) && fs::exists(old_backups, ec)) fs::copy(old_backups, backups_dir(), fs::copy_options::recursive, ec);
@@ -1386,7 +1387,7 @@ LRESULT CALLBACK wndproc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
           std::error_code ec;
           bool any = false;
           for (const auto& e : fs::directory_iterator(from, ec))
-            any |= e.is_directory() && e.path().filename().wstring().rfind(L"BLUS30187", 0) == 0;
+            any |= e.is_directory() && e.path().filename().wstring().rfind(acfa::inputs::kTitleIdWide, 0) == 0;
           if (!any) {
             MessageBoxW(g_wnd, L"No saves of this game in that folder.", kTitle, MB_ICONWARNING);
             break;
@@ -1396,7 +1397,7 @@ LRESULT CALLBACK wndproc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
             break;
           copy_saves(saves_dir(), backups_dir() / (L"saves-before-restore-" + stamp_now()));
           for (const auto& e : fs::directory_iterator(saves_dir(), ec))
-            if (e.is_directory() && e.path().filename().wstring().rfind(L"BLUS30187", 0) == 0) fs::remove_all(e.path(), ec);
+            if (e.is_directory() && e.path().filename().wstring().rfind(acfa::inputs::kTitleIdWide, 0) == 0) fs::remove_all(e.path(), ec);
           size_t n = copy_saves(from, saves_dir());
           MessageBoxW(g_wnd, (std::to_wstring(n) + L" save(s) restored.").c_str(), kTitle, MB_ICONINFORMATION);
           break;

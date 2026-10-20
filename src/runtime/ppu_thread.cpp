@@ -1,9 +1,14 @@
 #include "runtime/ppu_thread.h"
 #include "runtime/profiler.h"
 
+#ifdef _WIN32
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
+#elif defined(__APPLE__)
+#include "platform/macos/host_thread.h"
+#endif
 
+#include <cstdlib>
 #include <deque>
 #include <map>
 #include <vector>
@@ -32,7 +37,11 @@ bool g_tls_init = false;
 
 constexpr u32 kStackStartOffset = 0x70;
 
+#ifdef _WIN32
 DWORD WINAPI thread_main(LPVOID p) {
+#else
+void thread_main(void* p) {
+#endif
   PpuThread* t = static_cast<PpuThread*>(p);
   t_cur = t;
   t->state = 1;
@@ -61,7 +70,9 @@ DWORD WINAPI thread_main(LPVOID p) {
   LOG_I("thread", "thread 0x%x '%s' exited (status 0x%llx)", t->id, t->name.c_str(), (unsigned long long)status);
   game::thread_exited(t->name);
   if (t->tls_block) tls_free(t->tls_block);
+#ifdef _WIN32
   return 0;
+#endif
 }
 
 }  // namespace
@@ -193,22 +204,45 @@ void note_block() {
 s32 thread_start(u32 id) {
   PpuThread* t = thread_get(id);
   if (!t) return CELL_ESRCH;
+#ifdef __APPLE__
+  // Publish the native handle before an immediately exiting worker can be joined or detached.
+  std::unique_lock native_start_lock(t->mu);
+  if (t->state != 0 || t->host) return CELL_EBUSY;
+  t->state = 1;
+#endif
   PpuThread* creator = t_cur;
   // LV2 schedules by priority (lower value = higher priority): a new thread that outranks its
   // creator runs first, until it blocks. Games rely on this ordering during initialization.
   bool handoff = creator && !creator->host_main && !t->host_main && t->prio < creator->prio;
   t->handoff = handoff;
+#ifdef _WIN32
   DWORD tid = 0;
   HANDLE h = CreateThread(nullptr, 64u << 20, thread_main, t, STACK_SIZE_PARAM_IS_A_RESERVATION, &tid);
+#else
+  auto* h = acfa::host::start_thread(thread_main, t, 64u << 20, "ppu:" + t->name);
+  const u32 tid = u32(acfa::host::thread_id(h));
+#endif
   if (!h) {
     t->handoff = false;
+#ifdef __APPLE__
+    t->state = 0;
+#endif
     return CELL_EAGAIN;
   }
   t->host = h;
   t->host_tid = tid;
+#ifdef _WIN32
   std::wstring wname(t->name.begin(), t->name.end());
   SetThreadDescription(h, (L"ppu:" + wname).c_str());
+#endif
   prof::register_thread("ppu:" + t->name, h);
+#ifdef __APPLE__
+  if (t->detached) {
+    if (acfa::host::detach_thread(h)) fatal("cannot detach host PPU thread " + t->name);
+    t->host = nullptr;
+  }
+  native_start_lock.unlock();
+#endif
   LOG_I("thread", "thread 0x%x '%s' started (entry opd 0x%x, prio %d, stack 0x%x+0x%x, tls 0x%x)", t->id, t->name.c_str(),
         t->entry_opd, t->prio, t->stack_addr, t->stack_size, t->tls_block);
   input_thread_started(t->name);  // anchors for scripted input
@@ -244,6 +278,12 @@ s32 thread_join(u32 id, u64* status) {
   if (t->state != 2) note_block();
   t->cv.wait(lk, [&] { return t->state == 2; });
   if (status) *status = t->exit_status;
+#ifdef __APPLE__
+  auto* host = static_cast<acfa::host::Thread*>(t->host);
+  t->host = nullptr;
+  lk.unlock();  // A native join also waits for thread_main TLS cleanup after the guest exit notice.
+  if (host && acfa::host::join_thread(host)) fatal("cannot join host PPU thread " + t->name);
+#endif
   return CELL_OK;
 }
 
@@ -254,6 +294,13 @@ s32 thread_detach(u32 id) {
   if (t->detached) return CELL_EINVAL;
   if (t->join_claimed) return CELL_EBUSY;
   t->detached = true;
+#ifdef __APPLE__
+  if (t->host) {
+    if (acfa::host::detach_thread(static_cast<acfa::host::Thread*>(t->host)))
+      fatal("cannot detach host PPU thread " + t->name);
+    t->host = nullptr;
+  }
+#endif
   return CELL_OK;
 }
 
@@ -295,7 +342,11 @@ void process_exit(s32 status) {
   g_exiting = true;
   LOG_I("process", "guest process exit (status %d)", status);
   log_flush();
+#ifdef _WIN32
   ExitProcess(UINT(status));
+#else
+  std::_Exit(status);
+#endif
 }
 
 bool process_exiting() { return g_exiting; }
