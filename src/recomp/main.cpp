@@ -92,9 +92,10 @@ int main(int argc, char** argv) {
             std::istringstream ls(line);
             std::string addr, name;
             if (!(ls >> addr >> name)) continue;
-            opt.hooks[u32(std::stoul(addr, nullptr, 0))] = name;
+            if (name == "setjmp") opt.setjmp.insert(u32(std::stoul(addr, nullptr, 0)));  // callers become resumable
+            else opt.hooks[u32(std::stoul(addr, nullptr, 0))] = name;
           }
-          std::printf("%zu hook(s)\n", opt.hooks.size());
+          std::printf("%zu hook(s), %zu setjmp function(s)\n", opt.hooks.size(), opt.setjmp.size());
         }
         else if (a.rfind("--chunk=", 0) == 0) opt.insns_per_file = std::strtoul(a.c_str() + 8, nullptr, 0);
         else if (a == "--module" && i + 1 < argc) {

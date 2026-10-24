@@ -322,14 +322,27 @@ void flow_report(const char* why, u32 get, u32 put) {
     const FlowEvent& e = g_flow[i & 63];
     LOG_E("rsx", "  %c at 0x%08x -> 0x%08x (%.3f ms ago)", e.kind, e.at, e.to, double(now - e.t_us) / 1000.0);
   }
+  // The methods the FIFO ran last, and the words it parsed before its last control flow (data
+  // taken for commands shows there: the title -> hub desyncs ran into float arguments).
+  u32 n = g_method_pos.load(std::memory_order_relaxed);
+  for (u32 i = n > 32 ? n - 32 : 0; i < n; ++i)
+    LOG_E("rsx", "  method 0x%04x = 0x%08x", g_method_ring[i & 31][0], g_method_ring[i & 31][1]);
+  if (g_flow_n) {
+    u32 at = g_flow[(g_flow_n - 1) & 63].at;
+    for (u32 a = (at >= 0x100 ? at - 0x100 : 0) & ~0x1fu; a < at + 0x20; a += 0x20) {
+      std::string words;
+      for (u32 k = 0; k < 8; ++k) {
+        u32 ea = 0;
+        words += io_to_ea(a + 4 * k, &ea) ? acfa::strprintf(" %08x", ppu::r32(ea)) : std::string(" --------");
+      }
+      LOG_E("rsx", "  io 0x%08x:%s", a, words.c_str());
+    }
+  }
 }
 
 }  // namespace
 
 void fifo_desync(const char* why, u32 value) {
-  u32 n = g_method_pos.load(std::memory_order_relaxed);
-  for (u32 i = n > 32 ? n - 32 : 0; i < n; ++i)
-    LOG_E("rsx", "  method 0x%04x = 0x%08x", g_method_ring[i & 31][0], g_method_ring[i & 31][1]);
   std::string what = acfa::strprintf("%s (0x%08x)", why, value);
   flow_report(what.c_str(), __builtin_bswap32(*reinterpret_cast<volatile u32*>(ppu::mem() + kControlAddr + 4)), ppu::r32(kControlAddr));
   fatal("RSX FIFO desynchronized: " + what);

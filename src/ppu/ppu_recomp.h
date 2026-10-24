@@ -20,6 +20,13 @@ namespace ppu {
 using Ctx = Context;
 using Fn = void (*)(Context&);
 
+// Thrown by the runtime's hook on the guest's longjmp once the jmp_buf's registers are back in the
+// context: the function whose setjmp call saved them (stack pointer r1, return address lr) catches
+// it and continues after that call (acfa-recomp emits such functions resumable; recomp/emit.h).
+struct GuestLongjmp {
+  u32 r1, lr;
+};
+
 // ---- runtime hooks (implemented by the runtime) ----
 void icall(Ctx& ctx, u32 target);              // call guest code address (indirect)
 void syscall(Ctx& ctx);                        // `sc`, number in r11

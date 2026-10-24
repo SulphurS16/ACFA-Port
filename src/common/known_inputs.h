@@ -39,8 +39,10 @@ std::string module_other_version(const std::string& name, const std::string& sha
 extern const Known kFlashAtrac;
 
 // The optional update 01.35 (regulation data): its installed folder (dev_hdd0/game/BLUS30187 of an
-// emulator) or regulation.bin on its own.
+// emulator) or regulation.bin on its own; the package itself (as PSN serves it, encrypted) is only
+// recognized: the player's RPCS3 installs it.
 extern const Known kRegulation;      // USRDIR/regulation.bin
+extern const Known kUpdatePkg;       // UP0001-BLUS30187_00-AC45000004141906-A0135-V0100-PE.pkg
 constexpr const char* kUpdateContentId = "UP0001-BLUS30187_00-AC45000004141906";
 constexpr const char* kUpdateFiles[] = {"PARAM.SFO", "ICON0.PNG", "PS3LOGO.DAT"};  // copied when present
 

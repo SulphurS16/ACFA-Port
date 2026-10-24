@@ -1,9 +1,12 @@
 // Keyboard and mouse bindings onto the emulated pad (port 0), kept in the [keyboard], [menu] and
 // [mouse] sections of the shared settings file (common/settings_file.h; defaults: the game's
-// SIMPLE key scheme: WASD move, mouse look, left/right click right/left arm weapon, Space boost,
-// Shift quick boost, E overed boost, Escape pause). In the game's menus the [menu] keys come first
-// (Enter choose, Escape back; game/menu_mouse.h decides where the input goes). The PC SETTINGS
-// screen changes them while the game runs.
+// SIMPLE key scheme: WASD move, mouse look, left / right click left / right arm weapon, Space boost,
+// Shift quick boost, Q overed boost, Escape pause, Z / X quick turns). In missions a button's keys
+// do that button's SIMPLE / REGULAR-A action and press the button the game's control type gives
+// it (game/key_assign.h), and key-only controls run sequences (quick turns, two-stage quick boost,
+// half press, assault armor). In the game's menus the [menu] keys come first (Enter choose, Escape
+// back; game/menu_mouse.h decides where the input goes). The PC SETTINGS screen changes them while
+// the game runs.
 #pragma once
 #include <string>
 #include <vector>
@@ -20,11 +23,20 @@ namespace rt::bindings {
 struct PadOut {
   u16 d1 = 0, d2 = 0;  // cellPad digital words (bit layout of CELL_PAD_BTN_OFFSET_DIGITAL1/2)
   int lx = -1, ly = -1, rx = -1, ry = -1;
+  int l2p = -1, r2p = -1;    // L2 / R2 pressure 0-255 (the quick boost half pressed); -1: as the buttons say
+  bool lstick_rest = false;  // the left stick at rest whatever drives it (a quick turn's boost)
 };
+
+// How the mouse turns and looks in missions: as the controller's right stick, deflected by the
+// mouse's speed and cut off where the stick ends (the default), or by moving the camera, which
+// the AC then turns to follow (game/input_hooks.cpp).
+enum class MouseMode { Stick, Camera };
+const char* mouse_mode_name(MouseMode m);  // as in the file: stick, camera
 
 struct MouseSettings {
   double sensitivity_x = 1.0, sensitivity_y = 1.0;  // scale on raw counts: turning, looking up and down
   bool invert_x = false, invert_y = false;
+  MouseMode mode = MouseMode::Stick;
 };
 
 // Input codes: Windows virtual-key codes 1-255, mouse buttons kMouse + 0..4, wheel up/down.
@@ -47,7 +59,12 @@ std::string input_name(u32 code);       // code -> the name used in the file (""
 // Keys the window keeps for itself (F1 PC settings, F11 fullscreen) cannot be bound.
 bool bindable(u32 code);
 
-PadOut sample();  // current keys / mouse buttons / wheel
+// Current keys / mouse buttons / wheel. `deliver`: this state goes to the game (cellPadGetData):
+// presses since the previous delivery count as down even if already released (input_taps_take).
+PadOut sample(bool deliver);
+// The pad button a control's keys press in missions under the game's current button assignment
+// ("R1", ...; "" when the control is not a button action or the assignment is not known yet).
+std::string mission_button(size_t c);
 MouseSettings mouse();
 void set_mouse(const MouseSettings& m);
 

@@ -1,5 +1,59 @@
 # Changelog
 
+## 0.7.3 (2026-10-24)
+
+Crash and movie fixes from player reports, keyboard and mouse closer to the controller, the mouse
+in more menus, an optional fix for some ORDER MATCH opponents.
+
+Updating from 0.7.2: unzip the new release and start its launcher, then click **Set up**. This
+time it rebuilds more of the game than usual (the recompiler changed), which takes a few
+minutes.
+
+- Fixed: the ORDER MATCH against Dario Empio (Collared 11) crashed once his Primal Armor was
+  hit below 40 % ("host exception 0xc0000005 ... f_00d34a38"), and the one against Lilium
+  Wolcott (Collared 2) could do the same when her energy ran low. Their AI scripts call a
+  misspelled function there; the game recovers from such script errors on the console, and now
+  does in the port too (the match goes on as on the PS3).
+- Movies (the intro, briefings, chapter movies) on PCs with few processor cores: on two logical
+  processors the intro ran at about a quarter of its speed with broken sound; it now plays at
+  full speed. The movie player's helper processors waited for work by spinning, which took the
+  processor time away from the threads that give them that work.
+- New: **ORDER MATCH AI FIXES**, on by default (PC SETTINGS, new page GAME). Some ORDER MATCH
+  opponents' AI scripts have slips that make them fight below what was written: Dario Empio
+  (Collared 11) and Lilium Wolcott (Collared 2) call misspelled functions, Fragile (Collared 17)
+  fires his back weapons with the arm weapons' odds, Kamisori Johnny's (Collared 21) extra attack
+  stops with a script error, Collared 6 and ORCA 02 name weapons that do not exist. These are
+  corrected when a match loads its opponent: the opponents do what their scripts say, and some
+  fight harder than on the console. Turn it OFF for the matches as on the PS3.
+- The mouse turns and looks as a precise right stick (new default, **MOUSE MODE: STICK** in PC
+  SETTINGS): the AC turns exactly as far as the mouse moves, up to the stick's own top speed, with
+  the game's own smoothing; quick turns work with a fast sideways flick and the quick boost key.
+  The earlier mouse camera stays as **CAMERA**: its view now leads the AC by at most 15 degrees (so
+  lock-on and fire stay near the AC's front), and turning keys no longer cut quick turns short.
+- Keys pressed and released within one frame are no longer lost.
+- New keys for missions (PC SETTINGS, KEYBOARD): **QUICK TURN LEFT / RIGHT** (Z / X), the
+  controller's quick turn (the right stick sideways with the quick boost); hold the key to keep
+  turning. Without a key until you choose one: **2-STAGE QUICK TURN LEFT / RIGHT** (about 120
+  degrees), **2-STAGE QUICK BOOST** (the quick boost half pressed for its charge, then fully:
+  about twice as far), **QUICK BOOST HALF PRESS** (hold it, then press the quick boost key for
+  the second stage) and **ASSAULT ARMOR** (both weapon switches and overed boost together; it
+  needs an overed boost part that has it). A settings file from an earlier version gets Z and X
+  where no other control uses them.
+- Keys keep their actions under every control type: with KEY TYPE REGULAR-B or an own KEY
+  ASSIGN (ACSIS > OPTION) the keys still fire the weapon, boost and so on that they do with
+  SIMPLE / REGULAR-A; PC SETTINGS shows the button each key presses in missions.
+- PC SETTINGS: long captions (MOUSE SENSITIVITY X / Y) and the render scale's resolution are no
+  longer cut off.
+- Launcher: a **Game update** row under Game folder, to choose the game's update package (01.35)
+  or the regulation.bin from it directly. Still optional: without it the disc's balance data is
+  used. An update chosen after the files were prepared installs with **Install update**.
+- The mouse in more of the game's menus: ACSIS > ASSEMBLE, STABILIZER and SHOP (click a slot in
+  the top row to pick it, a part to equip it; the wheel scrolls through the parts), TUNE (the
+  cursor was missing there and a click pressed START; now categories and items by click, the
+  value with the arrow keys), DESIGN's schematics, and the ◀ ▶ arrows of choice rows (OPTIONS >
+  COCKPIT, ...) and of TUNE's categories. Lists move the way the D-pad moves them. Still by keys:
+  the colour editor's sliders and palette, the emblem picker, DESIGN's tabs.
+
 ## 0.7.2 (2026-10-18)
 
 Faster: much higher frame rates, smoother mission starts, less CPU time for movies.

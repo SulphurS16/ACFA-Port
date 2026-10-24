@@ -1,13 +1,14 @@
-// ACFA-Launcher: the player's way in. Takes the game's folder and the folder with the files the
-// player decrypted (checked by SHA-256; the port decrypts nothing), or prepares those files with
-// the player's own RPCS3 in one step (rpcs3.h: a private copy of RPCS3 does it), proposes a good
-// place for the game data, runs the first-time setup (setup.h), offers shortcuts, the display mode,
-// resolution and frame rate (the shared settings file, also changed in game under SYSTEM > PC
-// SETTINGS) and starts the game. A newer launcher extracted into another folder finds the earlier
-// install (install.h) and only rebuilds what changed. The More menu holds the rest: render scale,
-// monitor, presets, saves (open, back up, restore), safe mode, settings reset, rebuild, the log,
-// shortcuts and removing the game data. Settings and saves are the player's own: they live in
-// Saved Games\ARMORED CORE for Answer, the game data folder holds the rest.
+// ACFA-Launcher: the player's way in. Takes the game's folder, optionally the game's update (its
+// package, which the player's RPCS3 installs, or the regulation.bin from it) and the folder with
+// the files the player decrypted (checked by SHA-256; the port decrypts nothing), or prepares those
+// files with the player's own RPCS3 in one step (rpcs3.h: a private copy of RPCS3 does it),
+// proposes a good place for the game data, runs the first-time setup (setup.h), offers shortcuts,
+// the display mode, resolution and frame rate (the shared settings file, also changed in game
+// under SYSTEM > PC SETTINGS) and starts the game. A newer launcher extracted into another folder
+// finds the earlier install (install.h) and only rebuilds what changed. The More menu holds the
+// rest: render scale, monitor, presets, saves (open, back up, restore), safe mode, settings reset,
+// rebuild, the log, shortcuts and removing the game data. Settings and saves are the player's own:
+// they live in Saved Games\ARMORED CORE for Answer, the game data folder holds the rest.
 // Contains no game data or game-derived code.
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
@@ -50,9 +51,9 @@ constexpr UINT WM_SETUP = WM_APP + 1, WM_CHECKED = WM_APP + 2, WM_GAME_EXIT = WM
                WM_DATASIZE = WM_APP + 6, WM_REMOVED = WM_APP + 7;
 constexpr const wchar_t* kTitle = L"ARMORED CORE for Answer";
 enum Id {
-  kDiscEdit = 100, kFilesEdit, kDataEdit,
-  kDiscBrowse = 110, kFilesBrowse, kPrepFiles, kDataBrowse,
-  kDiscState = 120, kFilesState, kDataState,
+  kDiscEdit = 100, kFilesEdit, kDataEdit, kUpdateEdit,
+  kDiscBrowse = 110, kFilesBrowse, kPrepFiles, kDataBrowse, kUpdateBrowse,
+  kDiscState = 120, kFilesState, kDataState, kUpdateState,
   kPrepare = 140, kCancel, kProgress = 143, kStatus,
   kFps = 150, kMode, kResolution,
   kMore = 160,
@@ -88,6 +89,11 @@ SetupConfig g_cfg;
 Setup g_setup;
 Rpcs3Prep g_prep;
 fs::path g_rpcs3, g_pup;  // the player's rpcs3.exe and PS3UPDAT.PUP (Prepare files)
+// Game update: the file the player chose (the update package or its regulation.bin; launcher.ini
+// [paths] update). Until the player chooses, the launcher looks for the package in the game folder.
+fs::path g_update;
+bool g_update_chosen = false;
+bool g_prep_update_only = false;  // the RPCS3 job installs only the update (Install update)
 HANDLE g_game = nullptr;
 bool g_ready = false;
 bool g_removing = false;
@@ -95,7 +101,8 @@ bool g_setup_reported = false;  // the finished setup was handled (its last noti
 std::wstring g_note;  // a message for the status line (a setup or game error) until the next action
 
 std::mutex g_check_mu;
-Status g_disc_check, g_files_check, g_update_check;
+Status g_disc_check, g_files_check;
+UpdateCheck g_update_check;
 bool g_checked = false;
 std::atomic<int> g_check_gen{0};
 std::atomic<int> g_size_gen{0};
@@ -188,6 +195,10 @@ void load_paths() {
   g_pup = p("pup");
   g_place_ok = p("place_ok");
   g_user_override = p("user");  // optional: settings and saves somewhere else than Saved Games
+  const std::string none = "\n";  // no entry (a value never holds a line break)
+  std::string u = ini.get_or("paths", "update", none);
+  g_update_chosen = u != none;  // chosen, possibly none at all
+  g_update = g_update_chosen ? fs::path(widen(u)) : fs::path();
 }
 
 void save_paths() {
@@ -200,6 +211,7 @@ void save_paths() {
     ini.set("paths", "install", narrow(g_cfg.data.wstring()));
     ini.set("paths", "rpcs3", narrow(g_rpcs3.wstring()));
     ini.set("paths", "pup", narrow(g_pup.wstring()));
+    if (g_update_chosen) ini.set("paths", "update", narrow(g_update.wstring()));
     ini.set("paths", "place_ok", narrow(g_place_ok.wstring()));
     std::error_code ec;
     fs::create_directories(g_ini_path.parent_path(), ec);
@@ -219,6 +231,7 @@ void note_install() {
   i.files = g_cfg.files;
   i.rpcs3 = g_rpcs3;
   i.pup = g_pup;
+  i.update = g_update;
   i.version = ACFA_VERSION;
   record_install(i);
 }
@@ -475,12 +488,26 @@ void move_to_user_dir() {
 }
 
 // ---- checks of the chosen files (background: hashing takes a moment) ----
+// Where Set up takes the update's regulation.bin from (SetupConfig::update): the chosen file itself,
+// or for the package the folder Prepare files and Install update install it to.
+fs::path update_source() { return g_update.empty() ? fs::path() : is_package(g_update) ? g_cfg.data / "update" : g_update; }
+
+// Until the player chooses a game update, the package in the game folder (or two folders below it) is taken.
+void find_update() {
+  fs::path p = find_update_pkg(g_cfg.disc);
+  if (p.empty()) return;
+  g_update = p;
+  g_update_chosen = true;
+  set_text(kUpdateEdit, p.wstring());
+}
+
 void start_checks() {
   int gen = ++g_check_gen;
   SetupConfig c = g_cfg;
-  std::thread([c, gen] {
-    Found f = find_files(c.disc, c.files);
-    Status d = check_disc(c.disc, f), m = check_modules(c.files, f), u = check_update(f);
+  std::thread([c, chosen = g_update, gen] {
+    Found f = find_files(c.disc, c.files, c.update);
+    Status d = check_disc(c.disc, f), m = check_modules(c.files, f);
+    UpdateCheck u = check_update(chosen, f);
     {
       std::lock_guard lk(g_check_mu);
       if (gen != g_check_gen) return;
@@ -528,6 +555,13 @@ bool files_missing() {
   return eboot || g_files_check.verdict != Verdict::Ok;
 }
 
+// The chosen update package is not installed yet: Prepare files installs it with the decrypted
+// files, or, those complete, Install update on its own.
+bool update_to_install() {
+  std::lock_guard lk(g_check_mu);
+  return g_checked && g_update_check.install;
+}
+
 bool place_kept() { return same_path(g_place_ok, g_cfg.data); }
 
 // ---- the game data row ----
@@ -565,7 +599,8 @@ bool data_row_bad() { return !data_ok() || (place_risk(g_cfg.data) != Risk::None
 std::wstring idle_status() {
   if (!g_note.empty()) return g_note;
   if (g_removing) return L"Removing the game data...";
-  if (g_ready) return L"";
+  bool install = update_to_install() && !files_missing();
+  if (g_ready && !install) return L"";
   if (!data_ok()) return L"The game data cannot go into a game folder: Change... beside Game data chooses another place.";
   unsigned long long need = Setup::space_needed(g_cfg), free = free_bytes(g_cfg.data);
   if (free < need)
@@ -573,8 +608,9 @@ std::wstring idle_status() {
            L". Change... beside Game data chooses another place.";
   if (g_cfg.disc.empty()) return L"Choose the game's folder: the copy of your disc, the folder with PS3_GAME in it.";
   if (files_missing())
-    return L"Prepare files makes the decrypted files with your RPCS3 (rpcs3.net) and the PS3 update file PS3UPDAT.PUP 4.93 "
-           L"(playstation.com); or Browse... chooses files you decrypted yourself.";
+    return L"Prepare files makes the decrypted files with your RPCS3 (rpcs3.net) and the PS3 system software file PS3UPDAT.PUP "
+           L"4.93 (playstation.com); or Browse... chooses files you decrypted yourself.";
+  if (install) return L"Install update installs the game update with your RPCS3 (rpcs3.net). To play without it, clear Game update.";
   if (!inputs_ok()) return L"";
   if (has_build(g_cfg.data)) return L"Set up updates the game to version " ACFA_VERSION_W L" (it rebuilds only what changed).";
   return L"Set up builds the game once (a few minutes).";
@@ -583,27 +619,35 @@ std::wstring idle_status() {
 void update_buttons() {
   bool busy = g_setup.running() || g_prep.running() || g_removing, playing = g_game != nullptr;
   g_ready = !g_cfg.data.empty() && Setup::ready(g_cfg);
-  bool prep = !busy && files_missing();
+  bool missing = files_missing(), prep = !busy && (missing || update_to_install());
   show(kPrepFiles, prep);
+  if (std::wstring t = missing ? L"Prepare files" : L"Install update"; get_text(kPrepFiles) != t) set_text(kPrepFiles, t);
   EnableWindow(item(kPrepFiles), !playing);
   show(kPrepare, !busy && !g_ready && !prep);
   show(kCancel, g_setup.running() || g_prep.running());
   show(kProgress, g_setup.running());
   EnableWindow(item(kPrepare), !playing && inputs_ok() && data_ok());
   EnableWindow(item(kPlay), !busy && !playing && g_ready && inputs_ok());
-  for (int id : {kDiscBrowse, kFilesBrowse, kDiscEdit, kFilesEdit, kDataBrowse}) EnableWindow(item(id), !busy && !playing);
+  for (int id : {kDiscBrowse, kUpdateBrowse, kFilesBrowse, kDiscEdit, kUpdateEdit, kFilesEdit, kDataBrowse})
+    EnableWindow(item(id), !busy && !playing);
   for (int id : {kFps, kMode, kResolution}) EnableWindow(item(id), !playing && !g_cfg.data.empty());
   if (acfa::settings::Mode m = read_display().mode; m == acfa::settings::Mode::Borderless) EnableWindow(item(kResolution), FALSE);
   if (!g_setup.running() && !g_prep.running()) set_text(kStatus, idle_status());
 }
 
 void refresh_paths_from_ui() {
-  g_cfg.disc = get_text(kDiscEdit);
+  fs::path disc = get_text(kDiscEdit), update = get_text(kUpdateEdit);
+  bool new_disc = disc != g_cfg.disc;
+  g_cfg.disc = disc;
   g_cfg.files = get_text(kFilesEdit);
+  if (update != g_update) g_update = update, g_update_chosen = true;  // typed or browsed: the player's choice, even none
+  if (new_disc && !g_update_chosen) find_update();
+  g_cfg.update = update_source();
   save_paths();
   move_to_user_dir();
   set_text(kDiscState, L"Checking...");
   set_text(kFilesState, L"");
+  set_text(kUpdateState, L"");
   start_checks();
   update_buttons();
 }
@@ -822,7 +866,10 @@ void offer_earlier_install() {
   g_cfg.files = i.files;
   if (!i.rpcs3.empty()) g_rpcs3 = i.rpcs3;
   if (!i.pup.empty()) g_pup = i.pup;
+  if (!i.update.empty()) g_update = i.update, g_update_chosen = true;
   set_text(kDiscEdit, g_cfg.disc.wstring());
+  set_text(kUpdateEdit, g_update.wstring());
+  if (!g_update_chosen) find_update();
   g_cfg.data = i.data;
   if (a == kMoveIt) {
     if (move_data_to(here)) return;
@@ -938,21 +985,30 @@ void on_removed(RemoveResult* r) {
 }
 
 // ---- Prepare files: the player's RPCS3 makes the decrypted files (rpcs3.h) ----
+// With the decrypted files complete, Install update: the same, for the chosen update package only.
 void prepare_files() {
   std::error_code ec;
-  if (!fs::is_regular_file(g_cfg.disc / "PS3_GAME" / "USRDIR" / "EBOOT.BIN", ec)) {
+  bool update_only = !files_missing();
+  fs::path update_pkg;
+  {
+    std::lock_guard lk(g_check_mu);
+    if (g_update_check.package) update_pkg = g_update;
+  }
+  if (update_only && update_pkg.empty()) return;
+  if (!update_only && !fs::is_regular_file(g_cfg.disc / "PS3_GAME" / "USRDIR" / "EBOOT.BIN", ec)) {
     message(L"Choose the game's folder first (the one with PS3_GAME).", MB_ICONINFORMATION);
     return;
   }
   if (!confirm_place()) return;  // the files go into the game data folder
   fs::path exe = g_rpcs3;
   if (!fs::is_regular_file(exe, ec)) {
-    exe = pick(false, L"Your RPCS3 (rpcs3.exe; get it from rpcs3.net): it prepares the files once", known_folder(UserFolder::Downloads), L"RPCS3",
-               L"rpcs3.exe");
+    exe = pick(false, update_only ? L"Your RPCS3 (rpcs3.exe; get it from rpcs3.net): it installs the game update"
+                                  : L"Your RPCS3 (rpcs3.exe; get it from rpcs3.net): it prepares the files once",
+               known_folder(UserFolder::Downloads), L"RPCS3", L"rpcs3.exe");
     if (exe.empty()) return;
   }
   fs::path pup;
-  if (rpcs3_system_software(exe) != "4.93") {  // else RPCS3 has the system modules already
+  if (!update_only && rpcs3_system_software(exe) != "4.93") {  // else RPCS3 has the system modules already
     pup = g_pup;
     if (pup_version(pup) != "4.93") {
       pup = pick(false, L"PS3 system software 4.93 update file (PS3UPDAT.PUP, from playstation.com)", known_folder(UserFolder::Downloads),
@@ -974,9 +1030,12 @@ void prepare_files() {
   job.rpcs3_exe = exe;
   job.pup = pup;
   job.disc = g_cfg.disc;
-  job.update_pkg = find_update_pkg(g_cfg.disc, pup.empty() ? fs::path() : pup.parent_path());
+  job.update_pkg = update_pkg;
+  job.update_only = update_only;
   job.work = g_cfg.data / "rpcs3-work";
   job.out = g_cfg.data / "decrypted";
+  job.update_out = g_cfg.data / "update";
+  g_prep_update_only = update_only;
   g_note.clear();
   g_prep.start(job, [] { PostMessageW(g_wnd, WM_PREP, 0, 0); });
   update_buttons();
@@ -1004,7 +1063,7 @@ void on_prep_update() {
     return;
   }
   if (v.ok) {
-    set_text(kFilesEdit, (g_cfg.data / "decrypted").wstring());
+    if (!g_prep_update_only) set_text(kFilesEdit, (g_cfg.data / "decrypted").wstring());
     g_note = widen(v.note);
     refresh_paths_from_ui();
     note_install();
@@ -1058,13 +1117,14 @@ struct Place {
   int x, y, w, h;
 };
 const Place kPlaces[] = {
-    {kDiscEdit, 124, 14, 324, 24},   {kDiscBrowse, 454, 13, 90, 26},   {kDiscState, 124, 41, 420, 18},
-    {kFilesEdit, 124, 68, 324, 24},  {kFilesBrowse, 454, 67, 90, 26},  {kFilesState, 124, 95, 420, 18},
-    {kDataEdit, 124, 122, 324, 24},  {kDataBrowse, 454, 121, 90, 26},  {kDataState, 124, 149, 420, 18},
-    {kPrepare, 16, 178, 98, 28},     {kCancel, 16, 178, 98, 28},       {kPrepFiles, 16, 178, 98, 28},
-    {kStatus, 124, 178, 420, 34},    {kProgress, 124, 216, 420, 10},
-    {kMode, 124, 240, 190, 300},     {kResolution, 320, 240, 224, 300}, {kFps, 124, 274, 190, 300},
-    {kMore, 16, 320, 98, 30},        {kPlay, 334, 308, 210, 50},
+    {kDiscEdit, 124, 14, 324, 24},    {kDiscBrowse, 454, 13, 90, 26},    {kDiscState, 124, 41, 420, 18},
+    {kUpdateEdit, 124, 68, 324, 24},  {kUpdateBrowse, 454, 67, 90, 26},  {kUpdateState, 124, 95, 420, 18},
+    {kFilesEdit, 124, 122, 324, 24},  {kFilesBrowse, 454, 121, 90, 26},  {kFilesState, 124, 149, 420, 18},
+    {kDataEdit, 124, 176, 324, 24},   {kDataBrowse, 454, 175, 90, 26},   {kDataState, 124, 203, 420, 18},
+    {kPrepare, 16, 232, 98, 28},      {kCancel, 16, 232, 98, 28},        {kPrepFiles, 16, 232, 98, 28},
+    {kStatus, 124, 232, 420, 34},     {kProgress, 124, 270, 420, 10},
+    {kMode, 124, 294, 190, 300},      {kResolution, 320, 294, 224, 300}, {kFps, 124, 328, 190, 300},
+    {kMore, 16, 374, 98, 30},         {kPlay, 334, 362, 210, 50},
 };
 struct Label {
   int x, y, w, h;
@@ -1072,12 +1132,13 @@ struct Label {
 };
 const Label kLabels[] = {
     {16, 17, 104, 20, L"Game folder"},
-    {16, 71, 104, 20, L"Decrypted files"},
-    {16, 125, 104, 20, L"Game data"},
-    {16, 243, 104, 20, L"Display"},
-    {16, 277, 104, 20, L"Frame rate"},
+    {16, 71, 104, 20, L"Game update"},
+    {16, 125, 104, 20, L"Decrypted files"},
+    {16, 179, 104, 20, L"Game data"},
+    {16, 297, 104, 20, L"Display"},
+    {16, 331, 104, 20, L"Frame rate"},
 };
-constexpr int kClientW = 560, kClientH = 372;
+constexpr int kClientW = 560, kClientH = 426;
 
 void layout() {
   for (const Place& p : kPlaces) SetWindowPos(item(p.id), nullptr, S(p.x), S(p.y), S(p.w), S(p.h), SWP_NOZORDER | SWP_NOACTIVATE);
@@ -1109,14 +1170,16 @@ void create_controls() {
     CreateWindowExW(ex, cls, text, WS_CHILD | WS_VISIBLE | style, 0, 0, 10, 10, g_wnd, HMENU(INT_PTR(id)), g_inst, nullptr);
   };
   for (size_t i = 0; i < std::size(kLabels); ++i) make(L"STATIC", kLabels[i].text, SS_LEFT, kLabel + int(i));
-  for (int i = 0; i < 2; ++i) {
-    make(L"EDIT", L"", WS_TABSTOP | ES_AUTOHSCROLL, kDiscEdit + i, WS_EX_CLIENTEDGE);
-    make(L"BUTTON", L"Browse...", WS_TABSTOP | BS_PUSHBUTTON, kDiscBrowse + i);
-    make(L"STATIC", L"", SS_LEFT | SS_ENDELLIPSIS, kDiscState + i);
-  }
-  make(L"EDIT", L"", WS_TABSTOP | ES_AUTOHSCROLL | ES_READONLY, kDataEdit, WS_EX_CLIENTEDGE);
-  make(L"BUTTON", L"Change...", WS_TABSTOP | BS_PUSHBUTTON, kDataBrowse);
-  make(L"STATIC", L"", SS_LEFT | SS_ENDELLIPSIS, kDataState);
+  // The rows in tab order: a path, its button, the line below it.
+  auto row = [&](int edit, DWORD edit_style, int button, const wchar_t* button_text, int state) {
+    make(L"EDIT", L"", WS_TABSTOP | ES_AUTOHSCROLL | edit_style, edit, WS_EX_CLIENTEDGE);
+    make(L"BUTTON", button_text, WS_TABSTOP | BS_PUSHBUTTON, button);
+    make(L"STATIC", L"", SS_LEFT | SS_ENDELLIPSIS, state);
+  };
+  row(kDiscEdit, 0, kDiscBrowse, L"Browse...", kDiscState);
+  row(kUpdateEdit, 0, kUpdateBrowse, L"Browse...", kUpdateState);
+  row(kFilesEdit, 0, kFilesBrowse, L"Browse...", kFilesState);
+  row(kDataEdit, ES_READONLY, kDataBrowse, L"Change...", kDataState);
   make(L"BUTTON", L"Prepare files", WS_TABSTOP | BS_PUSHBUTTON, kPrepFiles);
   make(L"BUTTON", L"Set up", WS_TABSTOP | BS_PUSHBUTTON, kPrepare);
   make(L"BUTTON", L"Cancel", WS_TABSTOP | BS_PUSHBUTTON, kCancel);
@@ -1236,7 +1299,8 @@ void on_startup() {
 
 // The check results: one line per folder (update_buttons adds how to get missing files).
 void show_checks() {
-  Status d, m, u;
+  Status d, m;
+  UpdateCheck u;
   {
     std::lock_guard lk(g_check_mu);
     d = g_disc_check;
@@ -1244,18 +1308,18 @@ void show_checks() {
     u = g_update_check;
   }
   set_text(kDiscState, widen(d.text));
-  std::string files = m.text;
-  if (m.verdict == Verdict::Ok && u.verdict == Verdict::Ok) files += ", " + u.text;
-  if (m.verdict == Verdict::Ok && !u.text.empty() && u.verdict != Verdict::Ok) files += "; " + u.text;
-  set_text(kFilesState, widen(files));
-  for (int id : {kDiscState, kFilesState}) InvalidateRect(item(id), nullptr, TRUE);
+  set_text(kFilesState, widen(m.text));
+  std::wstring update = widen(u.status.text);
+  if (u.install) update += files_missing() ? L": Prepare files installs it." : L": Install update installs it.";
+  set_text(kUpdateState, update);
+  for (int id : {kDiscState, kUpdateState, kFilesState}) InvalidateRect(item(id), nullptr, TRUE);
 }
 
 Verdict verdict_of(int id) {
   if (id == kDataState) return data_row_bad() ? Verdict::Bad : Verdict::Empty;
   std::lock_guard lk(g_check_mu);
   if (!g_checked) return Verdict::Empty;
-  return id == kDiscState ? g_disc_check.verdict : g_files_check.verdict;
+  return id == kDiscState ? g_disc_check.verdict : id == kUpdateState ? g_update_check.status.verdict : g_files_check.verdict;
 }
 COLORREF verdict_color(Verdict v) {
   return v == Verdict::Ok ? RGB(0, 120, 40) : v == Verdict::Bad ? RGB(190, 30, 30) : GetSysColor(COLOR_GRAYTEXT);
@@ -1265,8 +1329,8 @@ LRESULT CALLBACK wndproc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
   switch (msg) {
     case WM_COMMAND: {
       int id = LOWORD(wp), code = HIWORD(wp);
-      if (code == EN_KILLFOCUS && (id == kDiscEdit || id == kFilesEdit)) {
-        if (get_text(id) != (id == kDiscEdit ? g_cfg.disc : g_cfg.files).wstring()) refresh_paths_from_ui();
+      if (code == EN_KILLFOCUS && (id == kDiscEdit || id == kUpdateEdit || id == kFilesEdit)) {
+        if (get_text(id) != (id == kDiscEdit ? g_cfg.disc : id == kUpdateEdit ? g_update : g_cfg.files).wstring()) refresh_paths_from_ui();
         return 0;
       }
       if (code == CBN_SELCHANGE && (id == kFps || id == kMode || id == kResolution)) {
@@ -1310,6 +1374,12 @@ LRESULT CALLBACK wndproc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
         case kFilesBrowse: {
           fs::path p = pick_folder(L"The folder with the decrypted files", g_cfg.files.empty() ? g_cfg.disc : g_cfg.files);
           if (!p.empty()) set_text(kFilesEdit, p.wstring()), refresh_paths_from_ui();
+          break;
+        }
+        case kUpdateBrowse: {
+          fs::path p = pick(false, L"The game's update 01.35: its package (.pkg) or the regulation.bin from it",
+                            g_update.empty() ? g_cfg.disc : g_update, L"Game update", L"*.pkg;regulation.bin");
+          if (!p.empty()) set_text(kUpdateEdit, p.wstring()), refresh_paths_from_ui();
           break;
         }
         case kDataBrowse:
@@ -1453,7 +1523,7 @@ LRESULT CALLBACK wndproc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
       int id = GetDlgCtrlID(HWND(lp));
       HDC dc = HDC(wp);
       SetBkMode(dc, TRANSPARENT);
-      if (id == kDiscState || id == kFilesState || id == kDataState) SetTextColor(dc, verdict_color(verdict_of(id)));
+      if (id == kDiscState || id == kUpdateState || id == kFilesState || id == kDataState) SetTextColor(dc, verdict_color(verdict_of(id)));
       return LRESULT(GetSysColorBrush(COLOR_WINDOW));
     }
     case WM_DPICHANGED: {
@@ -1583,7 +1653,9 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int show_cmd) {
   make_fonts();
   layout();
   set_text(kDiscEdit, g_cfg.disc.wstring());
+  set_text(kUpdateEdit, g_update.wstring());
   set_text(kFilesEdit, g_cfg.files.wstring());
+  if (!g_update_chosen) find_update();
   refresh_paths_from_ui();
   refresh_data_row();
   load_settings_controls();

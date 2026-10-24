@@ -50,6 +50,9 @@ DWORD WINAPI thread_main(LPVOID p) {
     LOG_D("thread", "thread 0x%x '%s' returned from entry (r3=0x%llx)", t->id, t->name.c_str(), (unsigned long long)status);
   } catch (const ThreadExit& e) {
     status = e.status;
+  } catch (const ppu::GuestLongjmp& j) {  // no resumable setjmp caller on this thread's stack (hooks.txt "setjmp")
+    fatal(acfa::strprintf("guest longjmp to 0x%08x (stack 0x%08x) in thread 0x%x '%s': no function that made that setjmp call is running",
+                          j.lr, j.r1, t->id, t->name.c_str()));
   }
   {
     std::lock_guard lk(t->mu);

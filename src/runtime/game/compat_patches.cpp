@@ -1,8 +1,9 @@
-// Compatibility patches for races in the game's own code: windows that the console's scheduling
-// (two hardware threads, priority-driven) rarely opens, but that this port's fully concurrent,
-// host-scheduled threads can hit, more so when the PC is busy. Each hook adds only the missing
-// synchronization and then runs the original guest function. The hooked addresses are listed in
-// hooks.txt (applied by acfa-recomp when generating code).
+// Compatibility patches. Races in the game's own code: windows that the console's scheduling (two
+// hardware threads, priority-driven) rarely opens, but that this port's fully concurrent,
+// host-scheduled threads can hit, more so when the PC is busy; each hook adds only the missing
+// synchronization and then runs the original guest function. And the guest's longjmp, which
+// recompiled code cannot return through on its own. The hooked addresses are listed in hooks.txt
+// (applied by acfa-recomp when generating code).
 #include <atomic>
 
 #include "ppu/ppu_recomp.h"
@@ -69,6 +70,24 @@ void hook_snd_bank_find(Ctx& ctx, void (*orig)(Ctx&)) {
 
 // Bank removal (0xef9ff0) destroys the cue table and sets the removed state only at its end: the
 // bank is marked removed first, so lookups starting meanwhile skip it.
+// The libc longjmp (0x10f5894): it restores r1, r2, r13-r31, the link register, CR, the FPRs and
+// the vector registers from the jmp_buf and sets r3 to the value (1 for 0), then returns through
+// the restored link register into the function that called setjmp. Generated code returns into
+// its own caller instead, with that other frame's stack pointer: the game's Lua (5.0.2) raises
+// script errors this way (luaD_throw 0xeb7ed8 -> luaD_rawrunprotected 0xeb7e38), and the stack
+// it then ran on was corrupted (a player's crash in ORDER MATCH against Collared 11, whose script
+// calls a misspelled function once his Primal Armor is below 40 %; 2026-10-24). After the
+// original restores the registers, the throw lands in the setjmp caller, which acfa-recomp emits
+// resumable (hooks.txt "setjmp").
+void hook_longjmp(Ctx& ctx, void (*orig)(Ctx&)) {
+  orig(ctx);
+  static std::atomic<int> logged{0};
+  int n = logged.fetch_add(1);
+  if (n < 20)
+    LOG_I("ppu", "longjmp to 0x%08x (stack 0x%08x, value %llu)", u32(ctx.lr), u32(ctx.r[1]), (unsigned long long)ctx.r[3]);
+  throw GuestLongjmp{u32(ctx.r[1]), u32(ctx.lr)};
+}
+
 void hook_ms_bank_remove(Ctx& ctx, void (*orig)(Ctx&)) {
   if (u32 bank = u32(ctx.r[3])) w32(bank + 8, 3);
   orig(ctx);

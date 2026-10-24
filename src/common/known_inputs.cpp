@@ -53,5 +53,7 @@ std::string module_other_version(const std::string& name, const std::string& sha
 
 const Known kFlashAtrac = {"flashATRAC.pic", "1edf54e1323dd736b71958ca56307d536dedc7c05ccb0dd3b2a3be1af5b50e30", 35131};
 const Known kRegulation = {"regulation.bin", "c7e993ad592c681963426b7ac7f2c5f4de28aa8b8a1a466f2b1518954232f70f", 245656};
+const Known kUpdatePkg = {"UP0001-BLUS30187_00-AC45000004141906-A0135-V0100-PE.pkg",
+                          "6911933229b07f8265b5865619293526e37d2eb2853ab603383fa82420005ed4", 349696};
 
 }  // namespace acfa::inputs

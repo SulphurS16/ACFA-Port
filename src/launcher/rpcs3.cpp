@@ -175,20 +175,15 @@ std::string rpcs3_system_software(const fs::path& rpcs3_exe) {
   return "";
 }
 
-fs::path find_update_pkg(const fs::path& disc, const fs::path& also) {
-  for (const fs::path& root : {disc, also}) {
-    if (root.empty()) continue;
-    std::error_code ec;
-    for (fs::recursive_directory_iterator it(root, fs::directory_options::skip_permission_denied, ec), end; !ec && it != end; it.increment(ec)) {
-      if (it.depth() > 2) {
-        it.disable_recursion_pending();
-        continue;
-      }
-      std::wstring n = lower(it->path().filename().wstring());
-      std::error_code e2;
-      if (it->is_regular_file(e2) && n.size() > 4 && n.compare(n.size() - 4, 4, L".pkg") == 0 && n.find(L"blus30187") != std::wstring::npos)
-        return it->path();
-    }
+fs::path find_update_pkg(const fs::path& folder) {
+  if (folder.empty()) return {};
+  std::error_code ec;
+  for (fs::recursive_directory_iterator it(folder, fs::directory_options::skip_permission_denied, ec), end; !ec && it != end; it.increment(ec)) {
+    if (it.depth() >= 2) it.disable_recursion_pending();
+    std::wstring n = lower(it->path().filename().wstring());
+    std::error_code e2;
+    if (it->is_regular_file(e2) && n.size() > 4 && n.compare(n.size() - 4, 4, L".pkg") == 0 && n.find(L"blus30187") != std::wstring::npos)
+      return it->path();
   }
   return {};
 }
@@ -259,10 +254,14 @@ void Rpcs3Prep::run(Rpcs3Job job) {
   DWORD pid = 0;
   std::error_code lec;
   fs::create_directories(job.work.parent_path(), lec);
-  log_ = _wfopen((job.work.parent_path() / "prepare-files.log").c_str(), L"wb");
+  // Install update adds to the log of Prepare files.
+  log_ = _wfopen((job.work.parent_path() / "prepare-files.log").c_str(), job.update_only ? L"ab" : L"wb");
   t0_ = std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now().time_since_epoch()).count();
-  log("Prepare files: RPCS3 " + narrow(job.rpcs3_exe.wstring()) + ", update file " + narrow(job.pup.wstring()) + ", game " +
-      narrow(job.disc.wstring()) + ", update package " + (job.update_pkg.empty() ? std::string("none") : narrow(job.update_pkg.wstring())));
+  if (job.update_only)
+    log("Install update: RPCS3 " + narrow(job.rpcs3_exe.wstring()) + ", update package " + narrow(job.update_pkg.wstring()));
+  else
+    log("Prepare files: RPCS3 " + narrow(job.rpcs3_exe.wstring()) + ", update file " + narrow(job.pup.wstring()) + ", game " +
+        narrow(job.disc.wstring()) + ", update package " + (job.update_pkg.empty() ? std::string("none") : narrow(job.update_pkg.wstring())));
   std::string titles_seen;  // the RPCS3 windows last logged
   auto log_windows = [&] {
     std::string t;
@@ -358,175 +357,181 @@ void Rpcs3Prep::run(Rpcs3Job job) {
     });
     if (!rr.started) return finish(false, "RPCS3 could not be started: " + rr.error);
   }
+  if (job.update_only && !options.count("--installpkg"))
+    return finish(false, "This RPCS3 is too old to install the game's update (it lacks --installpkg): update it from rpcs3.net.");
   for (const char* o : {"--installfw", "--decrypt"})
-    if (!options.count(o)) return finish(false, "This RPCS3 is too old to prepare the files (it lacks " + std::string(o) + "): update it from rpcs3.net.");
+    if (!job.update_only && !options.count(o))
+      return finish(false, "This RPCS3 is too old to prepare the files (it lacks " + std::string(o) + "): update it from rpcs3.net.");
   std::vector<std::wstring> base;
   if (options.count("--allow-any-location")) base.push_back(L"--allow-any-location");  // the copy lives in a work folder
 
-  // 2. The system modules: from the player's RPCS3 when it has 4.93 already, else installed in the copy.
-  fs::path ext;
-  fs::path player_ext = job.rpcs3_exe.parent_path() / "dev_flash" / "sys" / "external";
-  if (rpcs3_system_software(job.rpcs3_exe) == ki::kSystemSoftware && have_modules(player_ext)) {
-    ext = player_ext;
-  } else {
-    if (job.pup.empty()) return finish(false, "Choose the PS3 system software 4.93 update file (PS3UPDAT.PUP).");
-    const std::string installing = "Installing PS3 system software 4.93 in a private copy of RPCS3 (about half a minute)...";
-    set_status(installing);
-    std::vector<std::wstring> args = base;
-    args.insert(args.end(), {L"--installfw", job.pup.wstring()});
-    if (!start_rpcs3(exe, args)) return finish(false, "RPCS3 could not be started.");
-    // RPCS3 first asks "Install firmware: <file>?" in a window titled "RPCS3 Firmware Installer" (No
-    // has the focus), then shows its progress under the same title. The question is the player's:
-    // an installer window while RPCS3 reads nothing is the question (versions that do not ask
-    // start reading the update file at once). After Yes RPCS3 reads the update file, shows its
-    // progress and fills dev_flash; after No, or with the question closed, nothing happens: then
-    // Prepare files stops. Any other window RPCS3 shows (an error, say) is the player's to read
-    // and close the same way. Done when the system software is there and the installer has
-    // stayed closed for a second; RPCS3 then starts building a cache of its own, which is not
-    // needed. Waiting for the player does not count toward the time limit.
-    fs::path copy_ext = copy / "dev_flash" / "sys" / "external";
-    const std::string question = "RPCS3 asks \"Install firmware: ...\\" + narrow(job.pup.filename().wstring()) +
-                                 "?\": click Yes in RPCS3's window to continue (No stops Prepare files).";
-    const std::string again = ": nothing was installed or prepared. Click Prepare files to try again.";
-    HWND asked = nullptr, installer_seen = nullptr;
-    Settle settle;
-    bool working = false, asked_question = false, answered = false, answered_question = false;
-    std::string asked_title, answered_title;
-    unsigned long long io_mark = read_bytes(child);
-    auto now = Clock::now(), last = now, open_at = now, seen_at = now, active_at = now;
-    auto busy = Clock::duration::zero();
-    for (;;) {
-      Sleep(200);
-      if (cancel_) return finish(false, cancelled);  // after the wait: Cancel ends RPCS3 too
-      log_windows();
-      now = Clock::now();
-      if (!asked) busy += now - last;
-      last = now;
-      // Signs of the install under way: the update file read (32 MB more each time), dev_flash filled.
-      unsigned long long io = read_bytes(child);
-      if (io - io_mark > (32ull << 20) || (!working && has_entries(copy / "dev_flash"))) {
-        if (!working) log("RPCS3 is installing (" + std::to_string((io - io_mark) >> 20) + " MB read)");
-        working = true;
-        active_at = now;
-        io_mark = io;
-      }
-      HWND installer = window_titled(pid, L"Firmware Installer");
-      if (installer) open_at = active_at = now;
-      if (installer != installer_seen) {
-        if (installer_seen && !installer && !working && installer_seen != asked) {  // the question, answered before it was asked about
-          log("RPCS3's install question was answered at once");
-          answered = answered_question = true;
-          answered_title.clear();
-        }
-        installer_seen = installer;
-        seen_at = now;
-      }
-      if (asked && (!shown(asked) || (asked_question && working))) {
-        if (shown(asked)) {
-          log("RPCS3's installer window shows its progress: nothing to answer");
-        } else {
-          log(asked_question ? "the player answered RPCS3's install question" : "the player closed RPCS3's window \"" + asked_title + "\"");
-          answered = true;
-          answered_question = asked_question;
-          answered_title = asked_title;
-        }
-        asked = nullptr;
-        set_ask(nullptr, installing);
-        active_at = now;
-      }
-      if (!asked) {  // a window for the player: any but RPCS3's own; the installer while RPCS3 reads nothing
-        HWND want = settle(other_window(pid), now);
-        bool is_question = false;
-        if (!want && installer && !working && now - seen_at > std::chrono::milliseconds(600)) want = installer, is_question = true;
-        if (want) {
-          asked = want;
-          asked_question = is_question;
-          asked_title = title_of(want);
-          set_ask(want, is_question ? question : "RPCS3 shows \"" + asked_title + "\": read it in RPCS3's window and answer or close it there.");
-        }
-      }
-      if (asked) active_at = now;
-      bool installed = rpcs3_system_software(exe) == ki::kSystemSoftware && have_modules(copy_ext);
-      if ((installed && !installer && now - open_at > std::chrono::seconds(1)) || window_titled(pid, L"FPS:")) break;
-      if (exited()) {
-        if (installed) break;
-        return finish(false, "RPCS3 was closed before it installed the system software" + again);
-      }
-      if ((answered || working) && now - active_at > std::chrono::seconds(6)) {  // RPCS3 does nothing more
-        if (answered && answered_question && !working) return finish(false, "RPCS3's question was answered No or closed" + again);
-        if (answered && !answered_question)
-          return finish(false, "RPCS3 stopped after its message" + (answered_title.empty() ? std::string() : " \"" + answered_title + "\"") + again);
-        return finish(false, "RPCS3 stopped installing the system software from " + narrow(job.pup.filename().wstring()) + again);
-      }
-      if (busy > std::chrono::minutes(10)) return finish(false, "RPCS3 did not finish installing the system software in 10 minutes.");
-    }
-    if (asked) set_ask(nullptr, installing);
-    stop();
-    std::string v = rpcs3_system_software(exe);
-    log("system software in the copy: " + (v.empty() ? std::string("none") : v));
-    ext = copy / "dev_flash" / "sys" / "external";
-    if (v != ki::kSystemSoftware || !have_modules(ext))
-      return finish(false, "RPCS3 could not install the system software from " + narrow(job.pup.filename().wstring()) + (v.empty() ? "." : " (it has " + v + ")."));
-  }
-
-  // 3. Copies of the 10 modules and of EBOOT.BIN, decrypted by RPCS3 beside themselves.
-  const std::string decrypting = "Decrypting the system modules and the game's EBOOT.BIN with RPCS3...";
-  set_status(decrypting);
   fs::path stage = job.work / "files";
-  fs::create_directories(stage, ec);
-  std::vector<std::wstring> args = base;
-  for (const std::string& m : module_names()) {
-    fs::copy_file(ext / (m + ".sprx"), stage / (m + ".sprx"), fs::copy_options::overwrite_existing, ec);
-    args.insert(args.end(), {L"--decrypt", (stage / (m + ".sprx")).wstring()});
-  }
-  fs::copy_file(ext / ki::kFlashAtrac.name, stage / ki::kFlashAtrac.name, fs::copy_options::overwrite_existing, ec);
-  fs::copy_file(job.disc / "PS3_GAME" / "USRDIR" / "EBOOT.BIN", stage / "EBOOT.BIN", fs::copy_options::overwrite_existing, ec);
-  if (ec) return finish(false, "The files could not be copied for decrypting: " + ec.message());
-  args.insert(args.end(), {L"--decrypt", (stage / "EBOOT.BIN").wstring()});
-  if (!start_rpcs3(exe, args)) return finish(false, "RPCS3 could not be started.");
-  // RPCS3 decrypts without a window and exits; a window it shows meanwhile (a question, an error)
-  // is the player's to read and answer, as during the install, and that wait is not timed.
-  {
-    HWND asked = nullptr;
-    Settle settle;
-    std::string asked_title;
-    auto last = Clock::now();
-    auto busy = Clock::duration::zero();
-    for (;;) {
-      Sleep(200);
-      if (cancel_) return finish(false, cancelled);
-      if (exited()) break;
-      log_windows();
-      auto now = Clock::now();
-      if (!asked) busy += now - last;
-      last = now;
-      if (asked && !shown(asked)) {
-        log("the player closed RPCS3's window \"" + asked_title + "\"");
-        asked = nullptr;
-        set_ask(nullptr, decrypting);
-      }
-      if (!asked) {
-        if (HWND w = settle(other_window(pid), now)) {
-          asked = w;
-          asked_title = title_of(w);
-          set_ask(w, "RPCS3 shows \"" + asked_title + "\": read it in RPCS3's window and answer or close it there.");
+  if (!job.update_only) {
+    // 2. The system modules: from the player's RPCS3 when it has 4.93 already, else installed in the copy.
+    fs::path ext;
+    fs::path player_ext = job.rpcs3_exe.parent_path() / "dev_flash" / "sys" / "external";
+    if (rpcs3_system_software(job.rpcs3_exe) == ki::kSystemSoftware && have_modules(player_ext)) {
+      ext = player_ext;
+    } else {
+      if (job.pup.empty()) return finish(false, "Choose the PS3 system software 4.93 update file (PS3UPDAT.PUP).");
+      const std::string installing = "Installing PS3 system software 4.93 in a private copy of RPCS3 (about half a minute)...";
+      set_status(installing);
+      std::vector<std::wstring> args = base;
+      args.insert(args.end(), {L"--installfw", job.pup.wstring()});
+      if (!start_rpcs3(exe, args)) return finish(false, "RPCS3 could not be started.");
+      // RPCS3 first asks "Install firmware: <file>?" in a window titled "RPCS3 Firmware Installer" (No
+      // has the focus), then shows its progress under the same title. The question is the player's:
+      // an installer window while RPCS3 reads nothing is the question (versions that do not ask
+      // start reading the update file at once). After Yes RPCS3 reads the update file, shows its
+      // progress and fills dev_flash; after No, or with the question closed, nothing happens: then
+      // Prepare files stops. Any other window RPCS3 shows (an error, say) is the player's to read
+      // and close the same way. Done when the system software is there and the installer has
+      // stayed closed for a second; RPCS3 then starts building a cache of its own, which is not
+      // needed. Waiting for the player does not count toward the time limit.
+      fs::path copy_ext = copy / "dev_flash" / "sys" / "external";
+      const std::string question = "RPCS3 asks \"Install firmware: ...\\" + narrow(job.pup.filename().wstring()) +
+                                   "?\": click Yes in RPCS3's window to continue (No stops Prepare files).";
+      const std::string again = ": nothing was installed or prepared. Click Prepare files to try again.";
+      HWND asked = nullptr, installer_seen = nullptr;
+      Settle settle;
+      bool working = false, asked_question = false, answered = false, answered_question = false;
+      std::string asked_title, answered_title;
+      unsigned long long io_mark = read_bytes(child);
+      auto now = Clock::now(), last = now, open_at = now, seen_at = now, active_at = now;
+      auto busy = Clock::duration::zero();
+      for (;;) {
+        Sleep(200);
+        if (cancel_) return finish(false, cancelled);  // after the wait: Cancel ends RPCS3 too
+        log_windows();
+        now = Clock::now();
+        if (!asked) busy += now - last;
+        last = now;
+        // Signs of the install under way: the update file read (32 MB more each time), dev_flash filled.
+        unsigned long long io = read_bytes(child);
+        if (io - io_mark > (32ull << 20) || (!working && has_entries(copy / "dev_flash"))) {
+          if (!working) log("RPCS3 is installing (" + std::to_string((io - io_mark) >> 20) + " MB read)");
+          working = true;
+          active_at = now;
+          io_mark = io;
         }
+        HWND installer = window_titled(pid, L"Firmware Installer");
+        if (installer) open_at = active_at = now;
+        if (installer != installer_seen) {
+          if (installer_seen && !installer && !working && installer_seen != asked) {  // the question, answered before it was asked about
+            log("RPCS3's install question was answered at once");
+            answered = answered_question = true;
+            answered_title.clear();
+          }
+          installer_seen = installer;
+          seen_at = now;
+        }
+        if (asked && (!shown(asked) || (asked_question && working))) {
+          if (shown(asked)) {
+            log("RPCS3's installer window shows its progress: nothing to answer");
+          } else {
+            log(asked_question ? "the player answered RPCS3's install question" : "the player closed RPCS3's window \"" + asked_title + "\"");
+            answered = true;
+            answered_question = asked_question;
+            answered_title = asked_title;
+          }
+          asked = nullptr;
+          set_ask(nullptr, installing);
+          active_at = now;
+        }
+        if (!asked) {  // a window for the player: any but RPCS3's own; the installer while RPCS3 reads nothing
+          HWND want = settle(other_window(pid), now);
+          bool is_question = false;
+          if (!want && installer && !working && now - seen_at > std::chrono::milliseconds(600)) want = installer, is_question = true;
+          if (want) {
+            asked = want;
+            asked_question = is_question;
+            asked_title = title_of(want);
+            set_ask(want, is_question ? question : "RPCS3 shows \"" + asked_title + "\": read it in RPCS3's window and answer or close it there.");
+          }
+        }
+        if (asked) active_at = now;
+        bool installed = rpcs3_system_software(exe) == ki::kSystemSoftware && have_modules(copy_ext);
+        if ((installed && !installer && now - open_at > std::chrono::seconds(1)) || window_titled(pid, L"FPS:")) break;
+        if (exited()) {
+          if (installed) break;
+          return finish(false, "RPCS3 was closed before it installed the system software" + again);
+        }
+        if ((answered || working) && now - active_at > std::chrono::seconds(6)) {  // RPCS3 does nothing more
+          if (answered && answered_question && !working) return finish(false, "RPCS3's question was answered No or closed" + again);
+          if (answered && !answered_question)
+            return finish(false, "RPCS3 stopped after its message" + (answered_title.empty() ? std::string() : " \"" + answered_title + "\"") + again);
+          return finish(false, "RPCS3 stopped installing the system software from " + narrow(job.pup.filename().wstring()) + again);
+        }
+        if (busy > std::chrono::minutes(10)) return finish(false, "RPCS3 did not finish installing the system software in 10 minutes.");
       }
-      if (busy > std::chrono::minutes(3)) return finish(false, "RPCS3 did not finish decrypting in 3 minutes.");
+      if (asked) set_ask(nullptr, installing);
+      stop();
+      std::string v = rpcs3_system_software(exe);
+      log("system software in the copy: " + (v.empty() ? std::string("none") : v));
+      ext = copy / "dev_flash" / "sys" / "external";
+      if (v != ki::kSystemSoftware || !have_modules(ext))
+        return finish(false, "RPCS3 could not install the system software from " + narrow(job.pup.filename().wstring()) + (v.empty() ? "." : " (it has " + v + ")."));
     }
-    if (asked) set_ask(nullptr, decrypting);
+
+    // 3. Copies of the 10 modules and of EBOOT.BIN, decrypted by RPCS3 beside themselves.
+    const std::string decrypting = "Decrypting the system modules and the game's EBOOT.BIN with RPCS3...";
+    set_status(decrypting);
+    fs::create_directories(stage, ec);
+    std::vector<std::wstring> args = base;
+    for (const std::string& m : module_names()) {
+      fs::copy_file(ext / (m + ".sprx"), stage / (m + ".sprx"), fs::copy_options::overwrite_existing, ec);
+      args.insert(args.end(), {L"--decrypt", (stage / (m + ".sprx")).wstring()});
+    }
+    fs::copy_file(ext / ki::kFlashAtrac.name, stage / ki::kFlashAtrac.name, fs::copy_options::overwrite_existing, ec);
+    fs::copy_file(job.disc / "PS3_GAME" / "USRDIR" / "EBOOT.BIN", stage / "EBOOT.BIN", fs::copy_options::overwrite_existing, ec);
+    if (ec) return finish(false, "The files could not be copied for decrypting: " + ec.message());
+    args.insert(args.end(), {L"--decrypt", (stage / "EBOOT.BIN").wstring()});
+    if (!start_rpcs3(exe, args)) return finish(false, "RPCS3 could not be started.");
+    // RPCS3 decrypts without a window and exits; a window it shows meanwhile (a question, an error)
+    // is the player's to read and answer, as during the install, and that wait is not timed.
+    {
+      HWND asked = nullptr;
+      Settle settle;
+      std::string asked_title;
+      auto last = Clock::now();
+      auto busy = Clock::duration::zero();
+      for (;;) {
+        Sleep(200);
+        if (cancel_) return finish(false, cancelled);
+        if (exited()) break;
+        log_windows();
+        auto now = Clock::now();
+        if (!asked) busy += now - last;
+        last = now;
+        if (asked && !shown(asked)) {
+          log("the player closed RPCS3's window \"" + asked_title + "\"");
+          asked = nullptr;
+          set_ask(nullptr, decrypting);
+        }
+        if (!asked) {
+          if (HWND w = settle(other_window(pid), now)) {
+            asked = w;
+            asked_title = title_of(w);
+            set_ask(w, "RPCS3 shows \"" + asked_title + "\": read it in RPCS3's window and answer or close it there.");
+          }
+        }
+        if (busy > std::chrono::minutes(3)) return finish(false, "RPCS3 did not finish decrypting in 3 minutes.");
+      }
+      if (asked) set_ask(nullptr, decrypting);
+    }
+    stop();
+    if (!is_file(stage / "EBOOT.elf")) return finish(false, "RPCS3 did not decrypt the game's EBOOT.BIN.");
+    for (const std::string& m : module_names())
+      if (!is_file(stage / (m + ".prx"))) return finish(false, "RPCS3 did not decrypt " + m + ".sprx.");
   }
-  stop();
-  if (!is_file(stage / "EBOOT.elf")) return finish(false, "RPCS3 did not decrypt the game's EBOOT.BIN.");
-  for (const std::string& m : module_names())
-    if (!is_file(stage / (m + ".prx"))) return finish(false, "RPCS3 did not decrypt " + m + ".sprx.");
 
   // 4. The game's update (optional): RPCS3 asks "Do you want to install this package?" in its "PKG
   // Installation" window (Install / Cancel). The question is the player's, as during the system
-  // software install; Cancel, or closing it, goes on without the update (the disc's balance data).
-  // Any other window RPCS3 shows meanwhile is the player's to read and close the same way.
+  // software install; Cancel, or closing it, goes on without the update (the disc's balance data;
+  // Install update stops). Any other window RPCS3 shows meanwhile is the player's to read and close
+  // the same way.
   fs::path game_data;
-  std::string note;
+  std::string note, not_installed;  // why the update was not installed
   if (!job.update_pkg.empty() && options.count("--installpkg")) {
     const std::string updating = "Installing the game's update in the private copy of RPCS3...";
     set_status(updating);
@@ -565,8 +570,9 @@ void Rpcs3Prep::run(Rpcs3Job job) {
             asked = want;
             asked_question = want == pkgq;
             asked_title = title_of(want);
+            std::string cancel = job.update_only ? "Cancel installs nothing" : "Cancel goes on without the update";
             set_ask(want, asked_question ? "RPCS3 asks \"Do you want to install this package?\" (the game's update 01.35): click Install in "
-                                           "RPCS3's window (Cancel goes on without the update)."
+                                           "RPCS3's window (" + cancel + ")."
                                          : "RPCS3 shows \"" + asked_title + "\": read it in RPCS3's window and answer or close it there.");
           }
         }
@@ -581,23 +587,34 @@ void Rpcs3Prep::run(Rpcs3Job job) {
       stop();
     }
     if (is_file(reg)) game_data = reg.parent_path().parent_path();
-    else if (declined) note = "The game's update was not installed (RPCS3's question answered Cancel or closed): the disc's balance data is used.";
-    else note = "The game's update could not be installed; the disc's balance data is used.";
-  } else if (job.update_pkg.empty()) {
-    note = "No update package of the game was found: the disc's balance data is used (optional).";
+    else if (declined) not_installed = "The game's update was not installed (RPCS3's question answered Cancel or closed)";
+    else not_installed = "The game's update could not be installed";
+  } else if (!job.update_pkg.empty()) {
+    not_installed = "This RPCS3 cannot install the game's update (it lacks --installpkg)";
+  }
+  if (!not_installed.empty()) {
+    if (job.update_only) return finish(false, not_installed + ". Click Install update to try again.");
+    note = not_installed + ": the disc's balance data is used.";
   }
 
-  // 5. The launcher's folder of decrypted files.
-  set_status("Collecting the files...");
-  fs::create_directories(job.out, ec);
-  fs::remove_all(job.out / ki::kTitleId, ec);
-  std::vector<std::string> files = {"EBOOT.elf", ki::kFlashAtrac.name};
-  for (const std::string& m : module_names()) files.push_back(m + ".prx");
-  for (const std::string& f : files) {
-    fs::copy_file(stage / f, job.out / f, fs::copy_options::overwrite_existing, ec);
-    if (ec) return finish(false, "The files could not be saved in " + narrow(job.out.wstring()) + ": " + ec.message());
+  // 5. The launcher's folders: the decrypted files, the installed update.
+  set_status(job.update_only ? "Saving the update..." : "Collecting the files...");
+  if (!job.update_only) {
+    fs::create_directories(job.out, ec);
+    fs::remove_all(job.out / ki::kTitleId, ec);  // the update, where earlier launchers put it
+    std::vector<std::string> files = {"EBOOT.elf", ki::kFlashAtrac.name};
+    for (const std::string& m : module_names()) files.push_back(m + ".prx");
+    for (const std::string& f : files) {
+      fs::copy_file(stage / f, job.out / f, fs::copy_options::overwrite_existing, ec);
+      if (ec) return finish(false, "The files could not be saved in " + narrow(job.out.wstring()) + ": " + ec.message());
+    }
   }
-  if (!game_data.empty()) fs::copy(game_data, job.out / ki::kTitleId, fs::copy_options::recursive | fs::copy_options::overwrite_existing, ec);
+  if (!game_data.empty()) {
+    fs::remove_all(job.update_out / ki::kTitleId, ec);
+    fs::create_directories(job.update_out, ec);
+    fs::copy(game_data, job.update_out / ki::kTitleId, fs::copy_options::recursive | fs::copy_options::overwrite_existing, ec);
+    if (ec) return finish(false, "The update could not be saved in " + narrow(job.update_out.wstring()) + ": " + ec.message());
+  }
   finish(true, "", note);
 }
 

@@ -40,6 +40,7 @@ struct Install {
   fs::path launcher;     // the launcher that used it last (may be gone)
   fs::path data;         // the game data folder
   fs::path disc, files, rpcs3, pup;
+  fs::path update;       // the game update the player chose ("" none, or launchers before Game update)
   std::string version;   // of that launcher ("" unknown: launchers before the record)
   long long when = 0;    // last change of the install (file time ticks)
 };

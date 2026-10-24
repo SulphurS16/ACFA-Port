@@ -78,7 +78,7 @@ fs::path pick(const std::vector<fs::path>& candidates, const ki::Known& k) {
 
 }  // namespace
 
-Found find_files(const fs::path& disc, const fs::path& files) {
+Found find_files(const fs::path& disc, const fs::path& files, const fs::path& update) {
   Found f;
   // EBOOT.elf: decrypting EBOOT.BIN usually puts it next to it, in the game folder.
   std::vector<fs::path> eboots;
@@ -97,7 +97,10 @@ Found find_files(const fs::path& disc, const fs::path& files) {
       f.encrypted_modules = true;
     }
   }
-  f.regulation = pick(find_named(files, widen(ki::kRegulation.name)), ki::kRegulation);
+  // regulation.bin: the update the player chose first, then the decrypted files' folder.
+  std::vector<fs::path> regs = is_file(update) ? std::vector<fs::path>{update} : find_named(update, widen(ki::kRegulation.name));
+  for (const fs::path& p : find_named(files, widen(ki::kRegulation.name))) regs.push_back(p);
+  f.regulation = pick(regs, ki::kRegulation);
   return f;
 }
 
@@ -166,13 +169,50 @@ Status check_modules(const fs::path& files, const Found& f) {
   return {Verdict::Ok, "The 10 system modules of system software " + std::string(ki::kSystemSoftware), ""};
 }
 
-Status check_update(const Found& f) {
-  if (f.regulation.empty()) return {Verdict::Optional, "", ""};
-  std::string h = hash_of(f.regulation);
-  if (h != ki::kRegulation.sha256)
-    return {Verdict::Optional, "regulation.bin is not the one of update 01.35: the disc's balance data is used.",
-            narrow(f.regulation.wstring()) + ": sha256 " + h + ", expected " + ki::kRegulation.sha256};
-  return {Verdict::Ok, "update 01.35", ""};
+bool is_package(const fs::path& p) { return lower(p.extension().wstring()) == L".pkg"; }
+
+UpdateCheck check_update(const fs::path& chosen, const Found& f) {
+  UpdateCheck u;
+  std::string rh = f.regulation.empty() ? "" : hash_of(f.regulation);
+  bool have = rh == ki::kRegulation.sha256;  // the update's data is there (installed, or regulation.bin itself)
+  auto mismatch = [](const fs::path& p, const std::string& h, const ki::Known& k) {
+    return narrow(p.wstring()) + ": sha256 " + h + ", expected " + k.sha256;
+  };
+  if (chosen.empty()) {
+    if (have) u.status = {Verdict::Ok, "Update 01.35 (regulation.bin in the decrypted files)", ""};
+    else if (!f.regulation.empty())
+      u.status = {Verdict::Optional, "The regulation.bin in the decrypted files is not update 01.35's: the disc's balance data is used.",
+                  mismatch(f.regulation, rh, ki::kRegulation)};
+    else u.status = {Verdict::Optional, "Optional: the game's update 01.35 (.pkg), for its final balance data.", ""};
+    return u;
+  }
+  if (!is_file(chosen)) {
+    u.status = {Verdict::Bad, "File not found.", ""};
+    return u;
+  }
+  if (is_package(chosen)) {
+    std::string h = hash_of(chosen);
+    if (h != ki::kUpdatePkg.sha256) {
+      u.status = {Verdict::Bad, "Not the game's update 01.35 (" + std::string(ki::kUpdatePkg.name) + ").", mismatch(chosen, h, ki::kUpdatePkg)};
+      return u;
+    }
+    u.package = true;
+    u.install = !have;
+    u.status = have ? Status{Verdict::Ok, "Update 01.35, installed", ""} : Status{Verdict::Optional, "Update 01.35, not installed yet", ""};
+    return u;
+  }
+  if (lower(chosen.extension().wstring()) == L".pup") {
+    u.status = {Verdict::Bad, "That is the PS3 system software update (Prepare files asks for it): choose the game's update here.", ""};
+    return u;
+  }
+  if (lower(chosen.filename().wstring()) != widen(ki::kRegulation.name)) {
+    u.status = {Verdict::Bad, "Choose the game's update package (.pkg) or its regulation.bin.", ""};
+    return u;
+  }
+  std::string h = hash_of(chosen);
+  u.status = h == ki::kRegulation.sha256 ? Status{Verdict::Ok, "Update 01.35 (regulation.bin)", ""}
+                                         : Status{Verdict::Bad, "This regulation.bin is not update 01.35's.", mismatch(chosen, h, ki::kRegulation)};
+  return u;
 }
 
 std::wstring files_help() {
@@ -183,9 +223,10 @@ std::wstring files_help() {
          L"\u2022 EBOOT.elf: the game's PS3_GAME\\USRDIR\\EBOOT.BIN, decrypted. It can stay next to EBOOT.BIN.\n\n"
          L"\u2022 The 10 system modules of PS3 system software " + widen(ki::kSystemSoftware) + L" (sys\\external), decrypted to .prx: " + mods +
          L"; with flashATRAC.pic from the same folder.\n\n"
-         L"\u2022 Optional, for the game's final balance data: regulation.bin of update 01.35.\n\n"
          L"Choose the folder that holds them (they may also be in folders below it), or let the launcher prepare them: Prepare "
-         L"files asks for your RPCS3 and the PS3 system software 4.93 update file (PS3UPDAT.PUP from playstation.com).";
+         L"files asks for your RPCS3 and the PS3 system software 4.93 update file (PS3UPDAT.PUP from playstation.com).\n\n"
+         L"Optional, for the game's final balance data: the game's update 01.35 under Game update, either its package (" +
+         widen(ki::kUpdatePkg.name) + L"; your RPCS3 installs it) or the regulation.bin from it.";
 }
 
 }  // namespace launcher

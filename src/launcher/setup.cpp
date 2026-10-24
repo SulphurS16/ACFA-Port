@@ -97,7 +97,7 @@ fs::path verified_game_data(const Found& f) {
 std::string stamp(const SetupConfig& c, size_t step) {
   switch (step) {
     case kImport: {
-      Found f = find_files(c.disc, c.files);
+      Found f = find_files(c.disc, c.files, c.update);
       std::string s = "disc " + c.disc.generic_string() + "\neboot " + file_stamp(f.eboot_elf) + "\n";
       for (int i = 0; i < ki::kModuleCount; ++i) s += std::string(ki::kModules[i]) + " " + file_stamp(f.modules_dir / ki::module(ki::kModules[i])->name) + "\n";
       fs::path gd = verified_game_data(f);
@@ -446,7 +446,7 @@ void Setup::run(SetupConfig c) {
         {kImport,
          [&] {
            // The player's decrypted files, verified by SHA-256 (acfa-prep reports any mismatch).
-           Found f = find_files(c.disc, c.files);
+           Found f = find_files(c.disc, c.files, c.update);
            std::vector<std::wstring> a = {L"import",       L"--disc",        w(c.disc),
                                           L"--eboot",      w(f.eboot_elf),   L"--modules-dir",
                                           w(f.modules_dir), L"--flash-file", w(f.modules_dir / ki::kFlashAtrac.name),

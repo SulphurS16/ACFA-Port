@@ -23,6 +23,7 @@ struct SetupConfig {
   fs::path data;  // install folder: tools, prepared data, build, saves, settings
   fs::path disc;   // the game's disc folder (read in place; EBOOT.elf next to EBOOT.BIN)
   fs::path files;  // the folder with the decrypted files (inputs.h: in it or in folders below it)
+  fs::path update;  // optional: the game update's regulation.bin, or the folder its package was installed to (inputs.h)
 };
 
 enum class StepState { Waiting, Running, Done, Skipped, Failed };

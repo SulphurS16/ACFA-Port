@@ -15,9 +15,10 @@ namespace {
 
 using acfa::settings::Mode;
 
-std::mutex g_mu;  // g_display and the file; never held while calling into the window
+std::mutex g_mu;  // g_display, g_game and the file; never held while calling into the window
 std::string g_file;
 acfa::settings::Display g_display;
+acfa::settings::Game g_game;
 Mode g_last_full = Mode::Borderless;  // what F11 / Alt+Enter switch to from a window
 
 // Re-reads the file (it may have been edited since), changes the given values and saves it.
@@ -41,7 +42,9 @@ void init(const std::string& file, std::vector<std::string>* notes) {
   acfa::Ini ini = acfa::settings::load_or_create(file, notes);
   g_display = acfa::settings::read_display(ini);
   if (g_display.mode != Mode::Windowed) g_last_full = g_display.mode;
+  g_game = acfa::settings::read_game(ini);
   bindings::load(ini);
+  LOG_I("settings", "ORDER MATCH AI fixes %s", g_game.arena_ai_fixes ? "on" : "off (scripts as on the console)");
 }
 
 void use_safe_display() {
@@ -55,6 +58,20 @@ const std::string& file() { return g_file; }
 acfa::settings::Display display() {
   std::lock_guard lk(g_mu);
   return g_display;
+}
+
+acfa::settings::Game game() {
+  std::lock_guard lk(g_mu);
+  return g_game;
+}
+
+void set_game(const acfa::settings::Game& g) {
+  {
+    std::lock_guard lk(g_mu);
+    g_game = g;
+    update_file([&](acfa::Ini& ini) { acfa::settings::write_game(ini, g); });
+  }
+  LOG_I("settings", "ORDER MATCH AI fixes %s (from the next match on)", g.arena_ai_fixes ? "on" : "off");
 }
 
 void set_fps(double fps) {

@@ -118,7 +118,9 @@ int main(int argc, char** argv) {
                                                : acfa::settings::file_in(data).string();
   if (!user.empty()) c.saves = (user / "savedata").string();
   std::string shader_manifest = (root / "data" / "shader_manifest.txt").string();
-  // Run directory: <data>\runs\<UTC timestamp>
+  // Run directory: <data>\runs\<UTC timestamp>, or <timestamp>-2, -3, ... when another game
+  // started in the same second (two games on one PC: they must not share a log). Creating the
+  // directory decides atomically which name is whose.
   std::time_t now = std::time(nullptr);
   std::tm tm{};
   gmtime_s(&tm, &now);
@@ -127,7 +129,8 @@ int main(int argc, char** argv) {
   fs::path run = data / "runs" / stamp;
   try {
     acfa::guard_write(run);
-    fs::create_directories(run);
+    fs::create_directories(data / "runs");
+    for (int n = 2; !fs::create_directory(run) && n < 1000; ++n) run = data / "runs" / (std::string(stamp) + "-" + std::to_string(n));
     if (c.keep_runs) prune_runs(data / "runs", c.keep_runs);
     c.run_dir = run.string();
     log_open((run / "acfa.log").string());
@@ -153,6 +156,7 @@ int main(int argc, char** argv) {
   }
   std::string level = "info";
   [[maybe_unused]] bool pad_selftest = false;  // --pad-selftest (developer builds)
+  [[maybe_unused]] std::string arena_fixes_bnd;  // --arena-fixes-selftest BND (developer builds)
   for (int i = 1; i < argc; ++i) {
     std::string a = argv[i];
     auto next = [&]() -> std::string { return i + 1 < argc ? argv[++i] : std::string(); };

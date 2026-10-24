@@ -9,10 +9,13 @@
 // under it through the dialog's own SetFocus (the D-pad's path, with its highlight, help line and
 // notifications); a click presses Cross after focusing what was clicked, a right click Circle,
 // the wheel the D-pad. A click or drag on a slider's bar moves the slider with the D-pad (held
-// while far, single steps near) until its value matches the cursor. In a list the row under the
-// cursor is selected with the list's own move routine (and its notification), as far as that
-// does not scroll the list; a click on a row selects and chooses it. Nothing here changes the
-// game's state other than through those calls and presses.
+// while far, single steps near) until its value matches the cursor. In a list the item under the
+// cursor is reached with D-pad presses, as a player reaches it (hover: only items whose selection
+// does not scroll the list); a click on an item steps to it and chooses it, on a strip of slots
+// or categories (ASSEMBLE, TUNE) only selects it. A click on an arrow (◀ ▶ of a choice row or a
+// strip, ▲ ▼ of a list) presses its direction. Dialogs whose scene moves their lists itself keep
+// no focused object (TUNE): the cursor leaves their focus alone. Nothing here changes the game's
+// state other than through those calls and presses.
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 
@@ -24,6 +27,7 @@
 #include <cmath>
 #include <deque>
 #include <mutex>
+#include <vector>
 
 #include "ppu/ppu_recomp.h"
 #include "runtime/config.h"
@@ -35,8 +39,6 @@
 #include "runtime/memory.h"
 #include "runtime/sysdialog.h"
 #include "runtime/ui/overlay.h"
-
-void f_003e71a0(ppu::Ctx&);  // menu object: tell its parent dialog (r3 object, r4 code)
 
 namespace rt::game {
 namespace {
@@ -63,11 +65,12 @@ constexpr u32 kObjFocusable = 56;  // object vtable: focusable
 // CMenuSliderCtrl (vtable 0x120dff8): min, max, value, step (ints), the bar (floats l, t, r, b).
 constexpr u32 kSliderVtable = 0x0120dff8;
 constexpr u32 kSliderMin = 0x34, kSliderMax = 0x38, kSliderValue = 0x3c, kSliderStep = 0x40, kSliderBar = 0x44;
-// The list control (vtable 0x120dd08, FREE PLAY's missions and others): column +68, selected row
-// +104, rows on a page +108, rows +112, first row shown +116; vtable slot 21 moves the selection
-// (out, list, current {column, row}, delta), then the list's parent is told (0x3e71a0, code 5).
+// The list control (vtable 0x120dd08, FREE PLAY's missions, ASSEMBLE's parts and others):
+// selected column +68, columns on a page +72, columns +76, first column shown +80; selected row
+// +104, rows on a page +108, rows +112, first row shown +116.
 constexpr u32 kListVtable = 0x0120dd08;
-constexpr u32 kListCol = 68, kListRow = 104, kListPage = 108, kListCount = 112, kListTop = 116, kListMove = 84;
+constexpr u32 kListCol = 68, kListColPage = 72, kListColCount = 76, kListColTop = 80;
+constexpr u32 kListRow = 104, kListPage = 108, kListCount = 112, kListTop = 116;
 
 // Pad bits (cellPad digital words).
 constexpr u16 kStart = 0x8, kUp = 0x10, kRight = 0x20, kDown = 0x40, kLeft = 0x80;
@@ -138,17 +141,6 @@ u64 call(Ctx& ctx, u32 opd, u64 r3, u64 r4 = 0, u64 r5 = 0, u64 r6 = 0) {
   u64 ret = ctx.r[3];
   ctx = saved;
   return ret;
-}
-// The same for a recompiled function called directly (its own TOC handling).
-void call_fn(Ctx& ctx, void (*fn)(Ctx&), u64 r3, u64 r4) {
-  Ctx saved = ctx;
-  u32 sp = (u32(ctx.r[1]) - 0x300) & ~15u;
-  ppu::w64(sp, ctx.r[1]);
-  ctx.r[1] = sp;
-  ctx.r[3] = r3;
-  ctx.r[4] = r4;
-  fn(ctx);
-  ctx = saved;
 }
 u32 vfunc(u32 obj, u32 slot) {
   if (!valid(obj)) return 0;
@@ -258,41 +250,148 @@ u32 object_at(Ctx& ctx, u32 dialog, float gx, float gy, u32* slider) {
   return best;
 }
 
-bool is_list(u32 obj) { return valid(obj + kListTop + 4) && ppu::r32(obj) == kListVtable; }
-
-// The list row under (gx, gy) of `list` with rect `r`, or -1; *safe: selecting it does not scroll
-// the list. Wherever it can, the game keeps the selection on the middle row of the page (first
-// row shown = selection - page / 2, within the list: FREE PLAY, run 20261015-100154).
-s32 list_row_at(u32 list, const Rect& r, float gy, bool* safe) {
-  s32 page = s32(ppu::r32(list + kListPage)), count = s32(ppu::r32(list + kListCount)), top = s32(ppu::r32(list + kListTop));
-  if (page <= 0 || page > 64 || count <= 0 || top < 0 || !(r.b > r.t)) return -1;
-  s32 visible = s32((gy - r.t) / ((r.b - r.t) / float(page)));
-  if (visible < 0 || visible >= page || top + visible >= count) return -1;
-  s32 target = top + visible;
-  *safe = std::clamp(target - page / 2, 0, std::max(0, count - page)) == top;
-  return target;
+// The list control or a class derived from it (DESIGN's schematics and tabs: their own vtables
+// with the list's key handler, slot 10, and move routine, slot 21; run 20261024-185045).
+bool is_list(u32 obj) {
+  if (!valid(obj + kListTop + 4)) return false;
+  u32 vt = ppu::r32(obj);
+  if (vt == kListVtable) return true;
+  return valid(vt + 88) && ppu::r32(vt + 40) == ppu::r32(kListVtable + 40) && ppu::r32(vt + 84) == ppu::r32(kListVtable + 84);
+}
+// A derived strip whose selection is kept elsewhere: DESIGN's tabs did not change their column
+// when the D-pad changed the tab (run 20261024-185045), so the cursor cannot tell how far to step
+// and leaves them alone (a click there pressed Cross on the selected schematic).
+bool untracked_strip(u32 obj) {
+  return is_list(obj) && ppu::r32(obj) != kListVtable && s32(ppu::r32(obj + kListColPage)) > 1 && s32(ppu::r32(obj + kListPage)) <= 1;
 }
 
-// Selects row `target` of `list` as its key handler does (the list's own move, then the parent's
-// notification). Returns whether the list scrolled.
-bool list_select(Ctx& ctx, u32 list, s32 target) {
-  s32 row = s32(ppu::r32(list + kListRow)), col = s32(ppu::r32(list + kListCol)), top = s32(ppu::r32(list + kListTop));
-  if (target == row) return false;
-  u32 m = (u32(ctx.r[1]) - 0x60) & ~15u;  // {current}, {delta}, {out}: inside the 0x100 bytes call() leaves free
-  ppu::w32(m, u32(col));
-  ppu::w32(m + 4, u32(row));
-  ppu::w32(m + 8, 0);
-  ppu::w32(m + 12, u32(target - row));
-  ppu::w32(m + 16, u32(col));
-  ppu::w32(m + 20, u32(row));
-  call(ctx, vfunc(list, kListMove), m + 16, list, m, m + 8);
-  if (s32(ppu::r32(m + 16)) != col || s32(ppu::r32(m + 20)) != row) call_fn(ctx, f_003e71a0, list, 5);
-  return s32(ppu::r32(list + kListTop)) != top;
+// Whether `dialog` holds a list the player can move (checked again every half second). A dialog
+// that takes keys but keeps no focused object is still a menu then: TUNE's scene moves its lists
+// itself (run 20261024-182618).
+bool has_list(Ctx& ctx, u32 dialog) {
+  static u32 last = 0;
+  static bool result = false;
+  static s64 at = 0;
+  s64 t = now_ms();
+  if (dialog == last && t - at < 500) return result;
+  last = dialog;
+  at = t;
+  result = false;
+  u32 arr = ppu::r32(dialog + kDlgChildren), n = ppu::r32(dialog + kDlgChildCount);
+  if (n == 0 || n > 1024 || !valid(arr, 4 * n)) return false;
+  for (u32 i = 0; i < n && !result; ++i) {
+    u32 obj = ppu::r32(arr + 4 * i);
+    result = is_list(obj) && call(ctx, vfunc(obj, kObjFocusable), obj) != 0;
+  }
+  return result;
+}
+
+// A list's item under the cursor: the D-pad steps from the selection to it.
+struct ListItem {
+  bool strip = false;      // one row of several columns (ASSEMBLE's slots, TUNE's categories)
+  s32 dcol = 0, drow = 0;  // steps right / down (negative: left / up)
+  bool safe = false;       // selecting it does not scroll the list
+};
+
+// The item of `list` (rect `r`) under (x, y), if any. Wherever it can, a list keeps the selection
+// on the middle row of the page (first row shown = selection - page / 2, within the list: FREE
+// PLAY, run 20261015-100154). The strips keep the selection first on the page and wrap around
+// (ASSEMBLE, TUNE: run 20261024-182618), so every move scrolls them.
+bool list_item_at(u32 list, const Rect& r, float x, float y, ListItem* it) {
+  struct Axis {
+    s32 sel, page, count, top;
+  };
+  const Axis axes[2] = {
+      {s32(ppu::r32(list + kListCol)), s32(ppu::r32(list + kListColPage)), s32(ppu::r32(list + kListColCount)), s32(ppu::r32(list + kListColTop))},
+      {s32(ppu::r32(list + kListRow)), s32(ppu::r32(list + kListPage)), s32(ppu::r32(list + kListCount)), s32(ppu::r32(list + kListTop))}};
+  if (!(r.r > r.l && r.b > r.t)) return false;
+  it->strip = axes[0].page > 1 && axes[1].page <= 1;
+  const float pos[2] = {(x - r.l) / (r.r - r.l), (y - r.t) / (r.b - r.t)};  // 0-1 across the list
+  s32 steps[2] = {0, 0};
+  bool scrolls = false;
+  for (int k = 0; k < 2; ++k) {
+    const Axis& a = axes[k];
+    if (a.page <= 1) continue;  // the list has one column (or row) on a page
+    if (a.page > 64 || a.count <= 0 || a.count > 4096 || a.top < 0 || a.top >= a.count) return false;
+    s32 visible = s32(std::floor(pos[k] * float(a.page)));
+    if (visible < 0 || visible >= a.page) return false;
+    s32 target = a.top + visible;
+    if (target >= a.count) {
+      if (!it->strip || a.top + a.page <= a.count) return false;  // past the last item
+      target -= a.count;
+    }
+    steps[k] = target - a.sel;
+    if (it->strip) {  // the shorter way around
+      if (steps[k] > a.count / 2) steps[k] -= a.count;
+      if (steps[k] < -(a.count / 2)) steps[k] += a.count;
+    }
+    scrolls = scrolls || std::clamp(target - a.page / 2, 0, std::max(0, a.count - a.page)) != a.top;
+  }
+  it->dcol = steps[0];
+  it->drow = steps[1];
+  it->safe = !it->strip && !scrolls;
+  return true;
 }
 
 void press(u16 d1, u16 d2, s64 at, bool screen_only = false) {
   std::lock_guard lk(g_mu);
   g_presses.push_back({d1, d2, at, screen_only});
+}
+
+// The arrow under (x, y), if any: a small unnamed part (6-16 x 8-24) that is one of a pair, the
+// ◀ ▶ of a choice row (COCKPIT COLOR, RADAR TYPE) or of a strip (ASSEMBLE, TUNE) or the ▲ ▼ of a
+// list. Returns the D-pad direction it stands for (0: none) and its centre. Choice rows' arrows
+// also line up with the next row's: a partner side by side wins.
+u16 arrow_at(Ctx& ctx, u32 dialog, float x, float y, float* cx, float* cy) {
+  u32 arr = ppu::r32(dialog + kDlgChildren), n = ppu::r32(dialog + kDlgChildCount);
+  if (n == 0 || n > 1024 || !valid(arr, 4 * n)) return 0;
+  std::vector<Rect> parts;
+  int at = -1;
+  for (u32 i = 0; i < n; ++i) {
+    u32 obj = ppu::r32(arr + 4 * i);
+    if (!valid(obj, 16) || is_list(obj) || is_slider(obj)) continue;
+    s32 id = s32(ppu::r32(obj + kObjId));
+    if ((id != 0 && id != -1) || call(ctx, vfunc(obj, kObjFocusable), obj) != 0) continue;
+    Rect r = rect_of(ctx, obj);
+    float w = r.r - r.l, h = r.b - r.t;
+    if (w < 6 || w > 16 || h < 8 || h > 24) continue;
+    if (x >= r.l - 4 && x < r.r + 4 && y >= r.t - 4 && y < r.b + 4) at = int(parts.size());
+    parts.push_back(r);
+  }
+  if (at < 0) return 0;
+  const Rect& a = parts[size_t(at)];
+  *cx = (a.l + a.r) / 2;
+  *cy = (a.t + a.b) / 2;
+  float side = 0, stack = 0;  // the nearest partner side by side / above or below (signed distance)
+  for (size_t i = 0; i < parts.size(); ++i) {
+    float px = (parts[i].l + parts[i].r) / 2 - *cx, py = (parts[i].t + parts[i].b) / 2 - *cy;
+    if (int(i) == at) continue;
+    if (std::fabs(py) < 3 && std::fabs(px) > 20 && (side == 0 || std::fabs(px) < std::fabs(side))) side = px;
+    if (std::fabs(px) < 3 && std::fabs(py) > 20 && (stack == 0 || std::fabs(py) < std::fabs(stack))) stack = py;
+  }
+  if (side != 0) return side > 0 ? kLeft : kRight;
+  if (stack != 0) return stack > 0 ? kUp : kDown;
+  return 0;
+}
+
+// D-pad steps for a list under way until g_list_busy (ms; main thread). A list moves by D-pad
+// presses, as a player moves it: ASSEMBLE's scene keeps its lists' selection itself, so the
+// list's own move routine did not hold there (run 20261024-182618).
+s64 g_list_busy = 0;
+u32 g_step_list = 0;   // the list a hover stepped, and its first row shown before
+s32 g_step_top = 0;
+float g_scrolled_y = -1e9f;  // where a hover's steps scrolled the list: the cursor moves on first
+
+// Presses the D-pad toward `it` from `t`, 90 ms apart. Returns when the last step has been taken.
+s64 list_step(const ListItem& it, s64 t) {
+  if (!it.dcol && !it.drow) return t;
+  auto run = [&](s32 n, u16 forward, u16 back) {
+    for (s32 i = 0; i < std::abs(n); ++i, t += 90) press(n > 0 ? forward : back, 0, t);
+  };
+  run(it.drow, kDown, kUp);
+  run(it.dcol, kRight, kLeft);
+  g_list_busy = t + 60;
+  return g_list_busy;
 }
 
 // The dragged slider follows the cursor: the D-pad held toward the target while it is ten steps
@@ -340,7 +439,10 @@ void frame(Ctx& ctx) {
   call(ctx, vfunc(framework, kFrameworkDispatch), framework, msg);
   g_probing = false;
   u32 dialog = g_probe_dialog;
-  bool menu = dialog && valid(dialog + kDlgFocus) && ppu::r32(dialog + kDlgFocus) != 0;
+  // A dialog that takes keys is a menu when an object has its focus or, where its scene moves the
+  // selection itself and the dialog keeps none (TUNE), when it holds a list.
+  u32 dlg_focus = dialog && valid(dialog + kDlgFocus) ? ppu::r32(dialog + kDlgFocus) : 0;
+  bool menu = dialog && valid(dialog + kDlgFocus) && (dlg_focus != 0 || has_list(ctx, dialog));
   s64 now = now_ms();
   if (menu) g_menu_seen = now;
   bool grace = !menu && InputContext(g_context.load()) == InputContext::Menu && now - g_menu_seen < kMenuGraceMs;
@@ -404,35 +506,64 @@ void frame(Ctx& ctx) {
   dialog_origin(dialog, &ox, &oy);
   float lx = gx - ox, ly = gy - oy;
   bool down = std::any_of(events.begin(), events.end(), [](const Event& e) { return e.kind == Event::LeftDown; });
+  s64 t = now_ms();
+  // List steps done: look at the item under the cursor again; a hover's steps that scrolled the
+  // list wait for the cursor to move a row's height (no runaway scrolling under a resting cursor).
+  bool settled = g_list_busy && t >= g_list_busy;
+  if (settled) {
+    if (g_step_list && is_list(g_step_list) && s32(ppu::r32(g_step_list + kListTop)) != g_step_top) g_scrolled_y = ly;
+    g_list_busy = 0;
+    g_step_list = 0;
+  }
   u32 hit = 0, slider = 0;
-  s32 row = -1;  // a list's row under the cursor
-  bool row_safe = false;
+  ListItem item;
+  bool on_item = false;    // the cursor is on a list's item
   bool refocused = false;  // this frame's hover moved the focus
-  if (show && (moved || down) && !(g_drag.slider && g_drag.button)) {
+  if (show && (moved || down || settled) && !(g_drag.slider && g_drag.button)) {
     hit = object_at(ctx, dialog, lx, ly, &slider);
-    if (hit && hit != ppu::r32(dialog + kDlgFocus)) {
+    if (untracked_strip(hit)) hit = 0;
+    // The focus follows the cursor where the dialog keeps one (where it keeps none, its scene
+    // takes the keys itself).
+    if (hit && dlg_focus && hit != dlg_focus) {
       call(ctx, vfunc(dialog, kDlgSetFocus), dialog, hit);
       refocused = true;
     }
-    if (hit && is_list(hit)) {
-      row = list_row_at(hit, rect_of(ctx, hit), ly, &row_safe);
-      // Hover selects rows that do not scroll the list; after a scroll the cursor has to move a
-      // row's height before hover selects again (no runaway scrolling under a resting cursor).
-      static float scrolled_y = -1e9f;
-      if (row >= 0 && row_safe && !down && std::fabs(ly - scrolled_y) > 40 && list_select(ctx, hit, row)) scrolled_y = ly;
+    on_item = hit && is_list(hit) && list_item_at(hit, rect_of(ctx, hit), lx, ly, &item);
+    // Hover selects items that do not scroll the list.
+    if (on_item && item.safe && !down && !g_list_busy && std::fabs(ly - g_scrolled_y) > 40 && (item.dcol || item.drow)) {
+      g_step_list = hit;
+      g_step_top = s32(ppu::r32(hit + kListTop));
+      list_step(item, t + (refocused ? 150 : 0));
     }
   }
-  s64 t = now_ms();
   for (const Event& e : events) {
     if (e.kind == Event::LeftDown) {
+      float ax = 0, ay = 0;
+      u16 arrow = slider ? 0 : arrow_at(ctx, dialog, lx, ly, &ax, &ay);
       if (slider) {  // on a slider's bar: the slider follows the cursor while the button is down
         g_drag = {slider, true, 0, 0};
+      } else if (arrow) {  // an arrow: its row takes the focus (where the dialog keeps one), then the direction
+        u32 unused = 0, row = object_at(ctx, dialog, ax, ay, &unused);
+        s64 due = t + (refocused ? 150 : 0);
+        if (row && dlg_focus && row != ppu::r32(dialog + kDlgFocus)) {
+          call(ctx, vfunc(dialog, kDlgSetFocus), dialog, row);
+          due = t + 150;
+        }
+        press(arrow, 0, due);
       } else if (hit) {
-        if (row >= 0) list_select(ctx, hit, row);  // a list's row: selected, then chosen
+        if (on_item && g_list_busy) {  // after the steps under way, from where they end
+          g_waiting.push_back(e);
+          continue;
+        }
         // A click on an item chooses it; elsewhere nothing. When the click also moved the focus,
         // the choice waits until the dialog has taken it (CLIENT SELECT lost a press made in the
         // frame of its focus change, run 20261016-035308; 150 ms later it was taken, -035810).
-        press(0, kCross, t + (refocused ? 150 : row >= 0 ? 50 : 0));
+        s64 due = t + (refocused ? 150 : 0);
+        if (on_item) {  // a list's item: stepped to, then chosen; a strip's (a slot, a category) only selected
+          due = list_step(item, due);
+          if (item.strip) continue;
+        }
+        press(0, kCross, due);
       }
     } else if (e.kind == Event::LeftUp) {
       g_drag.button = false;

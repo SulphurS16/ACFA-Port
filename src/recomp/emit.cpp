@@ -23,7 +23,9 @@ struct FnEmitter {
   const Function& f;
   std::set<u32>& refs;
   bool comments;
+  const std::set<u32>& setjmp;  // setjmp and the stubs that only branch to it (EmitOptions::setjmp)
   std::string out;
+  std::set<u32> sj_sites;       // return addresses of this function's setjmp calls (resume points)
 
   bool is_func(u32 a) const { return an.functions().count(a) != 0; }
   std::string call(u32 t) {
@@ -149,7 +151,8 @@ bool FnEmitter::insn(u32 pc, u32 w) {
     case Op::B: {
       u32 t = (aa(w) ? 0 : pc) + u32(li(w));
       if (lk(w)) {
-        line(strprintf("ctx.lr=0x%08xu;", pc + 4) + call(t));
+        // A setjmp call records the frame it saves (the stack pointer the jmp_buf holds).
+        line(strprintf("ctx.lr=0x%08xu;", pc + 4) + call(t) + (sj_sites.count(pc + 4) ? "sj_r1=u32(R(1));" : ""));
         return true;
       }
       line(jump(t));
@@ -159,7 +162,8 @@ bool FnEmitter::insn(u32 pc, u32 w) {
       u32 t = (aa(w) ? 0 : pc) + u32(bd(w));
       std::string cnd = cond(d, a);
       if (lk(w)) {
-        std::string body = strprintf("ctx.lr=0x%08xu;", pc + 4) + (t == pc + 4 ? std::string() : call(t));
+        std::string body = strprintf("ctx.lr=0x%08xu;", pc + 4) + (t == pc + 4 ? std::string() : call(t)) +
+                           (sj_sites.count(pc + 4) ? "sj_r1=u32(R(1));" : "");
         line(cnd.empty() ? body : "if(" + cnd + "){" + body + "}");
         return true;
       }
@@ -702,9 +706,24 @@ void FnEmitter::body(const std::string& hook) {
                      hook.c_str(), f.entry, f.entry, hook.c_str(), f.entry);
   out += strprintf(hook.empty() ? "void f_%08x(Ctx& __restrict ctx){\n" : "void f_%08x_guest(Ctx& __restrict ctx){\n", f.entry);
   const auto& v = f.insns;
+  // setjmp calls (EmitOptions::setjmp): the body runs in a loop that a guest longjmp to one of them
+  // (ppu::GuestLongjmp, thrown by the runtime's longjmp with the jmp_buf's registers in place)
+  // re-enters right after that call, with this invocation's frame (the saved stack pointer).
+  for (size_t i = 0; i < v.size(); ++i) {
+    u32 w = img.r32(v[i]);
+    Op op = decode(w);
+    if ((op != Op::B && op != Op::BC) || !lk(w)) continue;
+    u32 t = (aa(w) ? 0 : v[i]) + u32(op == Op::B ? li(w) : bd(w));
+    if (setjmp.count(t) && i + 1 < v.size() && v[i + 1] == v[i] + 4) sj_sites.insert(v[i] + 4);
+  }
+  if (!sj_sites.empty()) {
+    out += "  u32 sj_r1=0,sj_at=0;\n  for(;;){try{\n  switch(sj_at){";
+    for (u32 s : sj_sites) out += strprintf("case 0x%08xu:goto L_%08x;", s, s);
+    out += "}\n";
+  }
   for (size_t i = 0; i < v.size(); ++i) {
     u32 pc = v[i];
-    if (f.labels.count(pc)) out += strprintf("L_%08x:\n", pc);
+    if (f.labels.count(pc) || sj_sites.count(pc)) out += strprintf("L_%08x:\n", pc);
     u32 w = img.r32(pc);
     if (comments) {
       char buf[128];
@@ -716,6 +735,15 @@ void FnEmitter::body(const std::string& hook) {
       bool next_is_succ = i + 1 < v.size() && v[i + 1] == pc + 4;
       if (!next_is_succ) line(jump(pc + 4));
     }
+  }
+  if (!sj_sites.empty()) {
+    out += "  return;\n  }catch(const ppu::GuestLongjmp& sj){if(sj.r1!=sj_r1||!(";
+    bool first = true;
+    for (u32 s : sj_sites) {
+      out += strprintf("%ssj.lr==0x%08xu", first ? "" : "||", s);
+      first = false;
+    }
+    out += "))throw;sj_at=sj.lr;}}\n";
   }
   out += "}\n";
 }
@@ -750,6 +778,19 @@ void emit_all(const std::vector<Unit>& units, const std::string& out_dir, const 
   size_t written = 0, total_files = 0, max_fn = 0;
   u32 max_fn_at = 0;
   std::string info;
+  // setjmp and the stubs that only branch to it (TOC-switching trampolines between code regions).
+  std::set<u32> sj = opt.setjmp;
+  for (bool grew = !sj.empty(); grew;) {
+    grew = false;
+    for (const Unit& u : units)
+      for (const auto& [e, f] : u.an->functions()) {
+        if (sj.count(e) || f.insns.empty() || f.insns.size() > 6) continue;
+        u32 pc = f.insns.back(), w = u.img->r32(pc);
+        if (decode(w) != Op::B || lk(w)) continue;
+        if (sj.count((aa(w) ? 0 : pc) + u32(li(w)))) grew = sj.insert(e).second || grew;
+      }
+  }
+  size_t sj_callers = 0;
   for (const Unit& u : units) {
     size_t file_idx = 0, in_file = 0;
     std::string bodies;
@@ -766,9 +807,10 @@ void emit_all(const std::vector<Unit>& units, const std::string& out_dir, const 
       in_file = 0;
     };
     for (const auto& [e, f] : u.an->functions()) {
-      FnEmitter fe{*u.img, *u.an, f, refs, opt.comments, {}};
+      FnEmitter fe{*u.img, *u.an, f, refs, opt.comments, sj, {}, {}};
       auto hk = opt.hooks.find(e);
       fe.body(hk == opt.hooks.end() ? std::string() : hk->second);
+      sj_callers += !fe.sj_sites.empty();
       bodies += fe.out;
       in_file += f.insns.size();
       if (f.insns.size() > max_fn) {
@@ -804,6 +846,7 @@ void emit_all(const std::vector<Unit>& units, const std::string& out_dir, const 
   t += acfa::strprintf("};\nconst size_t g_func_count = %zu;\n}\n", count);
   write_if_changed(out / "ppu_functab.cpp", t, written);
   info += acfa::strprintf("largest_function 0x%08x (%zu insns), files %zu\n", max_fn_at, max_fn, total_files);
+  info += acfa::strprintf("setjmp functions and stubs %zu, resumable setjmp callers %zu\n", sj.size(), sj_callers);
   write_if_changed(out / "gen_info.txt", info, written);
   std::printf("%s%zu file(s) written to %s\n", info.c_str(), written, out_dir.c_str());
 }

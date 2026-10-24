@@ -34,12 +34,13 @@ using Clock = std::chrono::steady_clock;
 // ---------------------------------------------------------------------------------------------
 // Model: two pages of rows, rebuilt from the live settings after every change.
 enum class Kind { Choice, Slider, Binding, Buttons };
-enum Id { kFps, kMode, kMonitor, kWindow, kFsResolution, kFsRefresh, kRenderScale, kSensitivityX, kSensitivityY, kInvertX, kInvertY, kBind, kButtons };
+enum Id { kFps, kMode, kMonitor, kWindow, kFsResolution, kFsRefresh, kRenderScale, kMouseMode, kSensitivityX, kSensitivityY, kInvertX, kInvertY, kArenaFixes, kBind, kButtons };
 
 struct Row {
   Kind kind = Kind::Choice;
   Id id = kFps;
-  std::string label, tag, value_note;
+  std::string label, tag, value_note, side_note;  // Slider: notes left and right of the bar
+  std::string help;                               // shown in the help bar while the row has the focus
   std::vector<std::string> options;  // Choice
   int index = 0;
   bool enabled = true;
@@ -49,8 +50,9 @@ struct Row {
   std::string slots[2];                          // Binding: input names ("" = none)
 };
 
-const char* const kPages[] = {"DISPLAY", "KEYBOARD / MOUSE", "MENU KEYS"};
-constexpr int kPageCount = 3;
+const char* const kPages[] = {"DISPLAY", "KEYBOARD / MOUSE", "MENU KEYS", "GAME"};
+constexpr int kPageCount = 4;
+constexpr int kGamePage = 3;
 
 // Action names of the pad controls under the game's SIMPLE layout (GAME_NOTES), and the control.
 struct ControlText {
@@ -71,6 +73,13 @@ const ControlText kControlText[] = {
     {"start", "PAUSE", "START"},                     {"select", "SELECT BUTTON", "SELECT"},
     {"up", "MENU UP", "D-PAD UP"},                   {"down", "MENU DOWN", "D-PAD DOWN"},
     {"left", "MENU LEFT", "D-PAD LEFT"},             {"right", "MENU RIGHT", "D-PAD RIGHT"},
+    {"quick_turn_left", "QUICK TURN LEFT", "R STICK + QB"},
+    {"quick_turn_right", "QUICK TURN RIGHT", "R STICK + QB"},
+    {"two_stage_turn_left", "2-STAGE QUICK TURN LEFT", "R STICK + QB 2-STAGE"},
+    {"two_stage_turn_right", "2-STAGE QUICK TURN RIGHT", "R STICK + QB 2-STAGE"},
+    {"two_stage_boost", "2-STAGE QUICK BOOST", "QB HALF, THEN FULL"},
+    {"half_boost", "QUICK BOOST HALF PRESS", "QB HALF (HOLD)"},
+    {"assault_armor", "ASSAULT ARMOR", "SWITCHES + OB"},
 };
 const ControlText* control_text(size_t c) {
   std::string name = bindings::control_name(c);
@@ -252,11 +261,30 @@ std::vector<Row> build_rows(int page) {
       gpu::window_client_size(&cw, &ch);
       double fit_h = std::min(double(ch), double(cw) * 9.0 / 16.0) * d.render_scale / 100.0;
       long rh = std::lround(std::clamp(fit_h, 360.0, 2880.0)), rw = std::lround(double(rh) * 16.0 / 9.0);
-      rs.value_note = acfa::strprintf("%d %%   %ld x %ld", d.render_scale, rw, rh);
+      rs.value_note = acfa::strprintf("%d %%", d.render_scale);
+      rs.side_note = acfa::strprintf("%ld x %ld", rw, rh);
     }
     rows.push_back(rs);
+  } else if (page == kGamePage) {  // optional changes to the game itself ([game])
+    Row af;
+    af.kind = Kind::Choice;
+    af.id = kArenaFixes;
+    af.label = "ORDER MATCH AI FIXES";
+    af.options = {"OFF", "ON"};
+    af.index = settings::game().arena_ai_fixes ? 1 : 0;
+    af.help = "Correct slips in some ORDER MATCH opponents' AI scripts; OFF: as on the PS3 (from the next match on)";
+    rows.push_back(af);
   } else {
     bindings::MouseSettings ms = bindings::mouse();
+    if (page == 1) {  // the mouse as the right stick (the default) or moving the camera
+      Row mm;
+      mm.kind = Kind::Choice;
+      mm.id = kMouseMode;
+      mm.label = "MOUSE MODE";
+      mm.options = {"STICK", "CAMERA"};
+      mm.index = ms.mode == bindings::MouseMode::Camera ? 1 : 0;
+      rows.push_back(mm);
+    }
     for (int axis = 0; axis < 2 && page == 1; ++axis) {
       Row s;
       s.kind = Kind::Slider;
@@ -296,6 +324,11 @@ std::vector<Row> build_rows(int page) {
       b.menu = menu;
       b.label = t ? t->action : upper(bindings::control_name(c));
       b.tag = t ? t->pad : "";
+      // In missions the keys press the action's button of the game's control type (bindings.h).
+      if (!menu) {
+        std::string live = bindings::mission_button(c);
+        if (!live.empty()) b.tag = live;
+      }
       std::vector<u32> codes = bindings::get(c, menu ? bindings::Layer::Menu : bindings::Layer::Game);
       for (size_t i = 0; i < 2 && i < codes.size(); ++i) b.slots[i] = key_label(codes[i]);
       if (codes.size() > 2) b.slots[1] += acfa::strprintf("  +%zu", codes.size() - 2);
@@ -319,7 +352,7 @@ constexpr int kVisibleRows = int((kListBottom - kListTop + kPitch - kRowH) / kPi
 constexpr float kSlotX[2] = {600, 905}, kSlotW = 290, kBindDivider = 466;  // binding rows: wider caption column
 constexpr float kArrowL = 472, kArrowR = 1054, kBarL = 505, kBarR = 1023;
 constexpr float kTabY = 34, kTabH = 30;
-constexpr float kTabX[kPageCount] = {656, 816, 1064}, kTabW[kPageCount] = {150, 238, 140};
+constexpr float kTabX[kPageCount] = {536, 696, 944, 1094}, kTabW[kPageCount] = {150, 238, 140, 110};
 constexpr float kButtonX[2] = {76, 287}, kButtonW = 199;
 
 struct Canvas {
@@ -461,12 +494,25 @@ void apply_choice(Row& r, int index) {
       if (std::sscanf(r.options[size_t(index)].c_str(), "%d x %d", &w, &h) == 2) settings::set_window_size(w, h);
       break;
     }
+    case kMouseMode: {
+      bindings::MouseSettings m = bindings::mouse();
+      m.mode = index == 1 ? bindings::MouseMode::Camera : bindings::MouseMode::Stick;
+      bindings::set_mouse(m);
+      settings::save_bindings();
+      break;
+    }
     case kInvertX:
     case kInvertY: {
       bindings::MouseSettings m = bindings::mouse();
       (r.id == kInvertX ? m.invert_x : m.invert_y) = index == 1;
       bindings::set_mouse(m);
       settings::save_bindings();
+      break;
+    }
+    case kArenaFixes: {
+      acfa::settings::Game g = settings::game();
+      g.arena_ai_fixes = index == 1;
+      settings::set_game(g);
       break;
     }
     default:
@@ -534,6 +580,8 @@ void defaults() {
     bindings::reset_defaults(bindings::Layer::Game);
     bindings::set_mouse(bindings::MouseSettings{});
     settings::save_bindings();
+  } else if (g_page == kGamePage) {
+    settings::set_game(acfa::settings::Game{});
   } else {
     bindings::reset_defaults(bindings::Layer::Menu);
     settings::save_bindings();
@@ -1059,6 +1107,17 @@ void color(float g, float a = 1) { g_gfx.brush->SetColor(D2D1::ColorF(g, g, g, a
 void text(const std::string& s, IDWriteTextFormat* f, float x0, float y0, float x1, float y1, float g) {
   color(g);
   std::wstring w = widen(s);
+  // A line wider than its box is set smaller until it fits (long captions and tags), not cut off.
+  IDWriteTextLayout* tl = nullptr;
+  if (x1 > x0 && y1 > y0 && f->GetWordWrapping() == DWRITE_WORD_WRAPPING_NO_WRAP &&
+      SUCCEEDED(g_gfx.dw->CreateTextLayout(w.c_str(), UINT32(w.size()), f, x1 - x0, y1 - y0, &tl))) {
+    DWRITE_TEXT_METRICS m{};
+    if (SUCCEEDED(tl->GetMetrics(&m)) && m.widthIncludingTrailingWhitespace > x1 - x0)
+      tl->SetFontSize(f->GetFontSize() * 0.98f * (x1 - x0) / m.widthIncludingTrailingWhitespace, {0, UINT32(w.size())});
+    g_gfx.dc->DrawTextLayout({x0, y0}, tl, g_gfx.brush, D2D1_DRAW_TEXT_OPTIONS_CLIP);
+    tl->Release();
+    return;
+  }
   g_gfx.dc->DrawText(w.c_str(), UINT32(w.size()), f, D2D1::RectF(x0, y0, x1, y1), g_gfx.brush, D2D1_DRAW_TEXT_OPTIONS_CLIP);
 }
 
@@ -1155,6 +1214,7 @@ void draw(const Snapshot& s, u32 w, u32 h) {
       if (r.index >= 0 && r.index < int(r.options.size())) text(r.options[size_t(r.index)], g_gfx.value, kBarL, y0, kBarR, y1, g);
     } else if (r.kind == Kind::Slider) {
       text(r.value_note, g_gfx.value, 336, y0, 440, y1, 0.8f);
+      if (!r.side_note.empty()) text(r.side_note, g_gfx.value, kArrowR + 16, y0, kRowR - 8, y1, 0.8f);
       triangle(kArrowL, ym, -1, 0, 0.6f);
       triangle(kArrowR, ym, 1, 0, 0.6f);
       float f = float((r.value - r.lo) / (r.hi - r.lo));
@@ -1190,10 +1250,14 @@ void draw(const Snapshot& s, u32 w, u32 h) {
     text(names[b], g_gfx.button, x0, kButtonsY, x1, kButtonsY + kRowH, 0.86f);
   }
 
-  // Help bar: only messages (a moved binding, the second DEFAULT press, the keys of a rebinding).
+  // Help bar: messages (a moved binding, the second DEFAULT press, the keys of a rebinding), else
+  // the focused row's note.
   line(0, 638.5f, kW, 638.5f, 0.62f);
   line(0, 676.5f, kW, 676.5f, 0.62f);
-  std::string help = !s.toast.empty() ? s.toast : s.capturing ? "ESC  CANCEL      DELETE  CLEAR" : "";
+  std::string help = !s.toast.empty() ? s.toast
+                     : s.capturing    ? "ESC  CANCEL      DELETE  CLEAR"
+                     : s.focus >= 0 && s.focus < n ? s.rows[size_t(s.focus)].help
+                                                    : "";
   text(help, g_gfx.help, 96, 640, kW - 40, 675, 0.9f);
 }
 

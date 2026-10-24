@@ -276,6 +276,7 @@ std::vector<Install> earlier_installs(const fs::path& self_exe) {
     i.files = path_of(rec, "install", "files");
     i.rpcs3 = path_of(rec, "install", "rpcs3");
     i.pup = path_of(rec, "install", "pup");
+    i.update = path_of(rec, "install", "update");
     i.version = rec.get_or("install", "version", "");
     add(i);
   }
@@ -302,6 +303,7 @@ std::vector<Install> earlier_installs(const fs::path& self_exe) {
       i.files = path_of(li, "paths", "files");
       i.rpcs3 = path_of(li, "paths", "rpcs3");
       i.pup = path_of(li, "paths", "pup");
+      i.update = path_of(li, "paths", "update");
       add(i);
     } catch (const std::exception&) {
     }
@@ -319,13 +321,14 @@ void record_install(const Install& i) {
   r.set("install", "files", narrow(i.files.wstring()));
   r.set("install", "rpcs3", narrow(i.rpcs3.wstring()));
   r.set("install", "pup", narrow(i.pup.wstring()));
+  r.set("install", "update", narrow(i.update.wstring()));
   save_record(r);
 }
 
 void forget_install(const fs::path& data) {
   acfa::Ini r = load_record();
   if (!same_path(path_of(r, "install", "data"), data)) return;
-  for (const char* k : {"data", "launcher", "version", "disc", "files", "rpcs3", "pup"}) r.remove("install", k);
+  for (const char* k : {"data", "launcher", "version", "disc", "files", "rpcs3", "pup", "update"}) r.remove("install", k);
   save_record(r);
 }
 
@@ -427,6 +430,7 @@ bool looks_ours(const fs::path& p) {
   if (n == L"downloads") return fs::is_empty(p, ec) || any_child(L"llvm-mingw") || any_child(L"cmake-") || any_child(L"ninja");
   if (n == L"game") return has(L"BLUS30187") || has(L"dev_flash");
   if (n == L"decrypted") return has(L"EBOOT.elf");
+  if (n == L"update") return has(L"BLUS30187");  // the game update Prepare files installed
   if (n == L"build") return has(L"CMakeCache.txt") || has(L"build.ninja") || has(L"gen") || has(L"acfa.exe");
   if (n == L"state") return has(L"built.txt") || has(L"import.txt") || has(L"recompile.txt") || has(L"spu.txt");
   if (n == L"source") return has(L".launcher-source");
@@ -443,7 +447,7 @@ std::vector<RemoveItem> removal_items(const fs::path& data) {
   };
   const Group groups[] = {
       {L"The build tools", {L"tools", L"downloads"}},
-      {L"The prepared game files", {L"game", L"decrypted", L"rpcs3-work"}},
+      {L"The prepared game files", {L"game", L"decrypted", L"update", L"rpcs3-work"}},
       {L"The built game and its caches",
        {L"build", L"state", L"spu_cache", L"shader_cache", L"shader_records", L"hdd1", L"hdd0\\game", L"config"}},
       {L"The port's unpacked sources", {L"source", L"source.new", L"source.zip.tmp"}},

@@ -58,4 +58,13 @@ struct Size {
 };
 const std::vector<Size>& window_sizes();
 
+// [game]: changes to the game itself that the player can turn off.
+struct Game {
+  // The ORDER MATCH AI scripts' slips corrected when they are loaded (runtime game/script_fixes.h);
+  // on by default (user decision 2026-10-24).
+  bool arena_ai_fixes = true;
+};
+Game read_game(const Ini& ini);
+void write_game(Ini& ini, const Game& g);
+
 }  // namespace acfa::settings

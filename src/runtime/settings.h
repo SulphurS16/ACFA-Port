@@ -34,5 +34,9 @@ void apply_window_mode();
 void note_window_size(int w, int h);
 // Keyboard bindings or mouse settings changed (bindings.h): saved.
 void save_bindings();
+// [game]: optional changes to the game (the ORDER MATCH AI fixes take effect when a match loads
+// its scripts).
+acfa::settings::Game game();
+void set_game(const acfa::settings::Game& g);
 
 }  // namespace rt::settings

@@ -35,7 +35,7 @@ Nothing from the game is in this repository. Everything game-derived is generate
 - Your own copy of ARMORED CORE for Answer (US disc, BLUS30187). You need the disc's files, meaning the folder that contains 'PS3_GAME'.
 - RPCS3, used once during setup to decrypt a few of your game files.
 - The PS3 system software 4.93 file 'PS3UPDAT.PUP' from [Sony's PS3 system software page](https://www.playstation.com/en-us/support/hardware/ps3/system-software/).
-- Optional: the game's update 01.35 package, placed in the game folder or next to 'PS3UPDAT.PUP'.
+- Optional: the game's update 01.35, the file 'UP0001-BLUS30187_00-AC45000004141906-A0135-V0100-PE.pkg'. Without it, the game uses the disc's own balance data.
 - About 4 GB of free disk space and an internet connection.
 
 ### Steps
@@ -44,15 +44,18 @@ Nothing from the game is in this repository. Everything game-derived is generate
 2. Right click the zip, choose **Extract All...**, and pick a folder with enough space, for example 'C:\Games\ACFA-Port'.
 3. Open that folder and start 'ACFA-Launcher.exe'.
 4. Under **Game folder**, choose the folder that contains 'PS3_GAME'.
-5. Click **Prepare files** and choose your 'rpcs3.exe' and 'PS3UPDAT.PUP'. The launcher uses your RPCS3 to decrypt the files the port needs. When RPCS3 asks "Install firmware?", click **Yes**; if you have the update, click **Install** when it asks about the package. This takes about a minute and doesn't change your RPCS3.
-6. Click **Set up**. It downloads the build tools and builds the game. This takes a few minutes and is only needed once.
-7. Choose whether you want a desktop shortcut and a Start menu entry.
-8. Click **PLAY**.
+5. Optional: under **Game update**, choose the update file. If it is inside the game folder, the launcher fills it in by itself.
+6. Click **Prepare files** and choose your 'rpcs3.exe' and 'PS3UPDAT.PUP'. The launcher uses your RPCS3 to decrypt the files the port needs. When RPCS3 asks "Install firmware?", click **Yes**; if you chose the update, click **Install** when it asks about the package. This takes about a minute and doesn't change your RPCS3.
+7. Click **Set up**. It downloads the build tools and builds the game. This takes a few minutes and is only needed once.
+8. Choose whether you want a desktop shortcut and a Start menu entry.
+9. Click **PLAY**.
 
 From now on, you can start the game from the shortcut.
 
 > [!NOTE]
-> Already decrypted the files yourself? Skip step 5 and choose their folder under **Decrypted files** instead. **More... > Which files does the port need?** lists them.
+> Already decrypted the files yourself? Skip step 6 and choose their folder under **Decrypted files** instead. **More... > Which files does the port need?** lists them.
+>
+> Got the update later? Choose it under **Game update**, click **Install update** (your RPCS3 installs it), then **Set up**.
 
 ## Update
 

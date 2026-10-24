@@ -63,7 +63,7 @@ u32 g_seen_release[kPorts] = {};  // sysdlg::released_count() at the previous re
 
 u8 axis(SHORT v) { return u8(std::clamp((int(v) + 32768) >> 8, 0, 255)); }
 
-PadState read_port(u32 port) {
+PadState read_port(u32 port, bool deliver = false) {
   PadState s;
   XINPUT_STATE xs{};  // the controller in this slot, in XInput's layout (gamepads.h)
   bool xin = !input_isolated() && pads::get(int(port), &xs);
@@ -102,7 +102,7 @@ PadState read_port(u32 port) {
   if (port == 0) {
     // Keyboard and mouse bindings (bindings.h; always available on port 0).
     s.connected = true;
-    bindings::PadOut k = bindings::sample();
+    bindings::PadOut k = bindings::sample(deliver);
     s.d1 |= k.d1;
     s.d2 |= k.d2;
     game::menu_pad_bits(&s.d1, &s.d2);  // clicks, right clicks and the wheel in the game's menus
@@ -110,6 +110,15 @@ PadState read_port(u32 port) {
     if (k.ly >= 0) s.ly = u8(k.ly);
     if (k.rx >= 0) s.rx = u8(k.rx);
     if (k.ry >= 0) s.ry = u8(k.ry);
+    if (k.l2p >= 0) {  // a key sequence's pressure (bindings.h); the button above 30, as a controller's
+      s.press[10] = std::max<u8>(s.press[10], u8(k.l2p));
+      if (k.l2p > 30) s.d2 |= L2;
+    }
+    if (k.r2p >= 0) {
+      s.press[11] = std::max<u8>(s.press[11], u8(k.r2p));
+      if (k.r2p > 30) s.d2 |= R2;
+    }
+    if (k.lstick_rest) s.lx = s.ly = 128;
   }
   auto pr = [](bool on, u8 cur) { return on ? std::max<u8>(cur, 255) : cur; };
   s.press[0] = pr(s.d1 & RIGHT, s.press[0]);
@@ -159,7 +168,7 @@ s32 cellPadGetData(u32 port, Ptr<PadData> data) {
   std::lock_guard lk(g_mu);
   if (!g_init) return PAD_ERR_UNINITIALIZED;
   if (port >= g_max || !data) return PAD_ERR_INVALID_PARAMETER;
-  PadState s = read_port(port);
+  PadState s = read_port(port, true);
   if (!s.connected) return PAD_ERR_NO_DEVICE;
   ui::PadMode ui_mode = ui::pad_mode();
   const bool held = sysdlg::active() || ui_mode != ui::PadMode::Normal;

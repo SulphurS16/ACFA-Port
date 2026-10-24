@@ -6,6 +6,8 @@
 #include <cstdio>
 #include <cstdlib>
 #include <map>
+#include <set>
+#include <sstream>
 #include <system_error>
 
 #include "common/bytes.h"
@@ -16,8 +18,8 @@ namespace {
 
 const char* const kHead =
     "# ARMORED CORE for Answer (native port): settings, shared by the launcher and the game's\n"
-    "# PC SETTINGS screen (F1 or a controller's Guide button while playing). Command-line options\n"
-    "# override them for one run.\n";
+    "# PC SETTINGS screen (SYSTEM > PC SETTINGS in the game's menu). Command-line options override\n"
+    "# them for one run.\n";
 
 const char* const kDisplay =
     "[display]\n"
@@ -42,6 +44,10 @@ const char* const kDisplay =
 
 const char* const kMouse =
     "[mouse]\n"
+    "# How the mouse turns and looks in missions: stick (as the controller's right stick, by the\n"
+    "# mouse's speed, at most as fast as the stick turns) or camera (the camera turns at once, a\n"
+    "# little ahead of the AC, and the AC turns after it)\n"
+    "mode = stick\n"
     "# Rotation per raw mouse count relative to the default (1.0): x turns, y looks up and down.\n"
     "# Raw input: no acceleration, smoothing or dead zone.\n"
     "sensitivity_x = 1.0\n"
@@ -49,16 +55,28 @@ const char* const kMouse =
     "invert_x = false\n"
     "invert_y = false\n";
 
+const char* const kGame =
+    "[game]\n"
+    "# Changes to the game itself (false: as on the console).\n"
+    "# ORDER MATCH AI fixes: slips in some opponents' AI scripts corrected when the match loads\n"
+    "# them (misspelled names that end their AI layers with a script error, Fragile's back weapon\n"
+    "# taking the arm weapon's weight, ...). The opponents then do what their scripts were\n"
+    "# written to do: some fight harder than on the console.\n"
+    "arena_ai_fixes = true\n";
+
 const char* const kKeyboardHead =
     "[keyboard]\n"
     "# Keyboard and mouse bindings onto the controller: <control> = <input>[, <input>...]\n"
     "# Controls: cross circle square triangle l1 l2 l3 r1 r2 r3 start select up down left right\n"
     "#   lstick_up lstick_down lstick_left lstick_right rstick_up rstick_down rstick_left rstick_right\n"
+    "#   quick_turn_left quick_turn_right two_stage_turn_left two_stage_turn_right two_stage_boost\n"
+    "#   half_boost assault_armor\n"
     "# Inputs: A-Z, 0-9, F2-F10, F12, Num0-Num9, Space, Enter, Escape, Tab, Backspace, Shift, Ctrl,\n"
     "#   Alt, Up, Down, Left, Right, Home, End, PageUp, PageDown, Insert, Delete, CapsLock, Mouse1\n"
     "#   (left), Mouse2 (right), Mouse3 (middle), Mouse4, Mouse5, WheelUp, WheelDown\n"
-    "# Mouse buttons and the wheel count while the game window has the mouse (click into it). The\n"
-    "# defaults follow the game's SIMPLE control layout; the mouse moves the camera.\n";
+    "# Mouse buttons and the wheel count while the game window has the mouse (click into it). In\n"
+    "# missions a button's keys do that button's action of the SIMPLE / REGULAR-A layout (cross: right\n"
+    "# arm weapon, ...) whatever control type the game is set to; the mouse turns and looks.\n";
 
 // The default keys (user's layout, 2026-10-16): the mouse moves the camera, so the right stick has
 // no keys of its own.
@@ -91,7 +109,19 @@ const char* const kKeyboardDefaults =
     "up = Up\n"
     "down = Down\n"
     "left = Left\n"
-    "right = Right\n";
+    "right = Right\n"
+    "# Key-only actions in missions: quick turns (the right stick sideways with a quick boost and the\n"
+    "# left stick at rest; hold to keep turning), two-stage quick turns and the two-stage quick boost\n"
+    "# (the quick boost half pressed for its charge, then fully), the quick boost held half pressed\n"
+    "# (press the quick boost key while holding it for the second stage), assault armor (both weapon\n"
+    "# switches and overed boost together)\n"
+    "quick_turn_left = Z\n"
+    "quick_turn_right = X\n"
+    "two_stage_turn_left =\n"
+    "two_stage_turn_right =\n"
+    "two_stage_boost =\n"
+    "half_boost =\n"
+    "assault_armor =\n";
 
 // The defaults of 0.4.0 and earlier: a [keyboard] section that still holds exactly these is moved
 // to the current defaults (a player who changed any key keeps all of them).
@@ -158,7 +188,7 @@ Ini load_or_create(const std::filesystem::path& file, std::vector<std::string>* 
       }
     }
     Ini fresh = Ini::parse(std::string(kHead) + "\n" + kDisplay + "\n" + kMouse + "\n" + kKeyboardHead + keyboard + "\n" + kMenuHead +
-                           kMenuDefaults);
+                           kMenuDefaults + "\n" + kGame);
     for (const auto& [k, v] : mouse) fresh.set("mouse", k, v);
     if (old_layout) {
       if (auto v = ini.get("", "fps")) fresh.set("display", "fps", *v);
@@ -214,12 +244,40 @@ Ini load_or_create(const std::filesystem::path& file, std::vector<std::string>* 
       note("settings: the keyboard's default keys of 0.4.0 replaced by the new default layout (no key had been changed)");
       changed = true;
     }
-    if (!ini.has_section("menu")) {  // files from before the menu keys: the section with its notes, as in a new file
+    // Controls added since the file was written (the key-only actions, 0.7.3): their default keys
+    // where no other control has them.
+    {
+      std::set<std::string> used;
+      for (const auto& [k, v] : ini.entries("keyboard")) {
+        std::istringstream items(v);
+        for (std::string item; std::getline(items, item, ',');)
+          if (!squeeze(item).empty()) used.insert(squeeze(item));
+      }
+      for (const auto& [k, v] : Ini::parse(std::string("[keyboard]\n") + kKeyboardDefaults).entries("keyboard")) {
+        if (ini.get("keyboard", k)) continue;
+        std::string keep;
+        std::istringstream items(v);
+        for (std::string item; std::getline(items, item, ',');) {
+          std::string t = item;
+          while (!t.empty() && t.front() == ' ') t.erase(t.begin());
+          while (!t.empty() && t.back() == ' ') t.pop_back();
+          if (t.empty() || used.count(squeeze(t))) continue;
+          keep += (keep.empty() ? "" : ", ") + t;
+        }
+        ini.set("keyboard", k, keep);
+        changed = true;
+      }
+    }
+    // Sections added since the file was written, with their notes, as in a new file: [menu] (menu
+    // keys), [game] (0.7.3).
+    auto append = [&](const std::string& section) {
       std::string text = ini.text();
       bool blank_end = text.empty() || (text.size() >= 4 && text.compare(text.size() - 4, 4, "\r\n\r\n") == 0);
-      ini = Ini::parse(text + (blank_end ? "" : "\r\n") + kMenuHead + kMenuDefaults);
+      ini = Ini::parse(text + (blank_end ? "" : "\r\n") + section);
       changed = true;
-    }
+    };
+    if (!ini.has_section("menu")) append(std::string(kMenuHead) + kMenuDefaults);
+    if (!ini.has_section("game")) append(kGame);
   }
   if (changed) {
     try {
@@ -294,5 +352,13 @@ const std::vector<Size>& window_sizes() {
   static const std::vector<Size> v = {{1280, 720}, {1600, 900}, {1920, 1080}, {2560, 1440}, {3200, 1800}, {3840, 2160}};
   return v;
 }
+
+Game read_game(const Ini& ini) {
+  Game g;
+  g.arena_ai_fixes = truthy(ini.get_or("game", "arena_ai_fixes", g.arena_ai_fixes ? "true" : "false"));
+  return g;
+}
+
+void write_game(Ini& ini, const Game& g) { ini.set("game", "arena_ai_fixes", g.arena_ai_fixes ? "true" : "false"); }
 
 }  // namespace acfa::settings
