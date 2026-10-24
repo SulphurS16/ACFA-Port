@@ -93,7 +93,7 @@ Keyboard and mouse in missions (defaults). The keys keep these actions under eve
 | Release the mouse | F1 |
 | Fullscreen | F11 or Alt+Enter |
 
-The mouse works like a precise right stick (**MOUSE MODE: STICK**, the default): your AC turns exactly as far as you move it, up to the stick's top speed. A fast sideways flick with quick boost does a quick turn. **MOUSE MODE: CAMERA** turns the view first and the AC follows. Both modes use raw input, with no mouse acceleration.
+The mouse works like a precise right stick (**MOUSE MODE: STICK**, the default): your AC turns exactly as far as you move it, as fast as it can turn. A fast sideways flick with quick boost does a quick turn. **MOUSE MODE: CAMERA** moves only the camera, freely; the AC turns after it at its own speed, and aims and moves as in the game. Both modes use raw input, with no mouse acceleration.
 
 Not on a key until you choose one in PC SETTINGS: 2-stage quick turn left / right, 2-stage quick boost, quick boost half press and assault armor (needs an overed boost part that has it).
 

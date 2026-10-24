@@ -26,10 +26,13 @@ minutes.
   corrected when a match loads its opponent: the opponents do what their scripts say, and some
   fight harder than on the console. Turn it OFF for the matches as on the PS3.
 - The mouse turns and looks as a precise right stick (new default, **MOUSE MODE: STICK** in PC
-  SETTINGS): the AC turns exactly as far as the mouse moves, up to the stick's own top speed, with
-  the game's own smoothing; quick turns work with a fast sideways flick and the quick boost key.
-  The earlier mouse camera stays as **CAMERA**: its view now leads the AC by at most 15 degrees (so
-  lock-on and fire stay near the AC's front), and turning keys no longer cut quick turns short.
+  SETTINGS): the AC turns exactly as far as the mouse moves, as fast as it can turn, with the
+  game's own smoothing; a quick flick turns the whole way at the AC's top turning speed (up to half
+  a turn), and quick turns work with a fast sideways flick and the quick boost key.
+- The earlier free mouse camera stays as **MOUSE MODE: CAMERA**, and now only the camera turns
+  freely: the FCS locks on and fires along the AC's front and the AC moves along its own facing, as
+  in the game, so it no longer locks on to or shoots at targets behind it. Turning keys no longer
+  cut quick turns short.
 - Keys pressed and released within one frame are no longer lost.
 - New keys for missions (PC SETTINGS, KEYBOARD): **QUICK TURN LEFT / RIGHT** (Z / X), the
   controller's quick turn (the right stick sideways with the quick boost); hold the key to keep

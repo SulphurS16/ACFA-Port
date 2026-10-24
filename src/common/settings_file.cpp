@@ -44,9 +44,9 @@ const char* const kDisplay =
 
 const char* const kMouse =
     "[mouse]\n"
-    "# How the mouse turns and looks in missions: stick (as the controller's right stick, by the\n"
-    "# mouse's speed, at most as fast as the stick turns) or camera (the camera turns at once, a\n"
-    "# little ahead of the AC, and the AC turns after it)\n"
+    "# How the mouse turns and looks in missions: stick (as the controller's right stick: the AC\n"
+    "# turns as far as the mouse moves, as fast as it can turn) or camera (only the camera turns, at\n"
+    "# once and freely; the AC turns after it, and aims and moves as in the game)\n"
     "mode = stick\n"
     "# Rotation per raw mouse count relative to the default (1.0): x turns, y looks up and down.\n"
     "# Raw input: no acceleration, smoothing or dead zone.\n"
@@ -78,10 +78,10 @@ const char* const kKeyboardHead =
     "# missions a button's keys do that button's action of the SIMPLE / REGULAR-A layout (cross: right\n"
     "# arm weapon, ...) whatever control type the game is set to; the mouse turns and looks.\n";
 
-// The default keys (user's layout, 2026-10-16): the mouse moves the camera, so the right stick has
+// The default keys (user's layout, 2026-10-16): the mouse turns and looks, so the right stick has
 // no keys of its own.
 const char* const kKeyboardDefaults =
-    "# Movement (left stick); the mouse moves the camera (right stick: no keys by default)\n"
+    "# Movement (left stick); the mouse turns and looks (right stick: no keys by default)\n"
     "lstick_up = W\n"
     "lstick_down = S\n"
     "lstick_left = A\n"
