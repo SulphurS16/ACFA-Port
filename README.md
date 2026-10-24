@@ -12,8 +12,8 @@ Not affiliated with, endorsed or sponsored by FromSoftware, Ubisoft, Sony Intera
 - Resolution options. The game draws at your screen's own resolution, in borderless, windowed or fullscreen.
 - Render scale from 50% to 200%.
 - High frame rates. 30, 60, 120, 144, your monitor's refresh rate or uncapped and the same game speed at every frame rate. Menus and movies stay at 60.
-- Full mouse support. The mouse moves the camera with raw input. Your AC turns after it at its own speed, as with the stick.
-- PC SETTINGS inside the game. An entry in the game's own SYSTEM menu, where HDD INSTALL was on the PS3: display, frame rate, mouse and keys settings all ingame.
+- Full mouse support. By default the mouse works like a precise right stick, with raw input: your AC turns exactly as far as you move it. A camera mode is in PC SETTINGS. The mouse also works in the game's menus, including the ACSIS garage.
+- PC SETTINGS inside the game. An entry in the game's own SYSTEM menu, where HDD INSTALL was on the PS3: display, frame rate, mouse, keys and game options, all in game.
 
 <img width="2560" height="1440" alt="acfa_J345U43DN5" src="https://github.com/user-attachments/assets/9dbfee69-26c8-446a-929c-e58336b61894" />
 
@@ -75,36 +75,40 @@ With several controllers connected, the first one plays (Xbox-style controllers 
 
 # Mouse and keyboard support
 
-Keyboard and mouse in missions (defaults, for the game's SIMPLE control layout):
+Keyboard and mouse in missions (defaults). The keys keep these actions under every control type (KEY TYPE):
 
 | Action | Keys |
 | --- | --- |
 | Move | W A S D |
-| Camera | Mouse |
+| Turn and look | Mouse |
 | Left / right arm weapon | Left / right click |
 | Shoulder weapon | E |
 | Switch right / left weapon | C / Ctrl |
 | Boost (hold to rise) / quick boost / overed boost | Space / Shift / Q |
+| Quick turn left / right | Z / X |
 | Reset view | V |
-| L3 | Middle click |
+| Lock (L3) | Middle click |
 | Pause | Tab or Escape |
 | SELECT / D-pad | Enter / arrow keys |
 | Release the mouse | F1 |
 | Fullscreen | F11 or Alt+Enter |
 
-The mouse moves the camera directly (raw input), and the AC turns after it at its own speed.
+The mouse works like a precise right stick (**MOUSE MODE: STICK**, the default): your AC turns exactly as far as you move it, up to the stick's top speed. A fast sideways flick with quick boost does a quick turn. **MOUSE MODE: CAMERA** turns the view first and the AC follows. Both modes use raw input, with no mouse acceleration.
+
+Not on a key until you choose one in PC SETTINGS: 2-stage quick turn left / right, 2-stage quick boost, quick boost half press and assault armor (needs an overed boost part that has it).
 
 In menus:
-- **Mouse:** point and click; right-click goes back; the wheel scrolls; drag sliders.
+- **Mouse:** point and click; right-click goes back; the wheel scrolls; drag sliders. This includes ACSIS (ASSEMBLE, STABILIZER, SHOP, TUNE, DESIGN). The colour editor, the emblem picker, DESIGN's tabs and TUNE's values still use keys.
 - **Keys:** arrows or W A S D move, Enter or Space choose, Escape or Backspace go back.
 - **PS3 buttons:** the game shows these. Tab = START, Q / E = L1 / R1.
 
-All keys can be changed in game under **SYSTEM > PC SETTINGS**.
+All keys can be changed in game under **SYSTEM > PC SETTINGS**, which also shows the PS3 button each key presses.
 
 ## Settings and saves
 
 - Display mode, resolution, render scale (50–200 %) and frame rate (30, 60, 120, 144, your display's rate or uncapped) are set in the launcher or in game under **SYSTEM > PC SETTINGS**. Game speed is the same at every frame rate.
 - The launcher has presets for modest PCs and handhelds under **More...**.
+- **ORDER MATCH AI FIXES** (PC SETTINGS > GAME, on by default) corrects slips in some ORDER MATCH opponents' AI scripts. They then fight as their scripts were written, and some are harder than on the PS3. Turn it OFF to play them as on the PS3.
 - Settings and saves are in `Saved Games\ARMORED CORE for Answer`. **More...** in the launcher backs up and restores saves. Saves don't work on a PS3.
 - PS3 saves work once you have decrypted them. Copy each save folder (named 'BLUS30187...') into the savedata folder above.
 - RPCS3 saves should work as they are. Copy the same 'BLUS30187...' folders from RPCS3's savedata folder.
