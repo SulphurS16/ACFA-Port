@@ -17,6 +17,7 @@
 0x0070ed88 input_turn_set          # the tutorial view's turn setter (0x70eb30 plus its step flag)
 0x00753170 ac_turn_input           # an AC's turn input, every frame (r3 controller, r4 input): the player's turn object for the mouse camera
 0x007535d0 ac_turn_input_b         # the same in the other operator state
+0x00753ac8 ac_turn_input_vob       # the same during a VOB flight's first part (its turn step 0x6ff0b0: the VOB's turn speeds)
 0x00708770 ac_turn_update          # an AC body's yaw rate (body +516) from the frame's turn input (r3 turn object): the stick's full turn rate (probe)
 0x00ab2090 camera_follow           # the follow camera's eye / look-at point toward the frame's wanted ones (r3 camera, r5 wanted, f1 dt; spring 0xab14b8)
 0x0008ad48 menu_frame              # every frame: pads to key messages (menu mouse: probe, hover; menu_mouse.cpp)

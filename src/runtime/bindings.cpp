@@ -313,20 +313,31 @@ PadOut sample(bool deliver) {
   };
   bool neg[4] = {}, pos[4] = {};
   std::lock_guard lk(g_mu);
-  // In the game's menus an input listed in [menu] drives its menu control only; on other screens
-  // than gameplay (title, movies) the menu's confirm and back keys press Start as well. An input
-  // keeps the meaning it had when it went down until it is released: Escape closing the pause menu
-  // (Circle there) does not become Start once gameplay resumes under the still pressed key.
+  // Outside gameplay (menus, and the screens without one: title, briefings, movies, the mission
+  // report) an input listed in [menu] drives its menu control only; where Start moves on (the title,
+  // movies: game::start_screen) the menu's confirm and back keys press Start as well. Until 0.7.3
+  // the screens without a menu took the [keyboard] controls (Enter SELECT, Escape START) and the
+  // confirm and back keys pressed Start: a briefing (it waits for Cross) could not be skipped with
+  // Enter, and a menu taken for such a screen while it opened got Start, which opens the hub's KEY
+  // GUIDE (GitHub issue #6; run 20261029-165204). An input keeps the meaning it had when it went
+  // down until it is released: Escape closing the pause menu (Circle there) does not become Start
+  // once gameplay resumes under the still pressed key.
   const game::InputContext where = game::input_context();
-  static std::vector<std::pair<u32, game::InputContext>> held;  // inputs down, with their context at the press
-  auto context_of = [&](u32 code) {
-    for (auto& [c, at] : held)
-      if (c == code) return at;
-    held.push_back({code, where});
-    if (where == game::InputContext::Menu && code < kMouse) game::note_menu_key();  // keys, not the mouse's buttons
-    return where;
+  struct Held {
+    u32 code;
+    game::InputContext at;  // the context at the press
+    bool start;             // pressed where Start moves on
   };
-  held.erase(std::remove_if(held.begin(), held.end(), [&](const auto& h) { return !down(h.first); }), held.end());
+  static std::vector<Held> held;  // inputs down
+  auto press_of = [&](u32 code) {
+    for (const Held& h : held)
+      if (h.code == code) return h;
+    held.push_back({code, where, where == game::InputContext::Screen && game::start_screen()});
+    if (where == game::InputContext::Menu && code < kMouse) game::note_menu_key();  // keys, not the mouse's buttons
+    return held.back();
+  };
+  auto context_of = [&](u32 code) { return press_of(code).at; };
+  held.erase(std::remove_if(held.begin(), held.end(), [&](const Held& h) { return !down(h.code); }), held.end());
   auto in_menu_layer = [&](u32 code) {
     for (const auto& m : g_menu)
       if (std::find(m.begin(), m.end(), code) != m.end()) return true;
@@ -336,7 +347,7 @@ PadOut sample(bool deliver) {
   auto drives = [&](u32 code, size_t c) {
     game::InputContext at = context_of(code);
     bool game = std::find(g_bind[c].begin(), g_bind[c].end(), code) != g_bind[c].end();
-    if (at != game::InputContext::Menu) return game;
+    if (at == game::InputContext::Gameplay) return game;
     return std::find(g_menu[c].begin(), g_menu[c].end(), code) != g_menu[c].end() || (game && !in_menu_layer(code));
   };
   // In missions a button control stands for its action (Control::slot) and presses the button the
@@ -363,10 +374,10 @@ PadOut sample(bool deliver) {
     };
     for (u32 code : g_bind[c]) check(code);
     for (u32 code : g_menu[c]) check(code);
-    // Screens without a menu (title, movies): the menu's confirm and back keys press Start.
+    // The title and movies: the menu's confirm and back keys press Start as well.
     if (k.kind == Kind::D2 && (k.bit == CROSS || k.bit == CIRCLE))
       for (u32 code : g_menu[c])
-        if (down(code) && context_of(code) == game::InputContext::Screen) o.d1 |= START;
+        if (down(code) && press_of(code).start) o.d1 |= START;
     if (!on) continue;
     PadElem e = mission && k.slot >= 0 ? action(u32(k.slot)) : PadElem{true, k.kind, k.bit, k.axis, k.positive};
     apply(e);

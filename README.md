@@ -99,7 +99,7 @@ Not on a key until you choose one in PC SETTINGS: 2-stage quick turn left / righ
 
 In menus:
 - **Mouse:** point and click; right-click goes back; the wheel scrolls; drag sliders. This includes ACSIS (ASSEMBLE, STABILIZER, SHOP, TUNE, DESIGN). The colour editor, the emblem picker, DESIGN's tabs and TUNE's values still use keys.
-- **Keys:** arrows or W A S D move, Enter or Space choose, Escape or Backspace go back.
+- **Keys:** arrows or W A S D move, Enter or Space choose, Escape or Backspace go back. This works on the title screen and in mission briefings too.
 - **PS3 buttons:** the game shows these. Tab = START, Q / E = L1 / R1.
 
 All keys can be changed in game under **SYSTEM > PC SETTINGS**, which also shows the PS3 button each key presses.

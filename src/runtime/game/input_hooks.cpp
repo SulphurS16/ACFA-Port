@@ -14,12 +14,14 @@
 #include "runtime/bindings.h"
 #include "runtime/input.h"
 #include "runtime/log.h"
+#include "runtime/game/frame_policy.h"
 #include "runtime/game/key_assign.h"
 #include "runtime/game/menu_mouse.h"
 #include "runtime/memory.h"
 #include "runtime/rsx/rsx.h"
 
 void f_006fe7c0(ppu::Ctx&);  // an AC's turn step (r3 turn object, f1 command): the full-speed probe
+void f_006ff0b0(ppu::Ctx&);  // the same during a VOB flight (the VOB's turn speeds and drag)
 void f_005ef328(ppu::Ctx&);  // the game parameters' singleton (a stub that derives its TOC from the caller's)
 
 namespace ppu {
@@ -136,6 +138,8 @@ std::atomic<u32> g_player_state{0};     // the player's virtual pad state (writt
 std::atomic<u32> g_look{0};             // the player AC's look control object
 std::atomic<u32> g_player_turn{0};      // the player AC's turn object
 std::atomic<u32> g_turn_toc{0};         // r2 of the turn inputs (the turn step's TOC, for the probe)
+bool g_turn_vob = false;                // the player's turn input is a VOB flight's (turn step 0x6ff0b0; main thread)
+void sync_mission();                    // main thread: forgets the player's AC when a mission starts or ends
 
 float rf(u32 ea) { return f32_of_bits(r32(ea)); }
 void wf(u32 ea, float v) {
@@ -226,10 +230,11 @@ void mouse_look_frame(u32 view) {
 }
 
 // The steady yaw rate of the stick fully pushed in a direction (radians per step): the game's own
-// turn step (0x6fe7c0) run as a probe with a full command on the player's turn object, its
-// accumulator (+28) and drag (+36) restored after it; the yaw integrator (0x707840 -> 0x706cb0)
-// takes the accumulator times the turn object's +44 (0.94 for the completed-game save's AC) and
-// settles where the drag takes it back off (its other terms are 0 and 1). 0 if not known yet.
+// turn step (0x6fe7c0; during a VOB flight 0x6ff0b0, the same with the VOB's turn speeds and drag)
+// run as a probe with a full command on the player's turn object, its accumulator (+28) and drag
+// (+36) restored after it; the yaw integrator (0x707840 -> 0x706cb0) takes the accumulator times
+// the turn object's +44 (0.94 for the completed-game save's AC) and settles where the drag takes it
+// back off (its other terms are 0 and 1). 0 if not known yet.
 double full_turn_rate(Ctx& ctx, u32 obj, int dir) {
   u32 toc = g_turn_toc.load(std::memory_order_relaxed);
   if (!toc || !rt::vm::committed(obj, 192)) return 0;
@@ -242,7 +247,8 @@ double full_turn_rate(Ctx& ctx, u32 obj, int dir) {
   ctx.r[2] = toc;
   ctx.r[3] = obj;
   ctx.f[1] = dir > 0 ? 1.0 : -1.0;
-  f_006fe7c0(ctx);
+  if (g_turn_vob) f_006ff0b0(ctx);
+  else f_006fe7c0(ctx);
   float add = rf(obj + 28) - before, turn_drag = rf(obj + 36), gain = rf(obj + 44);
   w32(obj + 28, acc);
   w32(obj + 36, drag);
@@ -250,12 +256,15 @@ double full_turn_rate(Ctx& ctx, u32 obj, int dir) {
   static int logged = 0;
   double full = turn_drag > 0 ? std::fabs(double(add)) * double(gain) / double(turn_drag) : 0;
   if (turn_drag > 0 && turn_drag < 1) g_turn_drag = turn_drag;
-  if (logged++ < 4) LOG_I("input", "mouse camera: full stick turn step %g x %g, drag %g -> %g rad per step", double(add), double(gain), double(turn_drag), full);
+  if (logged++ < 12)
+    LOG_I("input", "mouse camera: full stick turn step %g x %g, drag %g -> %g rad per step%s", double(add), double(gain), double(turn_drag), full,
+          g_turn_vob ? " (VOB flight)" : "");
   return full;
 }
 
 // The operator's turn call of the player: the player's view state, then the frame's mouse movement.
 void player_turn_call(Ctx& ctx) {
+  sync_mission();
   u32 view = u32(ctx.r[3]);
   if (!view || !rt::vm::committed(view + 12, 4)) return;
   static int logged = 0;
@@ -279,11 +288,14 @@ double chase_command(double stick) {
   }
   double full_r = g_full[1] > 0 ? g_full[1] : 0.02, full_l = g_full[0] > 0 ? g_full[0] : 0.02;
   double off = wrap(g_cam.yaw - g_cam.view - heading_of(body));
-  if (g_cam.moved) g_cam.attached = false;
-  else if (std::fabs(off) < kSettled) g_cam.attached = true;
-  if (g_cam.attached) return 0;
   // With no command the yaw rate falls by the drag's share per step: the AC still turns rate / drag.
   double coast = g_turn_drag > 0 ? double(rf(body + kYawRate)) / g_turn_drag : 0;
+  // The camera rides with the AC again once the AC points where it does and has stopped there: an
+  // AC that turns past the heading (a VOB flight turned 40 degrees past it, run 20261029-165204)
+  // turns back to it instead of taking the camera along.
+  if (g_cam.moved) g_cam.attached = false;
+  else if (std::fabs(off) < kSettled && std::fabs(coast) < kSettled) g_cam.attached = true;
+  if (g_cam.attached) return 0;
   double d = off - coast;
   if (std::fabs(d) < 1e-5) return 0;
   // A long frame (several steps) closes at most two thirds of the angle.
@@ -412,8 +424,8 @@ WantedTurn mouse_camera_follow(Ctx& ctx) {
 // radians per step, as its integrator 0x7a22d0 / 0x706cb0 settles). The game's drag then spreads
 // the turn over a few frames and keeps its total. Faster than the stick turns, the command stays
 // at full and the rest waits for the next frames (g_stick_pending): the AC turns at its top speed
-// until it has turned what the mouse asked, up to a half turn; the look waits only for what its
-// limits leave. Until 0.7.3 the rest was lost, as with a stick at its end (user decision
+// until it has turned what the mouse asked, up to a half turn and kMaxCatchUp seconds of turning;
+// the look waits only for what its limits leave. Until 0.7.3 the rest was lost, as with a stick at its end (user decision
 // 2026-10-20: option (a)), so a quick flick turned a few degrees (user, 2026-10-24: "if i move the
 // mouse it barely turns at all"). A turn faster than the stick's (a quick turn: the stick sideways
 // with a quick boost) ends what waits, so a flick with a quick boost turns as the quick turn does.
@@ -472,6 +484,33 @@ double g_stick_heading = 0;          // the player AC's heading at the previous 
 u32 g_stick_body = 0;                // and its body
 // A turn this much faster than the stick's own top speed is not the stick's (a quick turn).
 constexpr double kQuickTurnRate = 1.5;
+// At most what the AC turns in this time at its top speed waits (and at most a half turn): a normal
+// AC (about 70 degrees a second) keeps the half turn; a slowly turning one does not go on turning
+// long after the mouse stopped (a VOB flight's first part turns under a degree a second, run
+// 20261029-171201: a flick would have kept it turning for minutes).
+constexpr double kMaxCatchUp = 2.5;
+
+// When a mission starts or ends, nothing of the previous player AC is used: its objects are freed
+// (and in a VOB flight the first turn input that names the new ones can come a minute after the
+// start: run 20261029-165204, m280). Main thread, from every hook of the mouse (the pad update runs
+// each frame, menus included).
+bool g_in_mission = false;
+void sync_mission() {
+  bool running = rt::game::mission_running();
+  if (running == g_in_mission) return;
+  g_in_mission = running;
+  g_player_turn = 0;
+  g_look = 0;
+  g_player_state = 0;
+  g_full[0] = g_full[1] = 0;
+  g_turn_drag = 0;
+  g_turn_vob = false;
+  g_cam.known = false;
+  g_cam.body = 0;
+  g_cam.attached = true;
+  g_stick_pending[0] = g_stick_pending[1] = 0;
+  g_stick_body = 0;
+}
 
 // The player's action table (operator +80; rt::game::key_assignment): at the operator's turn call
 // it is in r28 (0x6eee98, return site 0x6ef030) or r27 (0x6e2198, return site 0x6e22ec).
@@ -561,6 +600,7 @@ AxisCommand axis_command(double want, double rate, double steps, double cmax, do
 
 // After each port 0 pad update: the frame's mouse movement onto the right stick.
 void mouse_stick_frame(u32 pad) {
+  sync_mission();
   LARGE_INTEGER now, freq;
   QueryPerformanceCounter(&now);
   QueryPerformanceFrequency(&freq);
@@ -602,7 +642,9 @@ void mouse_stick_frame(u32 pad) {
   double steps = dt * 60;
   double yaw = g_stick_pending[0] + double(m.invert_x ? -dx : dx) * m.sensitivity_x * kRadPerCount;  // right +
   double pitch = g_stick_pending[1] + double(m.invert_y ? -dy : dy) * m.sensitivity_y * kRadPerCount * kPitchDownSign;  // up +
-  yaw = std::clamp(yaw, -kPi, kPi);  // at most a half turn waits
+  double top_rate = g_full[0] > 0 && g_full[1] > 0 ? std::max(g_full[0], g_full[1]) : kFallbackFullTurn;
+  double reach = std::min(kPi, top_rate * 60 * kMaxCatchUp);
+  yaw = std::clamp(yaw, -reach, reach);
   u32 look = g_look.load(std::memory_order_relaxed);
   if (look && rt::vm::committed(look + kPitchState, 40)) {  // the look waits only for what its limits leave
     double angle = rf(look + kPitchState), hi = rf(look + kPitchState + 32), lo = rf(look + kPitchState + 36);
@@ -665,11 +707,15 @@ void hook_input_pitch_set(Ctx& ctx, void (*orig)(Ctx&)) {
   orig(ctx);
 }
 
-// The turn inputs (0x753170 every frame, 0x7535d0 in the other operator state: r3 an AC's controller,
-// r4 its input). The player's (its input holds the player's view state) gives the player's turn
-// object, r32(r32(r32(controller +4) +156) +268), and the TOC its turn step runs with.
+// The turn inputs (r3 an AC's controller, r4 its input): 0x753170 every frame, 0x7535d0 in the other
+// operator state, 0x753ac8 during the first part of a VOB flight (its turn step 0x6ff0b0: the
+// VOB's turn speeds; in m280 the first 57 s, then the AC turns with 0x753170 / 0x7535d0 while the VOB
+// still carries it, run 20261029-165204). The player's (its input holds the player's view state)
+// gives the player's turn object, r32(r32(r32(controller +4) +156) +268) (0x7273c8 in all three),
+// and the TOC its turn step runs with.
 namespace {
-void note_turn_input(Ctx& ctx) {
+void note_turn_input(Ctx& ctx, bool vob) {
+  sync_mission();
   u32 ctl = u32(ctx.r[3]), input = u32(ctx.r[4]);
   u32 state = g_player_state.load(std::memory_order_relaxed);
   if (!state || !input || !rt::vm::committed(input + 12, 4) || r32(input + 12) != state || !rt::vm::committed(ctl + 4, 4)) return;
@@ -679,18 +725,26 @@ void note_turn_input(Ctx& ctx) {
   if (!b || !rt::vm::committed(b + 268, 4)) return;
   u32 obj = r32(b + 268);
   g_turn_toc.store(u32(ctx.r[2]), std::memory_order_relaxed);
-  if (g_player_turn.exchange(obj) != obj) {
-    LOG_I("input", "mouse: player turn object 0x%08x", obj);
-    g_full[0] = g_full[1] = 0;  // another AC: its own turn rate
+  bool other = g_player_turn.exchange(obj) != obj;
+  if (other) LOG_I("input", "mouse: player turn object 0x%08x%s", obj, vob ? " (VOB flight)" : "");
+  else if (vob != g_turn_vob) LOG_I("input", "mouse: the player's AC turns %s", vob ? "as a VOB flight" : "on its own again");
+  if (other || vob != g_turn_vob) {  // another AC or turn step: its own turn rate
+    g_turn_vob = vob;
+    g_full[0] = g_full[1] = 0;
+    g_turn_drag = 0;
   }
 }
 }  // namespace
 void hook_ac_turn_input(Ctx& ctx, void (*orig)(Ctx&)) {
-  note_turn_input(ctx);
+  note_turn_input(ctx, false);
   orig(ctx);
 }
 void hook_ac_turn_input_b(Ctx& ctx, void (*orig)(Ctx&)) {
-  note_turn_input(ctx);
+  note_turn_input(ctx, false);
+  orig(ctx);
+}
+void hook_ac_turn_input_vob(Ctx& ctx, void (*orig)(Ctx&)) {
+  note_turn_input(ctx, true);
   orig(ctx);
 }
 
@@ -711,6 +765,7 @@ void hook_ac_turn_update(Ctx& ctx, void (*orig)(Ctx&)) {
 // An AC's look control update (0x7a2fb8: r3 the look control, r4 its input, f1 the frame time). For
 // the player's (its input holds the player's view state at +12): the mouse camera after the update.
 void hook_look_update(Ctx& ctx, void (*orig)(Ctx&)) {
+  sync_mission();
   u32 look = u32(ctx.r[3]), input = u32(ctx.r[4]);
   bool player = is_player_input(input);
   if (player && g_look.exchange(look) != look) {

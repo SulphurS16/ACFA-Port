@@ -32,6 +32,7 @@
 #include "ppu/ppu_recomp.h"
 #include "runtime/config.h"
 #include "runtime/game/frame_policy.h"
+#include "runtime/game/pc_settings_entry.h"
 #include "runtime/gpu/display.h"
 #include "runtime/gpu/window.h"
 #include "runtime/input.h"
@@ -475,15 +476,20 @@ void frame(Ctx& ctx) {
     g_drag = {};
     g_hold = 0;
   }
-  if (c == InputContext::Screen) {  // title, movies, the mission report: a click is Start, then Cross
+  if (c == InputContext::Screen) {  // title, briefings, movies, the mission report
     for (const Event& e : events)
       if (e.kind == Event::LeftDown) {
         s64 t = now_ms();
-        press(kStart, 0, t);
-        // The mission report waits for Cross (Start does nothing there, run 20261016-041503):
-        // Cross 0.2 s after Start, unless a menu or gameplay has the input by then (the title's
-        // Start opens a menu) or a movie plays (Start skips one).
-        if (!gpu::display::movie_playing()) press(0, kCross, t + 200, true);
+        if (gpu::display::movie_playing()) {
+          press(kStart, kCross, t);  // Start skips most movies, Cross a mission's briefing (run 20261029-165204)
+        } else {
+          // The title waits for Start; the mission report for Cross (Start does nothing there, run
+          // 20261016-041503): Cross 0.2 s later, unless a menu or gameplay has the input by then (the
+          // title's Start opens one; a menu not yet seen while it opens takes the click itself).
+          // Elsewhere Start would open the hub's KEY GUIDE (GitHub issue #6).
+          if (before_hub()) press(kStart, 0, t);
+          press(0, kCross, t + 200, true);
+        }
       }
     g_last_dialog = dialog;
     return;
@@ -579,6 +585,8 @@ void frame(Ctx& ctx) {
 }  // namespace
 
 InputContext input_context() { return InputContext(g_context.load(std::memory_order_relaxed)); }
+
+bool start_screen() { return gpu::display::movie_playing() || before_hub(); }
 
 void menu_mouse_moved() {
   g_mouse_at = now_ms();

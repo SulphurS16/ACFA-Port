@@ -87,6 +87,8 @@ void patch_text() {
 
 }  // namespace
 
+bool before_hub() { return g_before_hub.load(std::memory_order_relaxed); }
+
 void pc_settings_thread_started(const std::string& name) {
   if (name == "HDDInstallTask") {
     if (g_before_hub.load()) {  // the first start's question (the port reads the disc in place)

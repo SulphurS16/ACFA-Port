@@ -7,9 +7,14 @@ namespace rt::game {
 // What the player's input drives right now (bindings.h chooses keys by it):
 //   Menu:     a menu dialog with a focused item takes the keys (menu keys, cursor, clicks)
 //   Gameplay: a mission runs and no menu is open
-//   Screen:   anything else (title, movies, loading): Enter, Space, Escape and a click press Start
+//   Screen:   anything else (title, briefings, movies, loading, the mission report; a menu for a
+//             moment while it opens): the keys as in menus, a click presses Cross; where Start
+//             moves on (start_screen) the confirm and back keys and a click press Start as well
 enum class InputContext { Gameplay, Menu, Screen };
 InputContext input_context();
+// The title before the hub, and movies (briefings included): Start is what moves on there. Elsewhere
+// Start opens the hub's KEY GUIDE, so a confirm or back key must not press it (GitHub issue #6).
+bool start_screen();
 
 // Window thread: mouse activity over the client area (client pixels) while the mouse is free.
 void menu_mouse_moved();

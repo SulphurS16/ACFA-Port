@@ -1,5 +1,30 @@
 # Changelog
 
+## 0.7.4 (2026-10-29)
+
+Fixes from player reports: the mouse camera in VOB missions, and the keys and the mouse on the
+title menu, in briefings and in the hub.
+
+Updating from 0.7.3: unzip the new release (into a new folder or over the old one) and start its
+launcher, then click **Set up**: it rebuilds what changed.
+
+- **MOUSE MODE: CAMERA** now works in missions that start with a VOB (Vanguard Overed Boost)
+  flight (GitHub issue #5). The mouse did nothing for the first minute of the flight: the port
+  found the player's AC only through the turning it does without the VOB. Now the camera turns from
+  the first second, and the AC follows at the VOB's own turning speed (very slow at first, as with
+  a controller). When the AC turns past where the camera points, it now turns back instead of taking
+  the camera along (it went up to 40 degrees past it during the VOB flight).
+- **MOUSE MODE: STICK** no longer keeps a slowly turning AC turning long after the mouse stops: the
+  turn still to come is now limited to what the AC turns in about 2.5 seconds. A normal AC still
+  turns up to half a turn per flick, but in the first part of a VOB flight, which turns less than a
+  degree per second, a flick kept the AC turning for minutes.
+- Keys and the mouse on screens that are not menus (GitHub issue #6). On the title menu (NEW GAME,
+  LOAD GAME, ...) and in mission briefings, Enter, Space and a left click now choose, and a briefing
+  skips to "Accept this mission?". Before, they pressed START and SELECT there, which those screens
+  ignore. Enter, Space, Escape and Backspace also no longer open the hub's KEY GUIDE. That happened
+  when they were pressed while the hub was opening, for example right after leaving a briefing. Tab
+  still opens the KEY GUIDE.
+
 ## 0.7.3 (2026-10-24)
 
 Crash and movie fixes from player reports, keyboard and mouse closer to the controller, the mouse

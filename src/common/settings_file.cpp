@@ -135,8 +135,9 @@ const char* const kMenuHead =
     "[menu]\n"
     "# Keys in the game's menus (where a menu item is highlighted), as in [keyboard]: an input listed\n"
     "# here drives this control in menus; inputs not listed keep their [keyboard] control there. The\n"
-    "# mouse points and clicks (left: choose, right: back, wheel: up and down). On screens without a\n"
-    "# menu (title, movies) the confirm and back keys press Start.\n";
+    "# mouse points and clicks (left: choose, right: back, wheel: up and down). The same keys work on\n"
+    "# the screens without a menu (briefings, the mission report); on the title screen and in movies\n"
+    "# the confirm and back keys press Start as well.\n";
 
 const char* const kMenuDefaults =
     "cross = Enter, Space\n"

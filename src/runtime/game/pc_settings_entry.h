@@ -11,5 +11,7 @@ namespace rt::game {
 
 // A guest thread started (frame_policy.cpp passes every start on).
 void pc_settings_thread_started(const std::string& name);
+// From the start, and from each title screen on, until the hub: the title's PRESS START is ahead.
+bool before_hub();
 
 }  // namespace rt::game
