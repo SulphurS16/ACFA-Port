@@ -14,6 +14,7 @@
 #include <fstream>
 #include <thread>
 
+#include "acfa_version.h"  // generated from VERSION (CMakeLists.txt)
 #include "common/file.h"
 #include "runtime/bindings.h"
 #include "runtime/config.h"

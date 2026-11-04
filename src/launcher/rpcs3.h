@@ -1,8 +1,9 @@
 // Preparing the player's decrypted files with the player's own RPCS3, in one step (user decision
 // 2026-10-15). The launcher copies RPCS3's program files (never its settings or data) into a work
 // folder; that private copy installs the PS3 system software update file the player chose
-// (--installfw), decrypts the 10 system modules and a copy of the game's EBOOT.BIN (--decrypt)
-// and installs the game's update package the player chose under Game update (--installpkg). The
+// (--installfw), decrypts the 10 system modules and a copy of the game's EBOOT.BIN (--decrypt; not
+// when the game folder holds the right EBOOT.elf already, some hold only that) and installs the
+// game's update package the player chose under Game update (--installpkg). The
 // decrypted files go to the launcher's own folder of decrypted files, the installed update to its
 // own folder (<data>\update); the work folder is deleted. With the decrypted files complete, the
 // same private copy installs only the update (Install update). The player's RPCS3 is not changed,
@@ -36,6 +37,7 @@ struct Rpcs3Job {
   fs::path rpcs3_exe;   // the player's RPCS3
   fs::path pup;         // PS3UPDAT.PUP of system software 4.93 (unused when RPCS3 has 4.93 already)
   fs::path disc;        // the game folder (PS3_GAME\USRDIR\EBOOT.BIN)
+  fs::path eboot_elf;   // the game's EBOOT.elf, already decrypted and checked (empty: decrypt EBOOT.BIN)
   fs::path update_pkg;  // optional
   bool update_only = false;  // only the update package: the decrypted files are complete
   fs::path work;        // a work folder (deleted afterwards)

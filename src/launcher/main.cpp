@@ -27,6 +27,7 @@
 #include <set>
 #include <thread>
 
+#include "acfa_version.h"  // generated from VERSION (CMakeLists.txt)
 #include "common/bytes.h"
 #include "common/ini.h"
 #include "common/settings_file.h"
@@ -102,6 +103,7 @@ std::wstring g_note;  // a message for the status line (a setup or game error) u
 
 std::mutex g_check_mu;
 Status g_disc_check, g_files_check;
+fs::path g_eboot_ok;  // the game's EBOOT.elf when the game folder's check found it right, else empty
 UpdateCheck g_update_check;
 bool g_checked = false;
 std::atomic<int> g_check_gen{0};
@@ -512,6 +514,7 @@ void start_checks() {
       std::lock_guard lk(g_check_mu);
       if (gen != g_check_gen) return;
       g_disc_check = d;
+      g_eboot_ok = d.verdict == Verdict::Ok ? f.eboot_elf : fs::path();
       g_files_check = m;
       g_update_check = u;
       g_checked = true;
@@ -989,14 +992,20 @@ void on_removed(RemoveResult* r) {
 void prepare_files() {
   std::error_code ec;
   bool update_only = !files_missing();
-  fs::path update_pkg;
+  fs::path update_pkg, eboot_elf;
   {
     std::lock_guard lk(g_check_mu);
     if (g_update_check.package) update_pkg = g_update;
+    eboot_elf = g_eboot_ok;
   }
   if (update_only && update_pkg.empty()) return;
-  if (!update_only && !fs::is_regular_file(g_cfg.disc / "PS3_GAME" / "USRDIR" / "EBOOT.BIN", ec)) {
-    message(L"Choose the game's folder first (the one with PS3_GAME).", MB_ICONINFORMATION);
+  // The game's executable: its EBOOT.elf when the game folder's check found it right (some game
+  // folders hold only that, without EBOOT.BIN: a player's, 2026-11-04), else EBOOT.BIN to decrypt.
+  if (!update_only && eboot_elf.empty() && !fs::is_regular_file(g_cfg.disc / "PS3_GAME" / "USRDIR" / "EBOOT.BIN", ec)) {
+    message(g_cfg.disc.empty() ? L"Choose the game's folder first (the one with PS3_GAME)."
+                               : L"The game's folder has no PS3_GAME\\USRDIR\\EBOOT.BIN, the game itself. Choose the folder of the "
+                                 L"complete game (the one with PS3_GAME).",
+            MB_ICONINFORMATION);
     return;
   }
   if (!confirm_place()) return;  // the files go into the game data folder
@@ -1030,6 +1039,7 @@ void prepare_files() {
   job.rpcs3_exe = exe;
   job.pup = pup;
   job.disc = g_cfg.disc;
+  job.eboot_elf = eboot_elf;
   job.update_pkg = update_pkg;
   job.update_only = update_only;
   job.work = g_cfg.data / "rpcs3-work";

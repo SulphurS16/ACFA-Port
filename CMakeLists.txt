@@ -13,10 +13,13 @@ endif()
 add_compile_definitions(_WIN32_WINNT=0x0A00 WINVER=0x0A00 NOMINMAX UNICODE _UNICODE)
 
 # The port's version (VERSION; the release's changelog names it), shown by the launcher and logged
-# by the game.
+# by the game: a generated header that only those two main.cpp include, so a new version rebuilds
+# them, not the whole game (until 0.7.4 a compile definition on every file, the generated code's
+# included, made each release rebuild everything on the players' PCs).
 file(STRINGS ${CMAKE_SOURCE_DIR}/VERSION ACFA_VERSION LIMIT_COUNT 1)
 set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS ${CMAKE_SOURCE_DIR}/VERSION)
-add_compile_definitions(ACFA_VERSION="${ACFA_VERSION}")
+set(ACFA_VERSION_DIR ${CMAKE_BINARY_DIR}/version)
+file(CONFIGURE OUTPUT ${ACFA_VERSION_DIR}/acfa_version.h CONTENT "#pragma once\n#define ACFA_VERSION \"@ACFA_VERSION@\"\n" @ONLY)
 
 # Developer diagnostics (control-file commands, profiler, memory search and watchpoints, traces,
 # frame reports, A/B switches, test autopilot). Off in player builds: compiled out, and the
@@ -116,7 +119,7 @@ if(ACFA_GEN_SRC)
   if(NOT ACFA_DEV)  # players' builds open no console window (the run log holds every message)
     set_target_properties(acfa PROPERTIES WIN32_EXECUTABLE ON)
   endif()
-  target_include_directories(acfa PRIVATE ${CMAKE_SOURCE_DIR}/src)
+  target_include_directories(acfa PRIVATE ${CMAKE_SOURCE_DIR}/src ${ACFA_VERSION_DIR})
   target_compile_options(acfa PRIVATE ${ACFA_CPU_FLAGS} -fno-strict-aliasing -Wall -Wextra -Wno-unused-parameter -g)
   # Whole-archive: the function table references everything anyway; keeps HLE registrars alive.
   target_link_libraries(acfa PRIVATE acfa_ppu_gen acfa_spu_gen acfa_spu acfa_ppu acfa_common d3d11 dxgi d3dcompiler d2d1 dwrite ole32 psapi
@@ -158,7 +161,7 @@ if(ACFA_SOURCE_ZIP)
   target_sources(acfa-launcher PRIVATE ${CMAKE_BINARY_DIR}/launcher_source.rc)
   set_source_files_properties(${CMAKE_BINARY_DIR}/launcher_source.rc PROPERTIES OBJECT_DEPENDS "${acfa_source_zip}")
 endif()
-target_include_directories(acfa-launcher PRIVATE ${CMAKE_SOURCE_DIR}/src)
+target_include_directories(acfa-launcher PRIVATE ${CMAKE_SOURCE_DIR}/src ${ACFA_VERSION_DIR})
 target_link_libraries(acfa-launcher PRIVATE acfa_common comctl32 winhttp shell32 ole32 uuid advapi32)
 target_link_options(acfa-launcher PRIVATE -municode)
 target_compile_options(acfa-launcher PRIVATE -Wall -Wextra -Wno-missing-field-initializers)

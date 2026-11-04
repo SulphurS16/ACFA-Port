@@ -1,5 +1,20 @@
 # Changelog
 
+## 0.7.5 (2026-11-04)
+
+A launcher fix from a player report, and faster updates from now on.
+
+Updating from 0.7.4: unzip the new release (into a new folder or over the old one) and start its
+launcher, then click **Set up**. This update builds the game in full once more (a few minutes,
+longer on slower PCs); from now on, updates rebuild only what changed.
+
+- Launcher: **Prepare files** now works when the game folder already holds the decrypted EBOOT.elf
+  but not EBOOT.BIN. The game folder was checked green, but Prepare files said "Choose the game's
+  folder first" and opened nothing. It now decrypts only the system modules with RPCS3 and uses
+  that EBOOT.elf. When the game itself (EBOOT.BIN) is really missing, the message says so.
+- Updates rebuild only what changed. Until now, every new version rebuilt the whole game during
+  Set up, because the version number reached every file the build compiles.
+
 ## 0.7.4 (2026-10-29)
 
 Fixes from player reports: the mouse camera in VOB missions, and the keys and the mouse on the
