@@ -13,5 +13,7 @@ namespace rt::game {
 void pc_settings_thread_started(const std::string& name);
 // From the start, and from each title screen on, until the hub: the title's PRESS START is ahead.
 bool before_hub();
+// The title's PRESS START is on the screen (until Start: the title menu follows).
+bool at_press_start();
 
 }  // namespace rt::game

@@ -106,6 +106,8 @@ struct Frame {
 
 enum class Op { ListSave, ListLoad, FixedSave, FixedLoad, AutoSave, AutoLoad };
 bool is_save(Op op) { return op == Op::ListSave || op == Op::FixedSave || op == Op::AutoSave; }
+
+constexpr const char* kAc4TitleId = "BLUS30027";  // ARMORED CORE 4 (USA): its saves are what IMPORT DATA reads
 const char* op_name(Op op) {
   switch (op) {
     case Op::ListSave: return "cellSaveDataListSave2";
@@ -246,6 +248,7 @@ void sort_entries(std::vector<Entry>& v, u32 type, u32 order) {
 struct Session {
   fs::path root, host;
   std::string dir;
+  bool read_only = false;  // another game's save (ARMORED CORE 4's, for IMPORT DATA): never written
   bool is_new = true;
   acfa::sfo::Map sfo;
   std::map<std::string, std::vector<u8>> files;  // everything except PARAM.SFO
@@ -254,7 +257,7 @@ struct Session {
 
   bool load() {
     host = root / dir;
-    repair(root, dir);
+    if (!read_only) repair(root, dir);
     std::error_code ec;
     if (!fs::exists(host / "PARAM.SFO", ec)) return true;
     try {
@@ -515,9 +518,25 @@ s32 run(ppu::Ctx& ctx, const Args& a) {
   }
   if (!valid_dir_name(dir)) return SAVEDATA_ERROR_PARAM;
 
+  // ARMORED CORE 4's saves for the title menu's IMPORT DATA, which loads them by name
+  // (BLUS30027ASSMBLY064 the AC schematics, BLUS30027PAINT014 the paint data; run
+  // 20261114-094609): when this game's saves do not hold them, they are read in place from the
+  // ARMORED CORE 4 port's saves beside this game's folder (Saved Games\ARMORED CORE 4\savedata),
+  // never written there. Saves from RPCS3 or a PS3 (decrypted) are copied into this game's folder.
+  bool foreign = false;
+  if (a.op == Op::AutoLoad && dir.rfind(kAc4TitleId, 0) == 0 && !fs::exists(root / dir / "PARAM.SFO", ec)) {
+    fs::path ac4 = root.parent_path().parent_path() / "ARMORED CORE 4" / "savedata";
+    if (fs::exists(ac4 / dir / "PARAM.SFO", ec)) {
+      root = ac4;
+      foreign = true;
+      LOG_I("savedata", "%s: '%s' read from the ARMORED CORE 4 port's saves", op_name(a.op), dir.c_str());
+    }
+  }
+
   Session s;
   s.root = root;
   s.dir = dir;
+  s.read_only = foreign;
   if (!s.load()) {
     LOG_W("savedata", "%s: '%s' has a damaged PARAM.SFO", op_name(a.op), dir.c_str());
     if (dialogs) sysdlg::message("The saved data is corrupted.");
@@ -685,6 +704,10 @@ s32 run(ppu::Ctx& ctx, const Args& a) {
   if (!finished) {
     LOG_W("savedata", "%s: '%s' not completed (0x%08x); nothing written", op_name(a.op), dir.c_str(), u32(status));
     return status;
+  }
+  if (s.modified && s.read_only) {
+    LOG_W("savedata", "%s: '%s' is ARMORED CORE 4's: not written", op_name(a.op), dir.c_str());
+    return CELL_OK;
   }
   if (s.modified) {
     if (!s.commit()) {

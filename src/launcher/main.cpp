@@ -403,8 +403,9 @@ void load_settings_controls() {
   SendMessageW(fps, CB_SETCURSEL, WPARAM(sel), 0);
   HWND mode = item(kMode);
   SendMessageW(mode, CB_RESETCONTENT, 0, 0);
-  for (const wchar_t* m : {L"Windowed", L"Fullscreen", L"Borderless fullscreen"}) SendMessageW(mode, CB_ADDSTRING, 0, LPARAM(m));
-  SendMessageW(mode, CB_SETCURSEL, d.mode == acfa::settings::Mode::Fullscreen ? 1 : d.mode == acfa::settings::Mode::Borderless ? 2 : 0, 0);
+  // The order of PC SETTINGS (windowed and borderless side by side, exclusive fullscreen last).
+  for (const wchar_t* m : {L"Windowed", L"Borderless fullscreen", L"Fullscreen"}) SendMessageW(mode, CB_ADDSTRING, 0, LPARAM(m));
+  SendMessageW(mode, CB_SETCURSEL, d.mode == acfa::settings::Mode::Borderless ? 1 : d.mode == acfa::settings::Mode::Fullscreen ? 2 : 0, 0);
   fill_resolutions(d);
 }
 
@@ -417,7 +418,7 @@ void save_setting(int id) {
       const auto& choices = acfa::settings::fps_choices();
       if (sel >= 0 && sel < int(choices.size())) ini.set("display", "fps", acfa::settings::fps_text(choices[size_t(sel)].fps));
     } else if (id == kMode) {
-      d.mode = sel == 1 ? acfa::settings::Mode::Fullscreen : sel == 2 ? acfa::settings::Mode::Borderless : acfa::settings::Mode::Windowed;
+      d.mode = sel == 1 ? acfa::settings::Mode::Borderless : sel == 2 ? acfa::settings::Mode::Fullscreen : acfa::settings::Mode::Windowed;
       ini.set("display", "mode", acfa::settings::mode_name(d.mode));
     } else if (id == kResolution && sel >= 0 && sel < int(g_res_items.size())) {
       const ModeItem& m = g_res_items[size_t(sel)];

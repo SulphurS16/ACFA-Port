@@ -482,12 +482,15 @@ void frame(Ctx& ctx) {
         s64 t = now_ms();
         if (gpu::display::movie_playing()) {
           press(kStart, kCross, t);  // Start skips most movies, Cross a mission's briefing (run 20261029-165204)
+        } else if (at_press_start()) {
+          // The title's PRESS START takes Start only. A Cross after it reached the title menu, which
+          // is no dialog either, and chose LOAD GAME with the same click (GitHub issue #6, 0.7.4).
+          press(kStart, 0, t);
         } else {
-          // The title waits for Start; the mission report for Cross (Start does nothing there, run
-          // 20261016-041503): Cross 0.2 s later, unless a menu or gameplay has the input by then (the
-          // title's Start opens one; a menu not yet seen while it opens takes the click itself).
-          // Elsewhere Start would open the hub's KEY GUIDE (GitHub issue #6).
-          if (before_hub()) press(kStart, 0, t);
+          // The title menu and the mission report wait for Cross (Start does nothing there, run
+          // 20261016-041503); 0.2 s later, unless a menu or gameplay has the input by then (a menu
+          // not yet seen while it opens takes the click itself). Start would open the hub's KEY
+          // GUIDE (GitHub issue #6).
           press(0, kCross, t + 200, true);
         }
       }

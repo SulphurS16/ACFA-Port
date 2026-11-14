@@ -89,6 +89,11 @@ void patch_text() {
 
 bool before_hub() { return g_before_hub.load(std::memory_order_relaxed); }
 
+// The title's PRESS START: from its scene's start until the game goes on after Start (its disc
+// and game data checks start then, before the title menu; run 20261029-171201).
+std::atomic<bool> g_press_start{false};
+bool at_press_start() { return g_press_start.load(std::memory_order_relaxed); }
+
 void pc_settings_thread_started(const std::string& name) {
   if (name == "HDDInstallTask") {
     if (g_before_hub.load()) {  // the first start's question (the port reads the disc in place)
@@ -100,8 +105,9 @@ void pc_settings_thread_started(const std::string& name) {
     }
     return;
   }
-  if (name == "Title_$(Platform)") g_before_hub = true;
-  if (name == "MenuTop/MenuTopSelectScene") g_before_hub = false;
+  if (name == "Title_$(Platform)") g_before_hub = g_press_start = true;
+  if (name == "InstallDiskMount" || name == "GameDataInstaller" || name == "Unnamed DL2 thread") g_press_start = false;
+  if (name == "MenuTop/MenuTopSelectScene") g_before_hub = g_press_start = false;
   if (name == "TitleAfterInitScene" || name == "MenuTop/MenuTopSelectScene" || name == "SystemSetting/MenuSysSelectScene")
     patch_text();  // the UI text is loaded at boot; checked again before the menus that show it
 }

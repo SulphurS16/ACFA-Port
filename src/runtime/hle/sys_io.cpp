@@ -1,6 +1,6 @@
 // HLE: sys_io (cellPad, cellKb, cellMouse).
-// Pad port 0 combines the first controller (gamepads.h: XInput controllers, then PlayStation
-// controllers) with the keyboard and mouse; ports 1-3 map to further controllers when connected.
+// Pad port 0 combines every controller in use (gamepads.h get_merged: XInput and PlayStation
+// controllers) with the keyboard and mouse; ports 1-3 stay empty (the game has one player).
 // Keyboard/mouse libraries report no device (the game is played with the pad; host keyboard input
 // feeds the pad emulation instead).
 #define WIN32_LEAN_AND_MEAN
@@ -65,8 +65,8 @@ u8 axis(SHORT v) { return u8(std::clamp((int(v) + 32768) >> 8, 0, 255)); }
 
 PadState read_port(u32 port, bool deliver = false) {
   PadState s;
-  XINPUT_STATE xs{};  // the controller in this slot, in XInput's layout (gamepads.h)
-  bool xin = !input_isolated() && pads::get(int(port), &xs);
+  XINPUT_STATE xs{};  // every controller in use, in XInput's layout, on port 0 (gamepads.h get_merged)
+  bool xin = port == 0 && !input_isolated() && pads::get_merged(&xs);
   if (xin) {
     s.connected = true;
     const auto& g = xs.Gamepad;

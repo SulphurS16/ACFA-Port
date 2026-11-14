@@ -23,6 +23,7 @@
 #include <atomic>
 #include <chrono>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <memory>
 #include <mutex>
@@ -249,13 +250,18 @@ void start_watcher() {
 // ---- the slots ----
 struct Entry {
   XINPUT_STATE st{};
-  int xindex = -1;  // XInput user index, -1 for a PlayStation controller
+  int xindex = -1;      // XInput user index, -1 for a PlayStation controller
+  bool active = false;  // its state changed since it was found: someone uses it
+  const char* name = "XInput controller";
 };
 std::mutex g_mu;
 std::vector<Entry> g_snap;
 Clock::time_point g_snap_at{};
 bool g_x_on[4] = {};
 Clock::time_point g_x_retry[4] = {};
+DWORD g_x_first[4] = {};    // an XInput controller's packet number when it was found
+bool g_x_active[4] = {};    // and whether it changed since
+std::string g_in_use;       // the controllers in use, as last logged
 
 // The controllers now: one snapshot serves every reader within 2 ms. A missing XInput controller
 // is asked for again once a second (asking for one that is not there can take long).
@@ -268,9 +274,22 @@ void refresh() {
     if (!g_x_on[i] && now < g_x_retry[i]) continue;
     Entry e;
     e.xindex = int(i);
+    bool was = g_x_on[i];
     g_x_on[i] = g_xget(i, &e.st) == ERROR_SUCCESS;
-    if (g_x_on[i]) g_snap.push_back(e);
-    else g_x_retry[i] = now + std::chrono::seconds(1);
+    if (g_x_on[i]) {
+      if (!was) {
+        g_x_first[i] = e.st.dwPacketNumber;
+        g_x_active[i] = false;
+        LOG_I("pad", "XInput controller %lu connected", (unsigned long)i);
+      } else if (e.st.dwPacketNumber != g_x_first[i]) {
+        g_x_active[i] = true;
+      }
+      e.active = g_x_active[i];
+      g_snap.push_back(e);
+    } else {
+      if (was) LOG_I("pad", "XInput controller %lu disconnected", (unsigned long)i);
+      g_x_retry[i] = now + std::chrono::seconds(1);
+    }
   }
   std::lock_guard lk(g_dev_mu);
   for (const auto& d : g_devs) {
@@ -280,6 +299,8 @@ void refresh() {
     Entry e;
     e.st.dwPacketNumber = d->packet;
     e.st.Gamepad = d->pad;
+    e.active = d->packet >= 2;  // the first report counts 1
+    e.name = d->name;
     g_snap.push_back(e);
   }
 }
@@ -362,6 +383,36 @@ void vibrate(int slot, WORD left, WORD right) {
   v.wLeftMotorSpeed = left;
   v.wRightMotorSpeed = right;
   g_xset(DWORD(g_snap[size_t(slot)].xindex), &v);
+}
+
+bool get_merged(XINPUT_STATE* out) {
+  load_xinput();
+  start_watcher();
+  std::lock_guard lk(g_mu);
+  refresh();
+  if (g_snap.empty()) return false;
+  XINPUT_STATE m{};
+  std::string in_use;
+  auto stick = [](SHORT* x, SHORT* y, SHORT nx, SHORT ny) {  // the farther of the two
+    if (std::abs(int(nx)) + std::abs(int(ny)) > std::abs(int(*x)) + std::abs(int(*y))) *x = nx, *y = ny;
+  };
+  for (const Entry& e : g_snap) {
+    if (!e.active) continue;
+    const XINPUT_GAMEPAD& g = e.st.Gamepad;
+    m.Gamepad.wButtons |= g.wButtons;
+    m.Gamepad.bLeftTrigger = std::max(m.Gamepad.bLeftTrigger, g.bLeftTrigger);
+    m.Gamepad.bRightTrigger = std::max(m.Gamepad.bRightTrigger, g.bRightTrigger);
+    stick(&m.Gamepad.sThumbLX, &m.Gamepad.sThumbLY, g.sThumbLX, g.sThumbLY);
+    stick(&m.Gamepad.sThumbRX, &m.Gamepad.sThumbRY, g.sThumbRX, g.sThumbRY);
+    m.dwPacketNumber += e.st.dwPacketNumber;
+    in_use += (in_use.empty() ? "" : ", ") + (e.xindex >= 0 ? "XInput " + std::to_string(e.xindex) : std::string(e.name));
+  }
+  if (in_use != g_in_use) {
+    g_in_use = in_use;
+    LOG_I("pad", "controllers driving the game: %s", in_use.empty() ? "none yet (each counts from its first input)" : in_use.c_str());
+  }
+  *out = m;
+  return true;
 }
 
 }  // namespace rt::pads

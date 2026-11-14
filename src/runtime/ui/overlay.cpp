@@ -137,6 +137,40 @@ bool g_drag_slider = false;
 std::atomic<u16> g_suppress[4];
 u16 g_pad_held = 0;  // controller buttons held during the last poll (window thread)
 
+// A display mode, or an exclusive fullscreen resolution or refresh rate, chosen on the screen: shown
+// at once, applied once the choice has rested kDisplaySettle seconds, or when the screen closes.
+// Until 0.7.5 every step applied at once, and stepping from WINDOWED to BORDERLESS FULLSCREEN
+// passed through exclusive FULLSCREEN: a display switch per key press, seconds of black each on
+// some monitors (a player's report, 2026-11-11: "selecting Display Mode breaks the game").
+constexpr double kDisplaySettle = 0.7;
+struct PendingDisplay {
+  bool mode = false, fs = false;
+  acfa::settings::Mode m = acfa::settings::Mode::Windowed;
+  int w = 0, h = 0, hz = 0;
+  Clock::time_point at{};
+};
+PendingDisplay g_pending;  // g_mu
+
+acfa::settings::Display display_shown() {
+  acfa::settings::Display d = settings::display();
+  if (g_pending.mode) d.mode = g_pending.m;
+  if (g_pending.fs) d.fs_width = g_pending.w, d.fs_height = g_pending.h, d.fs_hz = g_pending.hz;
+  return d;
+}
+
+void apply_pending_display() {
+  using acfa::settings::Mode;
+  PendingDisplay p = g_pending;
+  g_pending = {};
+  acfa::settings::Display now = settings::display();
+  if (p.mode && p.m == now.mode) p.mode = false;  // back where it was
+  if (p.fs && p.w == now.fs_width && p.h == now.fs_height && p.hz == now.fs_hz) p.fs = false;
+  bool to_full = p.mode ? p.m == Mode::Fullscreen : now.mode == Mode::Fullscreen;
+  if (p.mode && !to_full) settings::set_mode(p.m);  // out of exclusive fullscreen first: a new resolution is then only kept
+  if (p.fs) settings::set_fullscreen_mode(p.w, p.h, p.hz);
+  if (p.mode && to_full) settings::set_mode(p.m);
+}
+
 // The install question the game shows behind the screen: answered with Circle once the screen
 // closes, but not before the question can take it.
 constexpr double kQuestionReady = 1.0, kPressTime = 0.15, kAfterPress = 0.3;
@@ -150,7 +184,7 @@ Clock::time_point after(Clock::time_point t, double seconds) {
 std::vector<Row> build_rows(int page) {
   std::vector<Row> rows;
   if (page == 0) {
-    acfa::settings::Display d = settings::display();
+    acfa::settings::Display d = display_shown();
     double fps = cfg().fps.load();
     Row r;
     r.kind = Kind::Choice;
@@ -171,8 +205,8 @@ std::vector<Row> build_rows(int page) {
     m.kind = Kind::Choice;
     m.id = kMode;
     m.label = "DISPLAY MODE";
-    m.options = {"WINDOWED", "FULLSCREEN", "BORDERLESS FULLSCREEN"};
-    m.index = d.mode == Mode::Fullscreen ? 1 : d.mode == Mode::Borderless ? 2 : 0;
+    m.options = {"WINDOWED", "BORDERLESS FULLSCREEN", "FULLSCREEN"};  // windowed and borderless side by side
+    m.index = d.mode == Mode::Borderless ? 1 : d.mode == Mode::Fullscreen ? 2 : 0;
     rows.push_back(m);
     std::vector<gpu::Monitor> monitors = gpu::window_monitors();
     if (monitors.size() > 1) {  // which monitor the game uses
@@ -458,30 +492,41 @@ void apply_choice(Row& r, int index) {
       if (index < int(choices.size())) settings::set_fps(choices[size_t(index)].fps);
       break;
     }
-    case kMode:
-      settings::set_mode(index == 1   ? acfa::settings::Mode::Fullscreen
-                         : index == 2 ? acfa::settings::Mode::Borderless
-                                      : acfa::settings::Mode::Windowed);
+    case kMode:  // applied once the choice rests (g_pending)
+      g_pending.mode = true;
+      g_pending.m = index == 1   ? acfa::settings::Mode::Borderless
+                    : index == 2 ? acfa::settings::Mode::Fullscreen
+                                 : acfa::settings::Mode::Windowed;
+      g_pending.at = after(Clock::now(), kDisplaySettle);
       break;
-    case kFsResolution: {  // keeps the refresh rate when the new resolution has it, else its highest
+    case kFsResolution: {  // keeps the refresh rate when the new resolution has it, else its highest; applied once it rests
       int w = 0, h = 0;
       if (std::sscanf(r.options[size_t(index)].c_str(), "%d x %d", &w, &h) != 2) break;
-      int keep = settings::display().fs_hz, best = 0;
+      int keep = display_shown().fs_hz, best = 0;
       bool has_keep = false;
       for (const auto& md : gpu::display::modes())
         if (int(md.w) == w && int(md.h) == h) {
           best = std::max(best, int(md.hz));
           has_keep |= int(md.hz) == keep;
         }
-      settings::set_fullscreen_mode(w, h, has_keep ? keep : best);
+      g_pending.fs = true;
+      g_pending.w = w;
+      g_pending.h = h;
+      g_pending.hz = has_keep ? keep : best;
+      g_pending.at = after(Clock::now(), kDisplaySettle);
       break;
     }
     case kFsRefresh: {
-      acfa::settings::Display d = settings::display();
+      acfa::settings::Display d = display_shown();
       int mw = 0, mh = 0, hz = 0;
       gpu::window_monitor_size(&mw, &mh);
-      if (std::sscanf(r.options[size_t(index)].c_str(), "%d", &hz) == 1)
-        settings::set_fullscreen_mode(d.fs_width ? d.fs_width : mw, d.fs_width ? d.fs_height : mh, hz);
+      if (std::sscanf(r.options[size_t(index)].c_str(), "%d", &hz) == 1) {
+        g_pending.fs = true;
+        g_pending.w = d.fs_width ? d.fs_width : mw;
+        g_pending.h = d.fs_width ? d.fs_height : mh;
+        g_pending.hz = hz;
+        g_pending.at = after(Clock::now(), kDisplaySettle);
+      }
       break;
     }
     case kMonitor: {
@@ -571,6 +616,7 @@ void defaults() {
   g_default_armed_until = {};
   g_toast.clear();
   if (g_page == 0) {
+    g_pending = {};
     settings::set_fps(60);
     settings::set_mode(acfa::settings::Mode::Windowed);
     settings::set_fullscreen_mode(0, 0, 0);
@@ -591,6 +637,7 @@ void defaults() {
 
 void open_locked() {
   g_state = State::Open;
+  g_pending = {};
   g_capturing = false;
   g_drag_slider = false;
   g_toast.clear();
@@ -605,6 +652,7 @@ void open_locked() {
 
 void close_locked() {
   if (g_state != State::Open) return;
+  apply_pending_display();  // a display choice not applied yet
   g_capturing = false;
   for (auto& s : g_suppress) s = g_pad_held;  // the closing press stays with the screen
   // The install question behind the screen takes a Circle press, then the screen goes away.
@@ -943,6 +991,13 @@ void tick() {
       gpu::window_refresh_cursor();  // the menu's cursor rules again
     }
     return;
+  }
+  {
+    std::lock_guard<std::recursive_mutex> lk(g_mu);
+    if ((g_pending.mode || g_pending.fs) && Clock::now() >= g_pending.at) {
+      apply_pending_display();
+      rebuild();
+    }
   }
   u16 buttons = 0;
   float lx = 0, ly = 0;

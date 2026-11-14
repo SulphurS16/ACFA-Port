@@ -3,9 +3,11 @@
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 
+#include <cctype>
 #include <map>
 #include <memory>
 #include <mutex>
+#include <set>
 
 #include "common/file.h"
 #include "runtime/hle.h"
@@ -22,6 +24,61 @@ struct Mount {
   std::vector<std::string> parts;  // the prefix's components
 };
 std::vector<Mount> g_mounts;
+
+// Mods: files in the mods folder beside the saves (players: Saved Games\ARMORED CORE for Answer\mods;
+// development runs: <data>\mods) replace the game's files of the same path below PS3_GAME\USRDIR
+// on the disc or the installed update's USRDIR, read only: a community regulation (regulation.bin,
+// taken for the update's and for the disc's param\regulation.bin alike), a modded archive
+// (bind\ingamescript.bnd). The folder is read once at start; the game's own files stay untouched.
+fs::path g_mods;
+std::map<std::string, std::string> g_mod_files;  // lower-case relative path ('/') -> as named in the folder
+std::mutex g_mod_mu;
+std::set<std::string> g_mod_noted;  // overrides already logged
+
+std::string lower(std::string s) {
+  for (char& c : s) c = char(std::tolower(static_cast<unsigned char>(c)));
+  return s;
+}
+
+void scan_mods() {
+  std::error_code ec;
+  if (g_mods.empty() || !fs::is_directory(g_mods, ec)) return;
+  for (auto it = fs::recursive_directory_iterator(g_mods, ec); !ec && it != fs::recursive_directory_iterator(); it.increment(ec)) {
+    if (!it->is_regular_file(ec)) continue;
+    std::u8string rel = fs::relative(it->path(), g_mods, ec).generic_u8string();
+    std::string r(rel.begin(), rel.end());
+    g_mod_files[lower(r)] = r;
+  }
+  if (!g_mod_files.empty()) {
+    std::string names;
+    for (const auto& [k, v] : g_mod_files) names += (names.empty() ? "" : ", ") + v;
+    LOG_I("vfs", "mods folder: %zu file(s) replace the game's: %s", g_mod_files.size(), names.c_str());
+  }
+}
+
+// The mod file for a guest path's components below a game files folder, or empty.
+fs::path mod_for(const std::vector<std::string>& parts) {
+  if (g_mod_files.empty()) return {};
+  auto at = [&](std::initializer_list<const char*> pre) {
+    if (parts.size() <= pre.size()) return false;
+    size_t k = 0;
+    for (const char* p : pre)
+      if (_stricmp(parts[k++].c_str(), p) != 0) return false;
+    return true;
+  };
+  size_t base = at({"dev_bdvd", "PS3_GAME", "USRDIR"}) ? 3 : at({"app_home"}) ? 1 : at({"dev_hdd0", "game", "BLUS30187", "USRDIR"}) ? 4 : 0;
+  if (!base) return {};
+  std::string rel;
+  for (size_t k = base; k < parts.size(); ++k) rel += (rel.empty() ? "" : "/") + lower(parts[k]);
+  auto it = g_mod_files.find(rel);
+  if (it == g_mod_files.end() && rel == "param/regulation.bin") it = g_mod_files.find("regulation.bin");  // one regulation for both
+  if (it == g_mod_files.end()) return {};
+  {
+    std::lock_guard lk(g_mod_mu);
+    if (g_mod_noted.insert(rel).second) LOG_I("vfs", "mods: %s replaces the game's %s", it->second.c_str(), rel.c_str());
+  }
+  return g_mods / fs::path(std::u8string(it->second.begin(), it->second.end()));
+}
 
 struct File {
   HANDLE h = INVALID_HANDLE_VALUE;
@@ -77,6 +134,12 @@ void init(const std::string& disc, const std::string& hdd0, const std::string& h
     g_mounts.push_back({"/dev_hdd0/home/00000001/savedata", fs::path(saves), true, {}});
     fs::create_directories(saves);
   }
+  g_mods = (saves.empty() ? fs::path(hdd0) : fs::path(saves)).parent_path() / "mods";
+  {
+    std::error_code ec;
+    fs::create_directories(g_mods, ec);  // there for the player to fill
+  }
+  scan_mods();
   for (Mount& m : g_mounts) {
     for (size_t i = 1; i <= m.prefix.size();) {
       size_t j = std::min(m.prefix.find('/', i), m.prefix.size());
@@ -117,6 +180,10 @@ bool resolve(const std::string& gp, Resolved& out) {
   for (size_t k = best->parts.size(); k < parts.size(); ++k) {
     if (parts[k].find(':') != std::string::npos || parts[k].find('\\') != std::string::npos) return false;
     h /= fs::path(std::u8string(parts[k].begin(), parts[k].end()));  // guest paths are UTF-8
+  }
+  if (fs::path m = mod_for(parts); !m.empty()) {
+    out = {m, false, best->prefix};
+    return true;
   }
   out = {h, best->writable, best->prefix};
   return true;

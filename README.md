@@ -71,7 +71,7 @@ Controllers work like the PS3 pad and can be connected at any time:
 - **PlayStation** (DUALSHOCK 4, DualSense, DualSense Edge; USB or Bluetooth): Options = START; Share / Create or the touchpad click = SELECT. No extra program needed. No vibration yet.
 - **Xbox and other XInput controllers:** A = Cross, B = Circle, X = Square, Y = Triangle, LB / RB = L1 / R1, LT / RT = L2 / R2, Menu = START, View = SELECT, stick clicks = L3 / R3.
 
-With several controllers connected, the first one plays (Xbox-style controllers first).
+All connected controllers play together as one pad, so a second device for the same controller (for example Steam Input's or DS4Windows' virtual controller beside the DualSense itself) does no harm. A controller's buttons are set in the game's own options (ACSIS > OPTION > CONTROL OPTIONS); PC SETTINGS changes the keyboard and mouse.
 
 # Mouse and keyboard support
 
@@ -114,6 +114,20 @@ All keys can be changed in game under **SYSTEM > PC SETTINGS**, which also shows
 - RPCS3 saves should work as they are. Copy the same 'BLUS30187...' folders from RPCS3's savedata folder.
 
 Only saves from the US version (BLUS30187) are found.
+
+## AC schematics and paint from ARMORED CORE 4
+
+The title menu's **IMPORT DATA** brings over your AC schematics and paint data from ARMORED CORE 4 (US version), as on the PS3.
+- **From the ARMORED CORE 4 PC port:** nothing to copy. The import finds your AC4 saves in `Saved Games\ARMORED CORE 4` by itself.
+- **From RPCS3 or a PS3:** copy the folders `BLUS30027ASSMBLY064` (schematics) and `BLUS30027PAINT014` (paint) into `Saved Games\ARMORED CORE for Answer\savedata`. PS3 saves must be decrypted first; RPCS3 saves work as they are.
+
+## Mods and community regulations
+
+Files in `Saved Games\ARMORED CORE for Answer\mods` replace the game's files of the same name, while the game's own files stay untouched:
+- **A community regulation** (for example 1.99): put its `regulation.bin` into `mods`, then choose the regulation in game under **ACSIS > OPTION > REGULATION**.
+- **Other mods:** use the same folder layout as the game's `PS3_GAME\USRDIR`, for example `mods\bind\ingamescript.bnd`.
+
+The folder is read when the game starts. Remove the files to play with the game's own data again.
 
 ## Community
 

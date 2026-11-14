@@ -1,5 +1,32 @@
 # Changelog
 
+## 0.7.6 (2026-11-14)
+
+Fixes from player reports, ARMORED CORE 4 imports and a mods folder.
+
+Updating from 0.7.5: unzip the new release (into a new folder or over the old one) and start its
+launcher, then click **Set up**: it rebuilds only what changed.
+
+- **Controllers:** all connected controllers now play together as one pad. With a second device
+  for the same controller (Steam Input's or DS4Windows' virtual controller beside a DualSense),
+  menus moved twice per press, and when another device came first, the DualSense drove the menus
+  but not the AC. A device that only ever reports the same state, such as a stuck trigger or
+  stick, no longer drives the game. The game's log names the controllers in use.
+- **PC SETTINGS > DISPLAY MODE:** the order is now WINDOWED, BORDERLESS FULLSCREEN, FULLSCREEN,
+  and a choice applies once it rests, a moment after the last key press or when you close PC
+  SETTINGS. Stepping from windowed to borderless used to pass through exclusive fullscreen and
+  switch the display at every key press, which could leave the screen black for seconds on some
+  monitors. The exclusive fullscreen resolution and refresh rate work the same way. The launcher
+  lists the modes in the same order.
+- **Title screen:** a left click on PRESS START no longer also chooses LOAD GAME on the title menu
+  (GitHub issue #6).
+- **IMPORT DATA** on the title menu finds ARMORED CORE 4 schematics and paint data in the
+  ARMORED CORE 4 PC port's saves by itself. Saves from RPCS3 or a PS3 are copied into this game's
+  savedata folder (see the README).
+- **Mods folder:** files in `Saved Games\ARMORED CORE for Answer\mods` replace the game's own,
+  for example a community regulation (`regulation.bin`) or other modded files in the game's folder
+  layout. The game's own files stay untouched.
+
 ## 0.7.5 (2026-11-04)
 
 A launcher fix from a player report, and faster updates from now on.
